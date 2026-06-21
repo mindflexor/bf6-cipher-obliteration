@@ -1,0 +1,40 @@
+{
+    "name": "bf6-portal-utils",
+    "version": "9.0.1",
+    "type": "module",
+    "description": "Battlefield 6 Portal Utils",
+    "engines": {
+        "node": ">=24.0.0"
+    },
+    "scripts": {
+        "prettier": "prettier --no-error-on-unmatched-pattern --write '**/*.{js,json,md,mjs,ts}'",
+        "lint": "eslint .",
+        "lint:fix": "eslint . --fix",
+        "build:types": "tsc --project tsconfig.build.json && npm run prettier",
+        "publish:npm": "npm run build:types && npm publish --access public"
+    },
+    "repository": {
+        "type": "git",
+        "url": "git+https://github.com/deluca-mike/bf6-portal-utils.git"
+    },
+    "author": "Michael De Luca",
+    "license": "MIT",
+    "bugs": {
+        "url": "https://github.com/deluca-mike/bf6-portal-utils/issues"
+    },
+    "homepage": "https://github.com/deluca-mike/bf6-portal-utils#readme",
+    "devDependencies": {
+        "@types/node": "^25.3.0",
+        "@typescript-eslint/eslint-plugin": "^8.56.0",
+        "@typescript-eslint/parser": "^8.56.0",
+        "bf6-portal-mod-types": "^2.3.1",
+        "eslint": "^9.39.2",
+        "eslint-config-prettier": "^10.1.8",
+        "eslint-plugin-jsdoc": "^62.6.0",
+        "eslint-plugin-prettier": "^5.5.5",
+        "prettier": "^3.8.1",
+        "ts-node": "^10.9.2",
+        "typescript": "^5.9.3",
+        "typescript-eslint": "^8.56.0"
+    }
+}

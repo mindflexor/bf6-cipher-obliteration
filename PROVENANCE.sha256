@@ -1,0 +1,7 @@
+﻿# SHA256 provenance snapshot
+# Generated: 2026-03-26T18:20:13Z
+
+24ce6ea803054ea7f5c9d691f0190e17130947b1ee4e88968c5523bb66fa677e  src/squad-obliteration/legacy/squad-obliteration-mode.ts
+da8440fcd4e87dab7e5a18fa8fb1e652cff4027069926e3e727b137121e1c0eb  src/strings.json
+087ac974f52e769316c1e6412c793a782822255a7ccac3b6aad150e811612b02  godot/reference/MF_Cairo_SQOMCOMS.spatial.json
+7e811e5147b56c430d2d28b3b57929c665316b3044402c0f6905900bdc56b393  godot/levels/MF_Cairo_SQOMCOMS.tscn

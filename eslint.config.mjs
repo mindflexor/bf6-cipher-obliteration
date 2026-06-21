@@ -1,0 +1,73 @@
+import eslint from '@eslint/js';
+import tseslint from 'typescript-eslint';
+import prettierConfig from 'eslint-config-prettier';
+
+export default [
+    {
+        ignores: [
+            'node_modules/**',
+            'src/modlib/**',
+            'dist/**',
+            'bf6-portal-utils-master/**',
+            'src/squad-obliteration/archive/**',
+            'src/squad-obliteration/legacy/**',
+        ],
+    },
+    eslint.configs.recommended,
+    ...tseslint.configs.recommended,
+    prettierConfig,
+    {
+        files: ['**/*.ts'],
+        languageOptions: {
+            parser: tseslint.parser,
+            parserOptions: {
+                ecmaVersion: 2022,
+                sourceType: 'module',
+                project: './tsconfig.json',
+            },
+        },
+        rules: {
+            '@typescript-eslint/no-namespace': 'off', // Allow namespaces
+            '@typescript-eslint/no-explicit-any': 'warn',
+            '@typescript-eslint/no-unused-vars': [
+                'warn',
+                {
+                    args: 'none', // Allow unused function parameters (required by API callbacks)
+                },
+            ],
+            'prefer-const': 'warn', // Using let instead of const for variables never reassigned
+            'no-prototype-builtins': 'warn', // Access Object.prototype method 'hasOwnProperty'
+            'no-empty': 'warn', // Empty block statement
+            'no-debugger': 'warn', // Unexpected 'debugger' statement
+        },
+    },
+    {
+        files: ['**/*.js'],
+        languageOptions: {
+            ecmaVersion: 2022,
+            sourceType: 'module',
+            globals: {
+                console: 'readonly',
+                process: 'readonly',
+            },
+        },
+    },
+    {
+        files: ['extension/**/*.js'],
+        languageOptions: {
+            ecmaVersion: 2022,
+            sourceType: 'module',
+            globals: {
+                console: 'readonly',
+                process: 'readonly',
+                chrome: 'readonly',
+                indexedDB: 'readonly',
+                location: 'readonly',
+                document: 'readonly',
+                URL: 'readonly',
+                navigator: 'readonly',
+                setTimeout: 'readonly',
+            },
+        },
+    },
+];
