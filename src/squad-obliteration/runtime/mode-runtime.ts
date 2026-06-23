@@ -178,7 +178,7 @@ let countDown: number = COUNT_DOWN_TIME;
 let lastTicketBleedTimeElapsed = 0;
 let currentFrameNowSec = 0;
 let currentFrameHasEngineNowSec = false;
-const CIPHER_HOT_LANE_FALLBACK_AFTER_SECONDS = (1 / TICK_RATE) + 0.02;
+const CIPHER_HOT_LANE_FALLBACK_AFTER_SECONDS = 0;
 let lastCipherHotLaneRunAtSec = 0;
 let cipherHotLaneFallbackWarned = false;
 let phaseCountdownDeadlineAtSec = 0;
@@ -568,9 +568,15 @@ const BOMB_CARRIER_ICON_BLINK_OFF_TICKS = mod.Max(1, mod.Floor(BOMB_CARRIER_ICON
 const BOMB_CARRIER_ICON_BLINK_CYCLE_TICKS = BOMB_CARRIER_ICON_BLINK_ON_TICKS + BOMB_CARRIER_ICON_BLINK_OFF_TICKS;
 const BOMB_CARRIER_ICON_BLINK_CYCLE_SECONDS = BOMB_CARRIER_ICON_BLINK_ON_SECONDS + BOMB_CARRIER_ICON_BLINK_OFF_SECONDS;
 const BOMB_CARRIER_ICON_HEIGHT_OFFSET_METERS = 1.5;
+const BOMB_CARRIER_ICON_RESEED_COOLDOWN_TICKS = mod.Max(1, mod.Floor(0.5 * TICK_RATE));
+const BOMB_CARRIER_ICON_RESEED_COOLDOWN_SECONDS = BOMB_CARRIER_ICON_RESEED_COOLDOWN_TICKS / TICK_RATE;
 const BOMB_CARRIER_ICON_HARD_SNAP_DISTANCE_METERS = 4;
 const BOMB_CARRIER_DROP_Y_EPSILON_METERS = 0.15;
 const BOMB_CARRIER_DROP_STABLE_SECONDS = 1.0;
+const ICON_FOLLOW_PREDICT_LEAD_SECONDS = 0.03;
+const ICON_FOLLOW_STIFFNESS = 28;
+const ICON_FOLLOW_MAX_DT_SECONDS = 0.20;
+const ICON_FOLLOW_MAX_SPEED_MPS = 25;
 const BOMB_SPAWN_CONTEXT_BASE_PICKUP = "base_lootspawner";
 const BOMB_SPAWN_CONTEXT_DROPPED_PICKUP = "dropped_lootspawner";
 const BOMB_SPAWN_CONTEXT_DROPPED_WORLDICON = "dropped_worldicon";
@@ -1130,6 +1136,7 @@ let bombCarrierEnemyBlinkStartAtSec = 0;
 let bombCarrierLastSourcePos: mod.Vector | undefined = undefined;
 let bombCarrierFriendlyLastPos: mod.Vector | undefined = undefined;
 let bombCarrierEnemyLastPos: mod.Vector | undefined = undefined;
+let bombCarrierIconFollowReseedBlockedUntilSec = 0;
 let bombCarrierTrackedY: number | undefined = undefined;
 let bombCarrierVerticalState: BombCarrierVerticalState = "stable";
 let bombCarrierStableYSinceSec = 0;
@@ -1176,6 +1183,13 @@ let visualSubtickFineStepCount = 0;
 let visualSubtickFallbackFrameCount = 0;
 let visualSubtickLastMode = "fallback";
 let visualSubtickLastDebugLogAtSec = 0;
+
+let carrierIconVisualLastSampleSec = 0;
+let carrierIconVisualLastCarrierPos: mod.Vector | undefined = undefined;
+let carrierIconVisualVelocity = mod.CreateVector(0, 0, 0);
+let carrierIconFriendlyVisualPos: mod.Vector | undefined = undefined;
+let carrierIconEnemyVisualPos: mod.Vector | undefined = undefined;
+
 let carrierIconVisualErrorSumMeters = 0;
 let carrierIconVisualErrorMaxMeters = 0;
 let carrierIconVisualErrorSamples = 0;
@@ -2698,27 +2712,13 @@ function setBombCarrierIconAbsolutePositionSafe(
 
 function setBombCarrierIconHotLanePosition(
   icon: mod.WorldIcon | undefined,
-  object: mod.Object | undefined,
+  _object: mod.Object | undefined,
   targetPos: mod.Vector,
-  previousTargetPos: mod.Vector | undefined,
+  _previousTargetPos: mod.Vector | undefined,
   context: string
 ): boolean {
   if (!icon) return false;
-
-  const movedHandle = setBombCarrierIconPositionSafe(icon, targetPos, context + "_handle");
-  if (!movedHandle) return false;
-
-  let shouldSnapBackingObject = previousTargetPos === undefined;
-  if (!shouldSnapBackingObject && previousTargetPos) {
-    const distance = mod.DistanceBetween(previousTargetPos, targetPos);
-    shouldSnapBackingObject = !Number.isFinite(distance) || distance > BOMB_CARRIER_ICON_HARD_SNAP_DISTANCE_METERS;
-  }
-
-  if (shouldSnapBackingObject && object) {
-    moveObjectToAbsolutePositionSafe(object, targetPos, context + "_object_snap");
-  }
-
-  return true;
+  return setBombCarrierIconPositionSafe(icon, targetPos, context + "_handle");
 }
 
 function clearBombCarrierRuntimeWorldIcons(): void {
@@ -2755,6 +2755,7 @@ function clearBombCarrierRuntimeWorldIcons(): void {
   bombCarrierLastSourcePos = undefined;
   bombCarrierFriendlyLastPos = undefined;
   bombCarrierEnemyLastPos = undefined;
+  bombCarrierIconFollowReseedBlockedUntilSec = 0;
   resetCarrierIconVisualFollowState();
 }
 
@@ -2886,15 +2887,159 @@ function spawnBombCarrierRuntimeWorldIcons(
   bombCarrierLastSourcePos = carrierPos;
   bombCarrierFriendlyLastPos = carrierPos;
   bombCarrierEnemyLastPos = carrierPos;
+  bombCarrierIconFollowReseedBlockedUntilSec = 0;
   bombCarrierEnemyBlinkStartAtSec = nowSec ?? getCurrentSchedulerNowSeconds();
+
+  carrierIconVisualLastSampleSec = nowSec ?? getCarrierSubtickNowSec();
+  carrierIconVisualLastCarrierPos = carrierPos;
+  carrierIconVisualVelocity = mod.CreateVector(0, 0, 0);
+  carrierIconFriendlyVisualPos = carrierPos;
+  carrierIconEnemyVisualPos = carrierPos;
 }
 
 function syncCipherCarrierVisualsNow(nowSec?: number, _reason: string = "tick"): void {
+  if (ENABLE_CARRIER_SUBTICK) {
+    updateBombCarrierRuntimeWorldIconsVisualFollowFrame(nowSec);
+  }
+
   updateBombCarrierRuntimeWorldIconsTick(nowSec);
+}
+
+function getCarrierSubtickNowSec(): number {
+  if (!ENABLE_CARRIER_SUBTICK) return getCurrentSchedulerNowSeconds();
+  return getVisualSubtickNowSec();
+}
+
+function clampVectorMagnitude(vector: mod.Vector, maxMagnitude: number): mod.Vector {
+  if (!Number.isFinite(maxMagnitude) || maxMagnitude <= 0) return mod.CreateVector(0, 0, 0);
+
+  const zero = mod.CreateVector(0, 0, 0);
+  const magnitude = mod.DistanceBetween(vector, zero);
+
+  if (!Number.isFinite(magnitude) || magnitude <= 0.0001) return mod.CreateVector(0, 0, 0);
+  if (magnitude <= maxMagnitude) return vector;
+
+  return mod.Multiply(mod.Normalize(vector), maxMagnitude);
+}
+
+function updateBombCarrierRuntimeWorldIconsVisualFollowFrame(nowSec?: number): void {
+  if (!ENABLE_CARRIER_SUBTICK) return;
+
+  const now = nowSec ?? getCarrierSubtickNowSec();
+
+  if (gameStatus !== 3 || bombCarrierPlayerId === undefined) {
+    resetCarrierIconVisualFollowState();
+    return;
+  }
+
+  if (!bombCarrierFriendlyIconHandle || !bombCarrierEnemyIconHandle) return;
+
+  const carrier = serverPlayers.get(bombCarrierPlayerId);
+  if (!carrier || !carrier.isDeployed || !mod.IsPlayerValid(carrier.player) || !isPlayerAlive(carrier.player)) {
+    resetCarrierIconVisualFollowState();
+    return;
+  }
+
+  const carrierPos = getBombCarrierIconTargetPositionForPlayerId(bombCarrierPlayerId, carrier.player);
+  if (!carrierPos) return;
+
+  if (
+    !carrierIconVisualLastCarrierPos ||
+    carrierIconVisualLastSampleSec <= 0 ||
+    !carrierIconFriendlyVisualPos ||
+    !carrierIconEnemyVisualPos
+  ) {
+    carrierIconVisualLastSampleSec = now;
+    carrierIconVisualLastCarrierPos = carrierPos;
+    carrierIconVisualVelocity = mod.CreateVector(0, 0, 0);
+    carrierIconFriendlyVisualPos = carrierPos;
+    carrierIconEnemyVisualPos = carrierPos;
+
+    setBombCarrierIconPositionSafe(
+      bombCarrierFriendlyIconHandle,
+      carrierPos,
+      "carrier_icon_friendly_init"
+    );
+
+    setBombCarrierIconPositionSafe(
+      bombCarrierEnemyIconHandle,
+      carrierPos,
+      "carrier_icon_enemy_init"
+    );
+
+    return;
+  }
+
+  let dt = now - carrierIconVisualLastSampleSec;
+  if (!Number.isFinite(dt) || dt < 0.001) dt = 0.001;
+  if (dt > ICON_FOLLOW_MAX_DT_SECONDS) dt = ICON_FOLLOW_MAX_DT_SECONDS;
+
+  const measuredVelocity = clampVectorMagnitude(
+    mod.Divide(mod.Subtract(carrierPos, carrierIconVisualLastCarrierPos), dt),
+    ICON_FOLLOW_MAX_SPEED_MPS
+  );
+
+  const followAlpha = clampNumber(1 - Math.exp(-ICON_FOLLOW_STIFFNESS * dt), 0, 1);
+
+  carrierIconVisualVelocity = mod.Add(
+    carrierIconVisualVelocity,
+    mod.Multiply(mod.Subtract(measuredVelocity, carrierIconVisualVelocity), followAlpha)
+  );
+
+  const predictedPos = mod.Add(
+    carrierPos,
+    mod.Multiply(carrierIconVisualVelocity, ICON_FOLLOW_PREDICT_LEAD_SECONDS)
+  );
+
+  carrierIconFriendlyVisualPos = mod.Add(
+    carrierIconFriendlyVisualPos,
+    mod.Multiply(mod.Subtract(predictedPos, carrierIconFriendlyVisualPos), followAlpha)
+  );
+
+  carrierIconEnemyVisualPos = mod.Add(
+    carrierIconEnemyVisualPos,
+    mod.Multiply(mod.Subtract(predictedPos, carrierIconEnemyVisualPos), followAlpha)
+  );
+
+  const movedFriendly = setBombCarrierIconPositionSafe(
+    bombCarrierFriendlyIconHandle,
+    carrierIconFriendlyVisualPos,
+    "carrier_icon_friendly_subtick"
+  );
+
+  const movedEnemy = setBombCarrierIconPositionSafe(
+    bombCarrierEnemyIconHandle,
+    carrierIconEnemyVisualPos,
+    "carrier_icon_enemy_subtick"
+  );
+
+  if (!movedFriendly || !movedEnemy) {
+    if (now >= bombCarrierIconFollowReseedBlockedUntilSec) {
+      clearBombCarrierRuntimeWorldIcons();
+      bombCarrierIconFollowReseedBlockedUntilSec = now + BOMB_CARRIER_ICON_RESEED_COOLDOWN_SECONDS;
+    }
+
+    return;
+  }
+
+  carrierIconVisualLastSampleSec = now;
+  carrierIconVisualLastCarrierPos = carrierPos;
+
+  bombCarrierLastSourcePos = carrierPos;
+  bombCarrierFriendlyLastPos = carrierIconFriendlyVisualPos;
+  bombCarrierEnemyLastPos = carrierIconEnemyVisualPos;
+
+  const followError = mod.DistanceBetween(carrierIconFriendlyVisualPos, carrierPos);
+  if (Number.isFinite(followError)) {
+    carrierIconVisualErrorSumMeters += followError;
+    carrierIconVisualErrorSamples += 1;
+    if (followError > carrierIconVisualErrorMaxMeters) carrierIconVisualErrorMaxMeters = followError;
+  }
 }
 
 function updateBombCarrierRuntimeWorldIconsTick(nowSec?: number): void {
   const now = nowSec ?? getCurrentSchedulerNowSeconds();
+
   if (gameStatus !== 3 || bombCarrierPlayerId === undefined) {
     clearBombCarrierRuntimeWorldIcons();
     return;
@@ -2907,45 +3052,54 @@ function updateBombCarrierRuntimeWorldIconsTick(nowSec?: number): void {
   }
 
   if (!bombCarrierFriendlyIconHandle || !bombCarrierEnemyIconHandle) {
+    if (now < bombCarrierIconFollowReseedBlockedUntilSec) return;
+
     spawnBombCarrierRuntimeWorldIcons(
       carrier.player,
       now,
       getCipherKeyTeamSnapshot(bombCarrierPlayerId) ?? carrier.team
     );
+
+    bombCarrierIconFollowReseedBlockedUntilSec = now + BOMB_CARRIER_ICON_RESEED_COOLDOWN_SECONDS;
     return;
   }
 
   const carrierPos = getBombCarrierIconTargetPositionForPlayerId(bombCarrierPlayerId, carrier.player);
   if (!carrierPos) return;
 
-  const movedFriendly = setBombCarrierIconHotLanePosition(
+  const nextFriendlyPos = carrierIconFriendlyVisualPos ?? bombCarrierFriendlyLastPos ?? carrierPos;
+  const nextEnemyPos = carrierIconEnemyVisualPos ?? bombCarrierEnemyLastPos ?? carrierPos;
+
+  const movedFriendly = setBombCarrierIconPositionSafe(
     bombCarrierFriendlyIconHandle,
-    bombCarrierFriendlyIconObject,
-    carrierPos,
-    bombCarrierFriendlyLastPos,
+    nextFriendlyPos,
     "carrier_icon_friendly_tick"
   );
-  const movedEnemy = setBombCarrierIconHotLanePosition(
+
+  const movedEnemy = setBombCarrierIconPositionSafe(
     bombCarrierEnemyIconHandle,
-    bombCarrierEnemyIconObject,
-    carrierPos,
-    bombCarrierEnemyLastPos,
+    nextEnemyPos,
     "carrier_icon_enemy_tick"
   );
 
   if (!movedFriendly || !movedEnemy) {
+    if (now < bombCarrierIconFollowReseedBlockedUntilSec) return;
+
     clearBombCarrierRuntimeWorldIcons();
+
     spawnBombCarrierRuntimeWorldIcons(
       carrier.player,
       now,
       getCipherKeyTeamSnapshot(bombCarrierPlayerId) ?? carrier.team
     );
+
+    bombCarrierIconFollowReseedBlockedUntilSec = now + BOMB_CARRIER_ICON_RESEED_COOLDOWN_SECONDS;
     return;
   }
 
   bombCarrierLastSourcePos = carrierPos;
-  bombCarrierFriendlyLastPos = carrierPos;
-  bombCarrierEnemyLastPos = carrierPos;
+  bombCarrierFriendlyLastPos = nextFriendlyPos;
+  bombCarrierEnemyLastPos = nextEnemyPos;
 
   try {
     mod.EnableWorldIconImage(bombCarrierFriendlyIconHandle, true);
@@ -2955,6 +3109,7 @@ function updateBombCarrierRuntimeWorldIconsTick(nowSec?: number): void {
   const elapsedSec = mod.Max(0, now - bombCarrierEnemyBlinkStartAtSec);
   const cycleSec = elapsedSec % BOMB_CARRIER_ICON_BLINK_CYCLE_SECONDS;
   const enemyVisible = cycleSec < BOMB_CARRIER_ICON_BLINK_ON_SECONDS;
+
   try {
     mod.EnableWorldIconImage(bombCarrierEnemyIconHandle, enemyVisible);
     mod.EnableWorldIconText(bombCarrierEnemyIconHandle, enemyVisible);
@@ -4806,6 +4961,7 @@ function assignBombCarrierFromDelta(
     }
   }
   UpdateBombCarrierUiForAllPlayers(carrierNowSec, true);
+  refreshCipherKeyUiAndIconsImmediately("assignBombCarrierFromDelta");
 
   logBombPickupDebug(
     mod.Message(
@@ -4950,6 +5106,7 @@ function forceBombDropFromCarrier(playerId: number, reason: string, dropPosition
     clearDroppedBombRuntimeObjects();
     bombDroppedSourceKind = "none";
     invalidateDeferredBombSpawnTimer();
+    refreshCipherKeyUiAndIconsImmediately("forceBombDropFromCarrier_fallback");
     scheduleDeferredBombRespawnAfterDelay(0, "carrier_drop_fallback_dynamic", "new_location_found", true);
     return;
   }
@@ -4960,6 +5117,8 @@ function forceBombDropFromCarrier(playerId: number, reason: string, dropPosition
   bombDroppedLastCarrierBlockedUntilSec =
     getCurrentSchedulerNowSeconds() + BOMB_DROPPED_RECLAIM_PREVIOUS_CARRIER_COOLDOWN_SECONDS;
   setBombPickupTriggerEnabled(false);
+
+  refreshCipherKeyUiAndIconsImmediately("forceBombDropFromCarrier");
 
   EvaluateDroppedBombReclaimFromAnchor();
   if (!hasDroppedBombRuntimeObjects() || bombCarrierPlayerId !== undefined) {
@@ -12735,20 +12894,21 @@ function UpdateBombCarrierUiForAllPlayers(nowSec?: number, force: boolean = fals
   const alpha = getBombCarrierPulseAlpha(nowSec ?? getCurrentSchedulerNowSeconds());
   const alphaBucket = mod.Floor(alpha * 100);
 
-  const players = getCipherKeyUiPlayerSnapshot();
-  for (let i = 0; i < players.length; i++) {
-    const p = players[i];
-    if (!p.bombCarrierTextWidget && !force) {
-      markCipherKeyHudDirtyForPlayer(p.id);
-      continue;
+  serverPlayers.forEach((p) => {
+    if (!p) return;
+
+    if (force || !p.bombCarrierTextWidget) {
+      p.bombCarrierTextWidget = mod.FindUIWidgetWithName(BOMB_CARRIER_WIDGET_NAME_PREFIX + p.id) as any;
     }
+
     const visible =
       gameStatus === 3 &&
       bombCarrierPlayerId === p.id &&
-      p.isDeployed;
+      p.isDeployed &&
+      mod.IsPlayerValid(p.player);
 
     applyBombCarrierHudStateForPlayer(p, visible, alpha, alphaBucket, force);
-  }
+  });
 }
 
 function getActiveGlobalBombNoticeMessage(): any {
@@ -12834,10 +12994,17 @@ function refreshBombNoticeUiForPlayer(p: Player, nowSec?: number, force: boolean
 
 function refreshBombNoticeUiForAllPlayers(nowSec?: number, force: boolean = false): void {
   const resolvedNowSec = nowSec ?? getCurrentSchedulerNowSeconds();
-  const players = getCipherKeyUiPlayerSnapshot();
-  for (let i = 0; i < players.length; i++) {
-    refreshBombNoticeUiForPlayer(players[i], resolvedNowSec, force);
-  }
+
+  serverPlayers.forEach((p) => {
+    if (!p) return;
+
+    if (force || !p.bombNoticeContainerWidget || !p.bombNoticeTextWidget) {
+      p.bombNoticeContainerWidget = mod.FindUIWidgetWithName(BOMB_NOTICE_CONTAINER_WIDGET_NAME_PREFIX + p.id) as any;
+      p.bombNoticeTextWidget = mod.FindUIWidgetWithName(BOMB_NOTICE_WIDGET_NAME_PREFIX + p.id) as any;
+    }
+
+    refreshBombNoticeUiForPlayer(p, resolvedNowSec, force);
+  });
 }
 
 function clearBombNoticeState(): void {
@@ -12958,6 +13125,25 @@ function showCipherKeyDroppedNoticeForTeam(keyTeam: mod.Team): void {
     (mod.stringkeys as any).CipherKeyEnemyDropped,
     "ENEMY DROPPED KEY"
   );
+}
+
+function refreshCipherKeyUiAndIconsImmediately(reason: string): void {
+  if (gameStatus !== 3) return;
+
+  const nowSec = getCurrentSchedulerNowSeconds();
+
+  refreshCipherKeyPlayerSnapshots(reason);
+  repairCipherKeyHudCachesForAllPlayers(true);
+  refreshBombNoticeUiForAllPlayers(nowSec, true);
+  UpdateBombCarrierUiForAllPlayers(nowSec, true);
+
+  if (bombCarrierPlayerId !== undefined) {
+    syncCipherCarrierVisualsNow(nowSec, reason);
+    updateBombCarrierBeepLoopTick(nowSec);
+  }
+
+  ensureDroppedBombRuntimeWorldIconVisibleIfNeeded();
+  ensureBaseBombRuntimeWorldIconVisibleIfNeeded();
 }
 
 async function pulseWidgetAlpha(widget: mod.UIWidget, maxAlpha: number): Promise<void> {
@@ -17327,6 +17513,12 @@ function resetVisualSubtickClockState(): void {
 }
 
 function resetCarrierIconVisualFollowState(): void {
+  carrierIconVisualLastSampleSec = 0;
+  carrierIconVisualLastCarrierPos = undefined;
+  carrierIconVisualVelocity = mod.CreateVector(0, 0, 0);
+  carrierIconFriendlyVisualPos = undefined;
+  carrierIconEnemyVisualPos = undefined;
+
   carrierIconVisualErrorSumMeters = 0;
   carrierIconVisualErrorMaxMeters = 0;
   carrierIconVisualErrorSamples = 0;
@@ -17923,6 +18115,12 @@ function OngoingGlobal_Inner(): void {
     UpdateDeployObjectiveTimerUiForAllPlayers();
     repairDirtyCipherKeyHudCaches(2);
 
+    if (ENABLE_CARRIER_SUBTICK) {
+      UpdateBombCarrierUiForAllPlayers(visualNowSec);
+      refreshBombNoticeUiForAllPlayers(visualNowSec);
+      updateBombCarrierRuntimeWorldIconsVisualFollowFrame(visualNowSec);
+    }
+
     let iconLaneDue = true;
     if (useEngineSchedulerFrame) {
       const iconDue = consumeNoCatchUpDue(nowSec, schedulerNextLiveIconFollowAtSec, ICON_FOLLOW_INTERVAL_SECONDS);
@@ -17931,7 +18129,19 @@ function OngoingGlobal_Inner(): void {
     }
     if (iconLaneDue) {
       const iconLaneNowSec = ENABLE_CARRIER_SUBTICK ? visualNowSec : nowSec;
+
+      if (!ENABLE_CARRIER_SUBTICK) {
+        UpdateBombCarrierUiForAllPlayers(iconLaneNowSec);
+        refreshBombNoticeUiForAllPlayers(iconLaneNowSec);
+      }
+
+      if (ENABLE_CARRIER_SUBTICK === true) {
+        refreshBombNoticeUiForAllPlayers(iconLaneNowSec);
+      }
+
+      updateBombCarrierRuntimeWorldIconsTick(iconLaneNowSec);
       updateBombCarrierBeepLoopTick(iconLaneNowSec);
+
       if (DEBUG_PERF_TELEMETRY) perfTelemetryIconLaneRuns += 1;
     }
 
