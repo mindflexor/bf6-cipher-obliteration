@@ -14,6 +14,13 @@ const EXPECTED_SPAWN_ANCHOR_IDS = [
     3411, 3412, 3413, 3414, 3415, 3421, 3422, 3423, 3424, 3425,
     4311, 4312, 4313, 4314, 4315, 4321, 4322, 4323, 4324, 4325,
 ];
+const EXPECTED_POSTMATCH_OBJECTS = [
+    { id: 4747, type: 'FiringRange_MatDecal_01', label: 'Postmatch runtime spawn parent' },
+    { id: 4646, type: 'FixedCamera', label: 'Postmatch fixed camera' },
+];
+const FORBIDDEN_AUTHORING_POSTMATCH_OBJECT_IDS = [
+    4545, 4546, 4547, 4548, 4550, 4551, 4552, 4553, 4554, 4555, 4556, 4557, 4558, 4559,
+];
 const EXPECTED_OBJECTIVE_SECTORS = [
     { sectorId: 200, capturePointIds: [201, 202], mcomIds: [7101, 7102] },
     { sectorId: 300, capturePointIds: [301, 302], mcomIds: [7201, 7202] },
@@ -187,6 +194,15 @@ validateObjectIds(EXPECTED_OBJECTIVE_COUNTER_WORLD_ICON_IDS, 'WorldIcon', 'Objec
 validateObjectIds(EXPECTED_LIVE_HQ_IDS, 'HQ_PlayerSpawner', 'Live HQ');
 validateObjectIds(EXPECTED_PRESENCE_TRIGGER_IDS, 'AreaTrigger', 'Presence-grid trigger');
 validateObjectIds(EXPECTED_SPAWN_ANCHOR_IDS, undefined, 'Spawn anchor');
+for (const expected of EXPECTED_POSTMATCH_OBJECTS) {
+    validateObjectIds([expected.id], expected.type, expected.label);
+}
+for (const id of FORBIDDEN_AUTHORING_POSTMATCH_OBJECT_IDS) {
+    const matches = objectsByObjId.get(id) ?? [];
+    if (matches.length > 0) {
+        errors.push(`Runtime-spawned postmatch prop ObjId ${id} must not be authored in the spatial, found ${matches.length}.`);
+    }
+}
 
 for (const expectedSector of EXPECTED_OBJECTIVE_SECTORS) {
     const sectorMatches = objectsByObjId.get(expectedSector.sectorId) ?? [];

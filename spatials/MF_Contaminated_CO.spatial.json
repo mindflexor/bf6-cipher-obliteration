@@ -316,7 +316,7 @@
                 "z": -0.58983594
             },
             "front": {
-                "x": 4.028203e-08,
+                "x": 4.028203e-8,
                 "y": 0.99488074,
                 "z": 0.10105593
             },
@@ -329,7 +329,7 @@
         },
         {
             "name": "SectorNORTH",
-            "ObjId": 200.0,
+            "ObjId": 200,
             "AutoEnableVehicles": false,
             "CapturePoints": [
                 "SQO Components/SectorNORTH/Capture Points/CapturePointA",
@@ -390,7 +390,7 @@
             "name": "CapturePointA",
             "InitialOwner": "Team1",
             "FlagPoleSize": "Payload",
-            "ObjId": 201.0,
+            "ObjId": 201,
             "OutlineAbove16Points": true,
             "TacticalAdviceLandVehicleFriendly": false,
             "metadata/_calculated_global_transform": [
@@ -494,10 +494,10 @@
         },
         {
             "name": "MCOM_A_North",
-            "ObjId": 7101.0,
+            "ObjId": 7101,
             "TacticalAdviceLandVehicleFriendly": false,
             "metadata/_calculated_global_transform": [
-                -4.37114e-08,
+                -4.37114e-8,
                 0,
                 -1,
                 0,
@@ -505,7 +505,7 @@
                 0,
                 1,
                 0,
-                -4.37114e-08,
+                -4.37114e-8,
                 -137.209,
                 66.7043,
                 50.7075
@@ -535,9 +535,9 @@
         },
         {
             "name": "SFX_GameModes_Rush_Alarm_SimpleLoop3D",
-            "ObjId": 4501.0,
+            "ObjId": 4501,
             "metadata/_calculated_global_transform": [
-                -4.37114e-08,
+                -4.37114e-8,
                 0,
                 -1,
                 0,
@@ -545,7 +545,7 @@
                 0,
                 1,
                 0,
-                -4.37114e-08,
+                -4.37114e-8,
                 -137.209,
                 66.7043,
                 50.7075
@@ -575,9 +575,9 @@
         },
         {
             "name": "SFX_GameModes_Rush_Alarm_Leadout_SimpleLoop3D",
-            "ObjId": 4502.0,
+            "ObjId": 4502,
             "metadata/_calculated_global_transform": [
-                -4.37114e-08,
+                -4.37114e-8,
                 0,
                 -1,
                 0,
@@ -585,7 +585,7 @@
                 0,
                 1,
                 0,
-                -4.37114e-08,
+                -4.37114e-8,
                 -137.209,
                 66.7043,
                 50.7075
@@ -615,9 +615,9 @@
         },
         {
             "name": "SFX_GameModes_Rush_Arm_SimpleLoop3D",
-            "ObjId": 4503.0,
+            "ObjId": 4503,
             "metadata/_calculated_global_transform": [
-                -4.37114e-08,
+                -4.37114e-8,
                 0,
                 -1,
                 0,
@@ -625,7 +625,7 @@
                 0,
                 1,
                 0,
-                -4.37114e-08,
+                -4.37114e-8,
                 -137.209,
                 66.7043,
                 50.7075
@@ -655,9 +655,9 @@
         },
         {
             "name": "SFX_GameModes_Rush_Defused_OneShot3D",
-            "ObjId": 4504.0,
+            "ObjId": 4504,
             "metadata/_calculated_global_transform": [
-                -4.37114e-08,
+                -4.37114e-8,
                 0,
                 -1,
                 0,
@@ -665,7 +665,7 @@
                 0,
                 1,
                 0,
-                -4.37114e-08,
+                -4.37114e-8,
                 -137.209,
                 66.7043,
                 50.7075
@@ -695,9 +695,9 @@
         },
         {
             "name": "SFX_GameModes_Rush_Defusing_SimpleLoop3D",
-            "ObjId": 4505.0,
+            "ObjId": 4505,
             "metadata/_calculated_global_transform": [
-                -4.37114e-08,
+                -4.37114e-8,
                 0,
                 -1,
                 0,
@@ -705,7 +705,7 @@
                 0,
                 1,
                 0,
-                -4.37114e-08,
+                -4.37114e-8,
                 -137.209,
                 66.7043,
                 50.7075
@@ -735,9 +735,9 @@
         },
         {
             "name": "FX_CarFire_FrameCrawl",
-            "ObjId": 611.0,
+            "ObjId": 611,
             "metadata/_calculated_global_transform": [
-                -8.74228e-08,
+                -8.74228e-8,
                 0,
                 -2,
                 0,
@@ -745,7 +745,7 @@
                 0,
                 2,
                 0,
-                -8.74228e-08,
+                -8.74228e-8,
                 -137.661,
                 66.9044,
                 50.7075
@@ -775,30 +775,30 @@
         },
         {
             "name": "FX_Car_Fire_M_GS",
-            "ObjId": 211.0,
+            "ObjId": 211,
             "metadata/_calculated_global_transform": [
                 1.91069e-15,
-                4.37114e-08,
+                4.37114e-8,
                 -1,
                 1,
-                -4.37114e-08,
+                -4.37114e-8,
                 0,
-                -4.37114e-08,
+                -4.37114e-8,
                 -1,
-                -4.37114e-08,
+                -4.37114e-8,
                 -137.209,
                 68.4401,
                 50.7075
             ],
             "type": "FX_Car_Fire_M_GS",
             "right": {
-                "x": 4.3605093742017894e-08,
+                "x": 4.3605093742017894e-8,
                 "y": 1,
-                "z": 3.0468525893597004e-09
+                "z": 3.0468525893597004e-9
             },
             "up": {
                 "x": 0.9975679969531496,
-                "y": -4.37114e-08,
+                "y": -4.37114e-8,
                 "z": 0.06970384360509033
             },
             "front": {
@@ -815,17 +815,17 @@
         },
         {
             "name": "WorldIcon",
-            "ObjId": 221.0,
+            "ObjId": 221,
             "iconTextVisible": true,
             "iconColor": [
                 0.761,
-                0.0,
+                0,
                 0.039
             ],
             "iconImagePicker": "BombArmed",
             "iconImageVisible": true,
             "metadata/_calculated_global_transform": [
-                -4.37114e-08,
+                -4.37114e-8,
                 0,
                 -1,
                 0,
@@ -833,7 +833,7 @@
                 0,
                 1,
                 0,
-                -4.37114e-08,
+                -4.37114e-8,
                 -137.209,
                 68.7043,
                 50.7075
@@ -863,7 +863,7 @@
         },
         {
             "name": "InteractPoint",
-            "ObjId": 2101.0,
+            "ObjId": 2101,
             "metadata/_calculated_global_transform": [
                 1,
                 0,
@@ -903,7 +903,7 @@
         },
         {
             "name": "FX_Vehicle_Car_Destruction_Death_Explosion_PTV",
-            "ObjId": 8101.0,
+            "ObjId": 8101,
             "metadata/_calculated_global_transform": [
                 1,
                 0,
@@ -982,7 +982,7 @@
         },
         {
             "name": "AreaTrigger",
-            "ObjId": 401.0,
+            "ObjId": 401,
             "metadata/linked": [
                 "Area"
             ],
@@ -1031,7 +1031,7 @@
             "name": "CapturePointB",
             "InitialOwner": "Team1",
             "FlagPoleSize": "Payload",
-            "ObjId": 202.0,
+            "ObjId": 202,
             "OutlineAbove16Points": true,
             "metadata/_calculated_global_transform": [
                 1,
@@ -1134,7 +1134,7 @@
         },
         {
             "name": "MCOM_B_North",
-            "ObjId": 7102.0,
+            "ObjId": 7102,
             "TacticalAdviceLandVehicleFriendly": false,
             "metadata/_calculated_global_transform": [
                 1,
@@ -1175,9 +1175,9 @@
         },
         {
             "name": "SFX_GameModes_Rush_Alarm_SimpleLoop3D",
-            "ObjId": 4506.0,
+            "ObjId": 4506,
             "metadata/_calculated_global_transform": [
-                -4.37114e-08,
+                -4.37114e-8,
                 0,
                 -1,
                 0,
@@ -1185,7 +1185,7 @@
                 0,
                 1,
                 0,
-                -4.37114e-08,
+                -4.37114e-8,
                 -176.991,
                 65.3878,
                 48.3843
@@ -1215,9 +1215,9 @@
         },
         {
             "name": "SFX_GameModes_Rush_Alarm_Leadout_SimpleLoop3D",
-            "ObjId": 4507.0,
+            "ObjId": 4507,
             "metadata/_calculated_global_transform": [
-                -4.37114e-08,
+                -4.37114e-8,
                 0,
                 -1,
                 0,
@@ -1225,7 +1225,7 @@
                 0,
                 1,
                 0,
-                -4.37114e-08,
+                -4.37114e-8,
                 -176.991,
                 65.3878,
                 48.3843
@@ -1255,9 +1255,9 @@
         },
         {
             "name": "SFX_GameModes_Rush_Arm_SimpleLoop3D",
-            "ObjId": 4508.0,
+            "ObjId": 4508,
             "metadata/_calculated_global_transform": [
-                -4.37114e-08,
+                -4.37114e-8,
                 0,
                 -1,
                 0,
@@ -1265,7 +1265,7 @@
                 0,
                 1,
                 0,
-                -4.37114e-08,
+                -4.37114e-8,
                 -176.991,
                 65.3878,
                 48.3843
@@ -1295,9 +1295,9 @@
         },
         {
             "name": "SFX_GameModes_Rush_Defused_OneShot3D",
-            "ObjId": 4509.0,
+            "ObjId": 4509,
             "metadata/_calculated_global_transform": [
-                -4.37114e-08,
+                -4.37114e-8,
                 0,
                 -1,
                 0,
@@ -1305,7 +1305,7 @@
                 0,
                 1,
                 0,
-                -4.37114e-08,
+                -4.37114e-8,
                 -176.991,
                 65.3878,
                 48.3843
@@ -1335,7 +1335,7 @@
         },
         {
             "name": "SFX_GameModes_Rush_Defusing_SimpleLoop3D",
-            "ObjId": 4510.0,
+            "ObjId": 4510,
             "metadata/_calculated_global_transform": [
                 1,
                 0,
@@ -1375,7 +1375,7 @@
         },
         {
             "name": "FX_CarFire_FrameCrawl",
-            "ObjId": 612.0,
+            "ObjId": 612,
             "metadata/_calculated_global_transform": [
                 2,
                 0,
@@ -1415,13 +1415,13 @@
         },
         {
             "name": "FX_Car_Fire_M_GS",
-            "ObjId": 212.0,
+            "ObjId": 212,
             "metadata/_calculated_global_transform": [
-                -4.37114e-08,
+                -4.37114e-8,
                 -1,
                 0,
                 1,
-                -4.37114e-08,
+                -4.37114e-8,
                 0,
                 0,
                 0,
@@ -1432,13 +1432,13 @@
             ],
             "type": "FX_Car_Fire_M_GS",
             "right": {
-                "x": -2.7378416833e-08,
+                "x": -2.7378416833e-8,
                 "y": 1,
-                "z": -3.4075003313e-08
+                "z": -3.4075003313e-8
             },
             "up": {
                 "x": -0.626345,
-                "y": -4.37114e-08,
+                "y": -4.37114e-8,
                 "z": -0.779545
             },
             "front": {
@@ -1455,10 +1455,10 @@
         },
         {
             "name": "WorldIcon",
-            "ObjId": 222.0,
+            "ObjId": 222,
             "iconColor": [
                 0.761,
-                0.0,
+                0,
                 0.039
             ],
             "iconImagePicker": "BombArmed",
@@ -1502,7 +1502,7 @@
         },
         {
             "name": "InteractPoint",
-            "ObjId": 2102.0,
+            "ObjId": 2102,
             "metadata/_calculated_global_transform": [
                 1,
                 0,
@@ -1542,7 +1542,7 @@
         },
         {
             "name": "FX_Vehicle_Car_Destruction_Death_Explosion_PTV",
-            "ObjId": 8102.0,
+            "ObjId": 8102,
             "metadata/_calculated_global_transform": [
                 1,
                 0,
@@ -1582,7 +1582,7 @@
         },
         {
             "name": "AreaTrigger",
-            "ObjId": 402.0,
+            "ObjId": 402,
             "metadata/linked": [
                 "Area"
             ],
@@ -1791,7 +1791,7 @@
         },
         {
             "name": "AreaTrigger",
-            "ObjId": 401.0,
+            "ObjId": 401,
             "metadata/linked": [
                 "Area"
             ],
@@ -1943,7 +1943,7 @@
         },
         {
             "name": "AreaTrigger",
-            "ObjId": 402.0,
+            "ObjId": 402,
             "metadata/linked": [
                 "Area"
             ],
@@ -1990,7 +1990,7 @@
         },
         {
             "name": "Sector_South",
-            "ObjId": 300.0,
+            "ObjId": 300,
             "AutoEnableVehicles": false,
             "CapturePoints": [
                 "SQO Components/Sector_South/Capture Points/T2CapturePointA_South",
@@ -2154,7 +2154,7 @@
             "ObjId": 7201,
             "TacticalAdviceLandVehicleFriendly": false,
             "metadata/_calculated_global_transform": [
-                -4.37114e-08,
+                -4.37114e-8,
                 0,
                 -1,
                 0,
@@ -2162,7 +2162,7 @@
                 0,
                 1,
                 0,
-                -4.37114e-08,
+                -4.37114e-8,
                 -127.681,
                 65.9164,
                 -13.8358
@@ -2192,9 +2192,9 @@
         },
         {
             "name": "SFX_GameModes_Rush_Alarm_SimpleLoop3D",
-            "ObjId": 4611.0,
+            "ObjId": 4611,
             "metadata/_calculated_global_transform": [
-                -4.37114e-08,
+                -4.37114e-8,
                 0,
                 -1,
                 0,
@@ -2202,7 +2202,7 @@
                 0,
                 1,
                 0,
-                -4.37114e-08,
+                -4.37114e-8,
                 -127.681,
                 65.9164,
                 -13.8358
@@ -2232,9 +2232,9 @@
         },
         {
             "name": "SFX_GameModes_Rush_Alarm_Leadout_SimpleLoop3D",
-            "ObjId": 4612.0,
+            "ObjId": 4612,
             "metadata/_calculated_global_transform": [
-                -4.37114e-08,
+                -4.37114e-8,
                 0,
                 -1,
                 0,
@@ -2242,7 +2242,7 @@
                 0,
                 1,
                 0,
-                -4.37114e-08,
+                -4.37114e-8,
                 -127.681,
                 65.9164,
                 -13.8358
@@ -2272,9 +2272,9 @@
         },
         {
             "name": "SFX_GameModes_Rush_Arm_SimpleLoop3D",
-            "ObjId": 4613.0,
+            "ObjId": 4613,
             "metadata/_calculated_global_transform": [
-                -4.37114e-08,
+                -4.37114e-8,
                 0,
                 -1,
                 0,
@@ -2282,7 +2282,7 @@
                 0,
                 1,
                 0,
-                -4.37114e-08,
+                -4.37114e-8,
                 -127.681,
                 65.9164,
                 -13.8358
@@ -2312,9 +2312,9 @@
         },
         {
             "name": "SFX_GameModes_Rush_Defused_OneShot3D",
-            "ObjId": 4614.0,
+            "ObjId": 4614,
             "metadata/_calculated_global_transform": [
-                -4.37114e-08,
+                -4.37114e-8,
                 0,
                 -1,
                 0,
@@ -2322,7 +2322,7 @@
                 0,
                 1,
                 0,
-                -4.37114e-08,
+                -4.37114e-8,
                 -127.681,
                 65.9164,
                 -13.8358
@@ -2352,9 +2352,9 @@
         },
         {
             "name": "SFX_GameModes_Rush_Defusing_SimpleLoop3D",
-            "ObjId": 4615.0,
+            "ObjId": 4615,
             "metadata/_calculated_global_transform": [
-                -4.37114e-08,
+                -4.37114e-8,
                 0,
                 -1,
                 0,
@@ -2362,7 +2362,7 @@
                 0,
                 1,
                 0,
-                -4.37114e-08,
+                -4.37114e-8,
                 -127.681,
                 65.9164,
                 -13.8358
@@ -2392,9 +2392,9 @@
         },
         {
             "name": "FX_CarFire_FrameCrawl",
-            "ObjId": 713.0,
+            "ObjId": 713,
             "metadata/_calculated_global_transform": [
-                -8.74228e-08,
+                -8.74228e-8,
                 0,
                 -2,
                 0,
@@ -2402,7 +2402,7 @@
                 0,
                 2,
                 0,
-                -8.74228e-08,
+                -8.74228e-8,
                 -128.134,
                 66.1164,
                 -13.8358
@@ -2432,30 +2432,30 @@
         },
         {
             "name": "FX_Car_Fire_M_GS",
-            "ObjId": 313.0,
+            "ObjId": 313,
             "metadata/_calculated_global_transform": [
                 1.91069e-15,
-                4.37114e-08,
+                4.37114e-8,
                 -1,
                 1,
-                -4.37114e-08,
+                -4.37114e-8,
                 0,
-                -4.37114e-08,
+                -4.37114e-8,
                 -1,
-                -4.37114e-08,
+                -4.37114e-8,
                 -127.681,
                 67.6522,
                 -13.8358
             ],
             "type": "FX_Car_Fire_M_GS",
             "right": {
-                "x": -3.304241016165398e-08,
+                "x": -3.304241016165398e-8,
                 "y": 1,
-                "z": 2.8616191102469888e-08
+                "z": 2.8616191102469888e-8
             },
             "up": {
                 "x": -0.7559220286161925,
-                "y": -4.37114e-08,
+                "y": -4.37114e-8,
                 "z": 0.654661966957591
             },
             "front": {
@@ -2472,17 +2472,17 @@
         },
         {
             "name": "WorldIcon",
-            "ObjId": 323.0,
+            "ObjId": 323,
             "iconTextVisible": true,
             "iconColor": [
                 0.761,
-                0.0,
+                0,
                 0.039
             ],
             "iconImagePicker": "BombArmed",
             "iconImageVisible": true,
             "metadata/_calculated_global_transform": [
-                -4.37114e-08,
+                -4.37114e-8,
                 0,
                 -1,
                 0,
@@ -2490,7 +2490,7 @@
                 0,
                 1,
                 0,
-                -4.37114e-08,
+                -4.37114e-8,
                 -127.681,
                 67.9164,
                 -13.8358
@@ -2520,7 +2520,7 @@
         },
         {
             "name": "InteractPoint",
-            "ObjId": 2106.0,
+            "ObjId": 2106,
             "metadata/_calculated_global_transform": [
                 1,
                 0,
@@ -2560,7 +2560,7 @@
         },
         {
             "name": "FX_Vehicle_Car_Destruction_Death_Explosion_PTV",
-            "ObjId": 8203.0,
+            "ObjId": 8203,
             "metadata/_calculated_global_transform": [
                 1,
                 0,
@@ -2600,7 +2600,7 @@
         },
         {
             "name": "AreaTrigger",
-            "ObjId": 503.0,
+            "ObjId": 503,
             "metadata/linked": [
                 "Area"
             ],
@@ -2711,7 +2711,7 @@
             "name": "T2CapturePoint_B_South",
             "InitialOwner": "Team2",
             "FlagPoleSize": "Payload",
-            "ObjId": 302.0,
+            "ObjId": 302,
             "OutlineAbove16Points": true,
             "metadata/_calculated_global_transform": [
                 1,
@@ -2752,10 +2752,10 @@
         },
         {
             "name": "MCOM_B_South",
-            "ObjId": 7202.0,
+            "ObjId": 7202,
             "TacticalAdviceLandVehicleFriendly": false,
             "metadata/_calculated_global_transform": [
-                -4.37114e-08,
+                -4.37114e-8,
                 0,
                 1,
                 0,
@@ -2763,7 +2763,7 @@
                 0,
                 -1,
                 0,
-                -4.37114e-08,
+                -4.37114e-8,
                 -173.539,
                 65.4856,
                 -10.4828
@@ -2793,9 +2793,9 @@
         },
         {
             "name": "SFX_GameModes_Rush_Alarm_SimpleLoop3D",
-            "ObjId": 4606.0,
+            "ObjId": 4606,
             "metadata/_calculated_global_transform": [
-                -4.37114e-08,
+                -4.37114e-8,
                 0,
                 -1,
                 0,
@@ -2803,7 +2803,7 @@
                 0,
                 1,
                 0,
-                -4.37114e-08,
+                -4.37114e-8,
                 -173.539,
                 65.4856,
                 -10.4828
@@ -2833,9 +2833,9 @@
         },
         {
             "name": "SFX_GameModes_Rush_Alarm_Leadout_SimpleLoop3D",
-            "ObjId": 4607.0,
+            "ObjId": 4607,
             "metadata/_calculated_global_transform": [
-                -4.37114e-08,
+                -4.37114e-8,
                 0,
                 -1,
                 0,
@@ -2843,7 +2843,7 @@
                 0,
                 1,
                 0,
-                -4.37114e-08,
+                -4.37114e-8,
                 -173.539,
                 65.4856,
                 -10.4828
@@ -2873,9 +2873,9 @@
         },
         {
             "name": "SFX_GameModes_Rush_Arm_SimpleLoop3D",
-            "ObjId": 4608.0,
+            "ObjId": 4608,
             "metadata/_calculated_global_transform": [
-                -4.37114e-08,
+                -4.37114e-8,
                 0,
                 -1,
                 0,
@@ -2883,7 +2883,7 @@
                 0,
                 1,
                 0,
-                -4.37114e-08,
+                -4.37114e-8,
                 -173.539,
                 65.4856,
                 -10.4828
@@ -2913,9 +2913,9 @@
         },
         {
             "name": "SFX_GameModes_Rush_Defused_OneShot3D",
-            "ObjId": 4609.0,
+            "ObjId": 4609,
             "metadata/_calculated_global_transform": [
-                -4.37114e-08,
+                -4.37114e-8,
                 0,
                 -1,
                 0,
@@ -2923,7 +2923,7 @@
                 0,
                 1,
                 0,
-                -4.37114e-08,
+                -4.37114e-8,
                 -173.539,
                 65.4856,
                 -10.4828
@@ -2953,9 +2953,9 @@
         },
         {
             "name": "SFX_GameModes_Rush_Defusing_SimpleLoop3D",
-            "ObjId": 4610.0,
+            "ObjId": 4610,
             "metadata/_calculated_global_transform": [
-                -4.37114e-08,
+                -4.37114e-8,
                 0,
                 1,
                 0,
@@ -2963,7 +2963,7 @@
                 0,
                 -1,
                 0,
-                -4.37114e-08,
+                -4.37114e-8,
                 -173.539,
                 65.4856,
                 -10.4828
@@ -2993,9 +2993,9 @@
         },
         {
             "name": "FX_CarFire_FrameCrawl",
-            "ObjId": 712.0,
+            "ObjId": 712,
             "metadata/_calculated_global_transform": [
-                -8.74228e-08,
+                -8.74228e-8,
                 0,
                 2,
                 0,
@@ -3003,7 +3003,7 @@
                 0,
                 -2,
                 0,
-                -8.74228e-08,
+                -8.74228e-8,
                 -173.087,
                 65.6856,
                 -10.4828
@@ -3033,30 +3033,30 @@
         },
         {
             "name": "FX_Car_Fire_M_GS",
-            "ObjId": 312.0,
+            "ObjId": 312,
             "metadata/_calculated_global_transform": [
                 1.91069e-15,
-                4.37114e-08,
+                4.37114e-8,
                 1,
                 1,
-                -4.37114e-08,
+                -4.37114e-8,
                 0,
-                4.37114e-08,
+                4.37114e-8,
                 1,
-                -4.37114e-08,
+                -4.37114e-8,
                 -173.539,
                 67.2214,
                 -10.4828
             ],
             "type": "FX_Car_Fire_M_GS",
             "right": {
-                "x": -2.904509023147719e-08,
+                "x": -2.904509023147719e-8,
                 "y": 1,
-                "z": -3.266600877579836e-08
+                "z": -3.266600877579836e-8
             },
             "up": {
                 "x": -0.66447403266601,
-                "y": -4.37114e-08,
+                "y": -4.37114e-8,
                 "z": -0.7473109709549112
             },
             "front": {
@@ -3073,17 +3073,17 @@
         },
         {
             "name": "WorldIcon",
-            "ObjId": 322.0,
+            "ObjId": 322,
             "iconTextVisible": true,
             "iconColor": [
                 0.761,
-                0.0,
+                0,
                 0.039
             ],
             "iconImagePicker": "BombArmed",
             "iconImageVisible": true,
             "metadata/_calculated_global_transform": [
-                -4.37114e-08,
+                -4.37114e-8,
                 0,
                 1,
                 0,
@@ -3091,7 +3091,7 @@
                 0,
                 -1,
                 0,
-                -4.37114e-08,
+                -4.37114e-8,
                 -173.539,
                 67.4856,
                 -10.4828
@@ -3121,7 +3121,7 @@
         },
         {
             "name": "InteractPoint",
-            "ObjId": 2105.0,
+            "ObjId": 2105,
             "metadata/_calculated_global_transform": [
                 1,
                 0,
@@ -3161,7 +3161,7 @@
         },
         {
             "name": "FX_Vehicle_Car_Destruction_Death_Explosion_PTV",
-            "ObjId": 8202.0,
+            "ObjId": 8202,
             "metadata/_calculated_global_transform": [
                 1,
                 0,
@@ -3201,7 +3201,7 @@
         },
         {
             "name": "AreaTrigger",
-            "ObjId": 502.0,
+            "ObjId": 502,
             "metadata/linked": [
                 "Area"
             ],
@@ -3342,7 +3342,7 @@
             "name": "CapturePointA_South",
             "InitialOwner": "Team2",
             "FlagPoleSize": "Payload",
-            "ObjId": 303.0,
+            "ObjId": 303,
             "OutlineAbove16Points": true,
             "metadata/_calculated_global_transform": [
                 1,
@@ -3550,7 +3550,7 @@
         },
         {
             "name": "AreaTrigger",
-            "ObjId": 502.0,
+            "ObjId": 502,
             "metadata/linked": [
                 "Area"
             ],
@@ -3737,7 +3737,7 @@
         {
             "name": "Initial HQ Spawn Team2_South",
             "Team": "Team2",
-            "ObjId": 2.0,
+            "ObjId": 2,
             "CameraAutoFOV": true,
             "InfantrySpawns": [],
             "metadata/linked": [
@@ -4504,7 +4504,7 @@
         },
         {
             "name": "SectorDisabled",
-            "ObjId": 400.0,
+            "ObjId": 400,
             "AutoEnableVehicles": false,
             "metadata/linked": [
                 "SectorArea",
@@ -5995,8 +5995,60 @@
             "id": "SQO Components/SpawnAnchors/Objective_SW_Team2/Side_West/Variant_South/Anchor_4325"
         },
         {
+            "name": "Postmatch_Object_Spawn",
+            "ObjId": 4747,
+            "type": "FiringRange_MatDecal_01",
+            "right": {
+                "x": 0.13317321,
+                "y": 0,
+                "z": -0.9910928
+            },
+            "up": {
+                "x": 0,
+                "y": 1,
+                "z": 0
+            },
+            "front": {
+                "x": 0.9910928,
+                "y": 0,
+                "z": 0.13317321
+            },
+            "position": {
+                "x": -225.66151,
+                "y": 334.42905,
+                "z": -310.0076
+            },
+            "id": "SQO Components/Postmatch_Object_Spawn"
+        },
+        {
+            "name": "PostMatch Camera",
+            "ObjId": 4646,
+            "type": "FixedCamera",
+            "right": {
+                "x": -0.084338743257205,
+                "y": 0,
+                "z": 0.9964371458009241
+            },
+            "up": {
+                "x": 0,
+                "y": 1,
+                "z": 0
+            },
+            "front": {
+                "x": -0.9964371458009241,
+                "y": 0,
+                "z": -0.084338743257205
+            },
+            "position": {
+                "x": -218.81220702635628,
+                "y": 335.6723056,
+                "z": -309.54168477559955
+            },
+            "id": "SQO Components/Postmatch_Object_Spawn/PostMatch Camera"
+        },
+        {
             "name": "Ready_Area",
-            "ObjId": 8808.0,
+            "ObjId": 8808,
             "AutoEnableVehicles": false,
             "MinimapOutline_Sector_ProjectToGround": false,
             "MinimapOutline_RetreatFrom_ProjectToGround": false,
@@ -6562,7 +6614,7 @@
         {
             "name": "FiringRange_Floor_A3",
             "metadata/_calculated_global_transform": [
-                -1.74846e-06,
+                -0.00000174846,
                 0,
                 -40,
                 0,
@@ -6570,7 +6622,7 @@
                 0,
                 40,
                 0,
-                -1.74846e-06,
+                -0.00000174846,
                 -245.05,
                 -84.1433,
                 -72.8297
@@ -6601,7 +6653,7 @@
         {
             "name": "FiringRange_Floor_A8",
             "metadata/_calculated_global_transform": [
-                -1.74846e-06,
+                -0.00000174846,
                 0,
                 -40,
                 0,
@@ -6609,7 +6661,7 @@
                 0,
                 40,
                 0,
-                -1.74846e-06,
+                -0.00000174846,
                 -245.05,
                 59.0395,
                 -72.8297
@@ -6641,27 +6693,27 @@
             "name": "FiringRange_Floor_A6",
             "metadata/_calculated_global_transform": [
                 7.64274e-14,
-                1.74846e-06,
+                0.00000174846,
                 -40,
                 40,
-                -1.74846e-06,
+                -0.00000174846,
                 0,
-                -1.74846e-06,
+                -0.00000174846,
                 -40,
-                -1.74846e-06,
+                -0.00000174846,
                 -245.05,
                 -142.1,
                 -72.8297
             ],
             "type": "FiringRange_Floor_A",
             "right": {
-                "x": -1.148037029895398e-06,
+                "x": -0.000001148037029895398,
                 "y": 40,
-                "z": -1.3187585205821544e-06
+                "z": -0.0000013187585205821544
             },
             "up": {
                 "x": -26.26395868124153,
-                "y": -1.74846e-06,
+                "y": -0.00000174846,
                 "z": -30.16960114803709
             },
             "front": {
@@ -6680,27 +6732,27 @@
             "name": "FiringRange_Floor_A7",
             "metadata/_calculated_global_transform": [
                 7.64274e-14,
-                1.74846e-06,
+                0.00000174846,
                 -40,
                 40,
-                -1.74846e-06,
+                -0.00000174846,
                 0,
-                -1.74846e-06,
+                -0.00000174846,
                 -40,
-                -1.74846e-06,
+                -0.00000174846,
                 -245.301,
                 -141.677,
                 101.716
             ],
             "type": "FiringRange_Floor_A",
             "right": {
-                "x": -1.148037029895398e-06,
+                "x": -0.000001148037029895398,
                 "y": 40,
-                "z": -1.3187585205821544e-06
+                "z": -0.0000013187585205821544
             },
             "up": {
                 "x": -26.26395868124153,
-                "y": -1.74846e-06,
+                "y": -0.00000174846,
                 "z": -30.16960114803709
             },
             "front": {
@@ -6718,14 +6770,14 @@
         {
             "name": "FiringRange_Floor_A4",
             "metadata/_calculated_global_transform": [
-                -1.74846e-06,
+                -0.00000174846,
                 -40,
-                1.74846e-06,
+                0.00000174846,
                 0,
-                -1.74846e-06,
+                -0.00000174846,
                 -40,
                 40,
-                -1.74846e-06,
+                -0.00000174846,
                 7.64274e-14,
                 -245.05,
                 -84.1433,
@@ -6739,13 +6791,13 @@
             },
             "up": {
                 "x": -30.16960114803709,
-                "y": -1.74846e-06,
+                "y": -0.00000174846,
                 "z": 26.26395868124153
             },
             "front": {
-                "x": 1.3187585205821544e-06,
+                "x": 0.0000013187585205821544,
                 "y": -40,
-                "z": -1.148037029895398e-06
+                "z": -0.000001148037029895398
             },
             "position": {
                 "x": -292.463248975,
@@ -6757,14 +6809,14 @@
         {
             "name": "FiringRange_Floor_A5",
             "metadata/_calculated_global_transform": [
-                -1.74846e-06,
+                -0.00000174846,
                 -40,
-                1.74846e-06,
+                0.00000174846,
                 0,
-                -1.74846e-06,
+                -0.00000174846,
                 -40,
                 40,
-                -1.74846e-06,
+                -0.00000174846,
                 7.64274e-14,
                 -128.319,
                 -84.1433,
@@ -6778,13 +6830,13 @@
             },
             "up": {
                 "x": -30.16960114803709,
-                "y": -1.74846e-06,
+                "y": -0.00000174846,
                 "z": 26.26395868124153
             },
             "front": {
-                "x": 1.3187585205821544e-06,
+                "x": 0.0000013187585205821544,
                 "y": -40,
-                "z": -1.148037029895398e-06
+                "z": -0.000001148037029895398
             },
             "position": {
                 "x": -204.420436655,
@@ -6834,7 +6886,7 @@
         },
         {
             "name": "InteractPointChangeTeam",
-            "ObjId": 2001.0,
+            "ObjId": 2001,
             "metadata/_calculated_global_transform": [
                 0.996453,
                 0,
@@ -6874,16 +6926,16 @@
         },
         {
             "name": "WorldIcon",
-            "ObjId": 5001.0,
+            "ObjId": 5001,
             "iconTextVisible": true,
             "iconColor": [
-                0.0,
-                1.0,
-                0.0
+                0,
+                1,
+                0
             ],
             "iconImagePicker": "Hazard",
             "iconImageVisible": true,
-            "iconTeamOwnerId": 2.0,
+            "iconTeamOwnerId": 2,
             "metadata/_calculated_global_transform": [
                 0.996453,
                 0,
@@ -6923,7 +6975,7 @@
         },
         {
             "name": "InteractPointReady",
-            "ObjId": 2002.0,
+            "ObjId": 2002,
             "metadata/_calculated_global_transform": [
                 0.996453,
                 0,
@@ -6963,16 +7015,16 @@
         },
         {
             "name": "WorldIcon",
-            "ObjId": 5002.0,
+            "ObjId": 5002,
             "iconTextVisible": true,
             "iconColor": [
-                0.0,
+                0,
                 0.5,
-                1.0
+                1
             ],
             "iconImagePicker": "Flag",
             "iconImageVisible": true,
-            "iconTeamOwnerId": 2.0,
+            "iconTeamOwnerId": 2,
             "metadata/_calculated_global_transform": [
                 0.996453,
                 0,
@@ -7051,7 +7103,7 @@
         },
         {
             "name": "InteractPointChangeTeam",
-            "ObjId": 2003.0,
+            "ObjId": 2003,
             "metadata/_calculated_global_transform": [
                 -0.986734,
                 0,
@@ -7091,16 +7143,16 @@
         },
         {
             "name": "WorldIcon",
-            "ObjId": 5003.0,
+            "ObjId": 5003,
             "iconTextVisible": true,
             "iconColor": [
-                0.0,
-                1.0,
-                0.0
+                0,
+                1,
+                0
             ],
             "iconImagePicker": "Hazard",
             "iconImageVisible": true,
-            "iconTeamOwnerId": 1.0,
+            "iconTeamOwnerId": 1,
             "metadata/_calculated_global_transform": [
                 -0.986734,
                 0,
@@ -7140,7 +7192,7 @@
         },
         {
             "name": "InteractPointReady",
-            "ObjId": 2004.0,
+            "ObjId": 2004,
             "metadata/_calculated_global_transform": [
                 -0.986734,
                 0,
@@ -7180,16 +7232,16 @@
         },
         {
             "name": "WorldIcon",
-            "ObjId": 5004.0,
+            "ObjId": 5004,
             "iconTextVisible": true,
             "iconColor": [
-                0.0,
+                0,
                 0.5,
-                1.0
+                1
             ],
             "iconImagePicker": "Flag",
             "iconImageVisible": true,
-            "iconTeamOwnerId": 1.0,
+            "iconTeamOwnerId": 1,
             "metadata/_calculated_global_transform": [
                 -0.986734,
                 0,
@@ -7229,7 +7281,7 @@
         },
         {
             "name": "ReadyupAreaTrigger",
-            "ObjId": 889.0,
+            "ObjId": 889,
             "metadata/linked": [
                 "Area"
             ],
@@ -7498,11 +7550,11 @@
         },
         {
             "name": "WorldIcon",
-            "ObjId": 890.0,
+            "ObjId": 890,
             "iconTextVisible": true,
             "iconImagePicker": "DangerPing",
             "iconImageVisible": true,
-            "iconTeamOwnerId": 1.0,
+            "iconTeamOwnerId": 1,
             "metadata/_calculated_global_transform": [
                 1,
                 0,
@@ -7542,11 +7594,11 @@
         },
         {
             "name": "WorldIcon2",
-            "ObjId": 891.0,
+            "ObjId": 891,
             "iconTextVisible": true,
             "iconImagePicker": "DangerPing",
             "iconImageVisible": true,
-            "iconTeamOwnerId": 2.0,
+            "iconTeamOwnerId": 2,
             "metadata/_calculated_global_transform": [
                 1,
                 0,
@@ -18780,13 +18832,13 @@
         {
             "name": "FiringRange_Floor_A6",
             "metadata/_calculated_global_transform": [
-                1.73672e-06,
+                0.00000173672,
                 39.7314,
                 -4.62731,
                 40,
-                -1.74846e-06,
+                -0.00000174846,
                 0,
-                -2.02266e-07,
+                -2.02266e-7,
                 -4.62731,
                 -39.7314,
                 184.448,
@@ -18795,13 +18847,13 @@
             ],
             "type": "FiringRange_Floor_A",
             "right": {
-                "x": -1.148037044666434e-06,
+                "x": -0.000001148037044666434,
                 "y": 40,
-                "z": -1.3187585077233197e-06
+                "z": -0.0000013187585077233197
             },
             "up": {
                 "x": -26.263957122800672,
-                "y": -1.74846e-06,
+                "y": -0.00000174846,
                 "z": -30.169602504728207
             },
             "front": {
@@ -18819,13 +18871,13 @@
         {
             "name": "FiringRange_Floor_A7",
             "metadata/_calculated_global_transform": [
-                1.73672e-06,
+                0.00000173672,
                 39.7314,
                 -4.62731,
                 40,
-                -1.74846e-06,
+                -0.00000174846,
                 0,
-                -2.02266e-07,
+                -2.02266e-7,
                 -4.62731,
                 -39.7314,
                 11.0449,
@@ -18834,13 +18886,13 @@
             ],
             "type": "FiringRange_Floor_A",
             "right": {
-                "x": -1.148037044666434e-06,
+                "x": -0.000001148037044666434,
                 "y": 40,
-                "z": -1.3187585077233197e-06
+                "z": -0.0000013187585077233197
             },
             "up": {
                 "x": -26.263957122800672,
-                "y": -1.74846e-06,
+                "y": -0.00000174846,
                 "z": -30.169602504728207
             },
             "front": {
@@ -18860,13 +18912,13 @@
             "metadata/_calculated_global_transform": [
                 -39.7314,
                 -4.62731,
-                2.02266e-07,
+                2.02266e-7,
                 0,
-                -1.74846e-06,
+                -0.00000174846,
                 -40,
                 4.62731,
                 -39.7314,
-                1.73672e-06,
+                0.00000173672,
                 184.448,
                 -56.299,
                 -16.1502
@@ -18879,13 +18931,13 @@
             },
             "up": {
                 "x": -30.169602504728207,
-                "y": -1.74846e-06,
+                "y": -0.00000174846,
                 "z": 26.263957122800672
             },
             "front": {
-                "x": 1.3187585077233197e-06,
+                "x": 0.0000013187585077233197,
                 "y": -40,
-                "z": -1.148037044666434e-06
+                "z": -0.000001148037044666434
             },
             "position": {
                 "x": -292.463248975,
@@ -18899,13 +18951,13 @@
             "metadata/_calculated_global_transform": [
                 -39.7314,
                 -4.62731,
-                2.02266e-07,
+                2.02266e-7,
                 0,
-                -1.74846e-06,
+                -0.00000174846,
                 -40,
                 4.62731,
                 -39.7314,
-                1.73672e-06,
+                0.00000173672,
                 197.952,
                 -56.299,
                 99.7966
@@ -18918,13 +18970,13 @@
             },
             "up": {
                 "x": -30.169602504728207,
-                "y": -1.74846e-06,
+                "y": -0.00000174846,
                 "z": 26.263957122800672
             },
             "front": {
-                "x": 1.3187585077233197e-06,
+                "x": 0.0000013187585077233197,
                 "y": -40,
-                "z": -1.148037044666434e-06
+                "z": -0.000001148037044666434
             },
             "position": {
                 "x": -204.420436655,
@@ -19169,7 +19221,7 @@
         },
         {
             "name": "ReadyUpT1HQ",
-            "ObjId": 8888.0,
+            "ObjId": 8888,
             "InfantrySpawns": [
                 "Ready_Area/SpawnPoint",
                 "Ready_Area/SpawnPoint2",
@@ -19224,7 +19276,7 @@
         {
             "name": "ReadyUpT2HQ",
             "Team": "Team2",
-            "ObjId": 8889.0,
+            "ObjId": 8889,
             "InfantrySpawns": [
                 "Ready_Area/SpawnPoint7",
                 "Ready_Area/SpawnPoint8",
@@ -19564,7 +19616,7 @@
             "front": {
                 "x": -0.00999976,
                 "y": 0,
-                "z": 6.96387e-05
+                "z": 0.0000696387
             },
             "position": {
                 "x": -149.599,
@@ -22837,7 +22889,7 @@
                 "z": -0.0075788
             },
             "front": {
-                "x": -9.01705e-05,
+                "x": -0.0000901705,
                 "y": -0.00999904,
                 "z": -0.000104774
             },
@@ -22862,7 +22914,7 @@
                 "z": -0.0075788
             },
             "front": {
-                "x": -9.01705e-05,
+                "x": -0.0000901705,
                 "y": -0.00999904,
                 "z": -0.000104774
             },
@@ -22883,11 +22935,11 @@
             },
             "up": {
                 "x": -0.00782888,
-                "y": 5.40737e-06,
+                "y": 0.00000540737,
                 "z": 0.00622162
             },
             "front": {
-                "x": -9.01703e-05,
+                "x": -0.0000901703,
                 "y": -0.00999904,
                 "z": -0.000104774
             },
@@ -22908,11 +22960,11 @@
             },
             "up": {
                 "x": -0.00782888,
-                "y": 5.40737e-06,
+                "y": 0.00000540737,
                 "z": 0.00622162
             },
             "front": {
-                "x": -9.01703e-05,
+                "x": -0.0000901703,
                 "y": -0.00999904,
                 "z": -0.000104774
             },
@@ -22933,11 +22985,11 @@
             },
             "up": {
                 "x": -0.00782888,
-                "y": 5.40737e-06,
+                "y": 0.00000540737,
                 "z": 0.00622162
             },
             "front": {
-                "x": -9.01703e-05,
+                "x": -0.0000901703,
                 "y": -0.00999904,
                 "z": -0.000104774
             },
@@ -22962,7 +23014,7 @@
                 "z": -0.0075788
             },
             "front": {
-                "x": -9.01705e-05,
+                "x": -0.0000901705,
                 "y": -0.00999904,
                 "z": -0.000104774
             },
@@ -23903,7 +23955,7 @@
             "type": "FiringRange_Wall_1024_01",
             "right": {
                 "x": 0.156609,
-                "y": -5.95935e-09,
+                "y": -5.95935e-9,
                 "z": -0.124394
             },
             "up": {
@@ -23928,7 +23980,7 @@
             "type": "FiringRange_Wall_1024_01",
             "right": {
                 "x": 0.156609,
-                "y": -5.95935e-09,
+                "y": -5.95935e-9,
                 "z": -0.124394
             },
             "up": {
@@ -23953,7 +24005,7 @@
             "type": "FiringRange_Wall_1024_01",
             "right": {
                 "x": 0.156609,
-                "y": -5.95935e-09,
+                "y": -5.95935e-9,
                 "z": -0.124394
             },
             "up": {
@@ -23978,7 +24030,7 @@
             "type": "FiringRange_Wall_1024_01",
             "right": {
                 "x": 0.156609,
-                "y": -5.95935e-09,
+                "y": -5.95935e-9,
                 "z": -0.124394
             },
             "up": {
@@ -24003,7 +24055,7 @@
             "type": "FiringRange_Wall_1024_01",
             "right": {
                 "x": 0.391521,
-                "y": -1.48967e-08,
+                "y": -1.48967e-8,
                 "z": -0.310984
             },
             "up": {
@@ -24028,7 +24080,7 @@
             "type": "FiringRange_Wall_1024_01",
             "right": {
                 "x": 0.391521,
-                "y": -1.48967e-08,
+                "y": -1.48967e-8,
                 "z": -0.310984
             },
             "up": {
@@ -24053,7 +24105,7 @@
             "type": "FiringRange_Wall_1024_01",
             "right": {
                 "x": 0.156609,
-                "y": -5.95935e-09,
+                "y": -5.95935e-9,
                 "z": -0.124394
             },
             "up": {
@@ -24230,7 +24282,7 @@
             "type": "Container_02_Closed",
             "right": {
                 "x": 0.769176,
-                "y": -1.86265e-09,
+                "y": -1.86265e-9,
                 "z": -0.639036
             },
             "up": {

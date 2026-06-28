@@ -53,6 +53,19 @@ const ICON_FOLLOW_INTERVAL_SECONDS = 0.05; // 20 Hz
 const FAST_INTERVAL_SECONDS = 0.10; // 10 Hz
 const SLOW_INTERVAL_SECONDS = 0.30; // 3.3 Hz
 const ENDGAME_AUDIO_INTERVAL_SECONDS = 0.50; // 2 Hz
+const CIPHER_RUNTIME_BOTS_ENABLED = false;
+const CIPHER_RUNTIME_BOT_TARGET_TOTAL_PLAYERS = 8;
+const CIPHER_RUNTIME_BOT_RECONCILE_INTERVAL_SECONDS = 1.0;
+const CIPHER_RUNTIME_BOT_SPAWN_RETRY_SECONDS = 2.0;
+const CIPHER_RUNTIME_BOT_RESPAWN_DELAY_SECONDS = 1.0;
+const CIPHER_RUNTIME_BOT_UNSPAWN_DELAY_SECONDS = 1.0;
+const CIPHER_RUNTIME_BOT_REVIVE_SCAN_RADIUS_METERS = 18.0;
+const CIPHER_RUNTIME_BOT_REVIVE_FORCE_RADIUS_METERS = 3.0;
+const BOT_OBJECTIVE_THINK_INTERVAL_SECONDS = 1.0;
+const BOT_OBJECTIVE_COMMAND_REFRESH_SECONDS = 1.0;
+const BOT_OBJECTIVE_TARGET_REISSUE_DISTANCE_METERS = 4.0;
+const BOT_LIVE_SPAWN_RETRY_SECONDS = 2.0;
+const BOT_LIVE_SPAWN_INITIAL_DELAY_SECONDS = 0.25;
 const VISUAL_SUBTICK_ENGINE_CLOSE_TOLERANCE_SECONDS = 1.0;
 const VISUAL_SUBTICK_BLEND_ELAPSED_WEIGHT = 0.7;
 const VISUAL_SUBTICK_BLEND_REMAINING_WEIGHT = 0.3;
@@ -69,18 +82,20 @@ const LIVE_ENDGAME_AUDIO_INTERVAL_TICKS = mod.Max(1, mod.Floor(ENDGAME_AUDIO_INT
 const INITIAL_TICKETS = 0;
 const WIN_SCORE = RULES.matchScoreCap;
 const HALF_SCORE_CAP = RULES.halfScoreCap;
-const CIPHER_KEYS_TO_DESTROY_OBJECTIVE = RULES.cipherKeysToDestroyObjective;
+const NODE_OVERLOAD_COOLDOWN_SECONDS = RULES.nodeOverloadCooldownSeconds;
 const CIPHER_COUNTER_Y_OFFSET_METERS = 5.5;
 const CIPHER_SECOND_HALF_DEPLOY_PHASE_SECONDS = 30;
 const CIPHER_SECOND_HALF_FINAL_COUNTDOWN_SECONDS = 5;
 const CIPHER_SECOND_HALF_FORCE_DEPLOY_SETTLE_SECONDS = 2.0;
+const CIPHER_HALFTIME_INTERMISSION_SECONDS = 5;
 
 const ROUND_TIME = RULES.halfTimeSeconds;                // seconds
 const OVERTIME_TIME = RULES.suddenDeathSeconds;              // seconds
 const TOTAL_TICKS = ROUND_TIME * TICK_RATE;
 const LIVE_ENGINE_TIME_LIMIT_SAFETY_SECONDS = 7200;
 const LIVE_TIMER_INTRO_SECONDS = 3.0;
-const LIVE_TIMER_DEFAULT_POS_X = 123.99;
+const LIVE_BOTTOM_HUD_OFFSET_X = -40;
+const LIVE_TIMER_DEFAULT_POS_X = 123.99 + LIVE_BOTTOM_HUD_OFFSET_X;
 const LIVE_TIMER_DEFAULT_POS_Y = 698.56;
 const LIVE_TIMER_DEFAULT_WIDTH = 130;
 const LIVE_TIMER_DEFAULT_HEIGHT = 34;
@@ -108,7 +123,7 @@ const LIVE_TIMER_INTRO_VALUE_TEXT_COLOR: [number, number, number] = [1, 0.5137, 
 
 const COUNT_DOWN_TIME = 5;              // ready-up delay before forced undeploy into pre-live
 const PRELIVE_TIME = 15;                // seconds (pre-live freeze)
-const POSTMATCH_TIME = 20;              // seconds
+const POSTMATCH_TIME = RULES.postmatchTimeSeconds;              // seconds
 
 const REDEPLOY_TIME = RULES.redeployTimeSeconds; // live redeploy time
 const DEATH_TICKET_LOSS = 0;           // tickets after first live deploy
@@ -178,9 +193,6 @@ let countDown: number = COUNT_DOWN_TIME;
 let lastTicketBleedTimeElapsed = 0;
 let currentFrameNowSec = 0;
 let currentFrameHasEngineNowSec = false;
-const CIPHER_HOT_LANE_FALLBACK_AFTER_SECONDS = 0;
-let lastCipherHotLaneRunAtSec = 0;
-let cipherHotLaneFallbackWarned = false;
 let phaseCountdownDeadlineAtSec = 0;
 let phaseCountdownLastShownSeconds = -1;
 let phaseCountdownTickDeadline = 0;
@@ -211,20 +223,34 @@ let serverScores: number[] = [INITIAL_TICKETS, INITIAL_TICKETS];
 type CipherHalfIndex = 1 | 2;
 type CipherMatchStage = "half1" | "half2" | "suddenDeath";
 type CipherMapSide = "north" | "south";
-type CipherHorizontalVariant = "west" | "east";
 type CipherPresenceZone = "northWest" | "northEast" | "southWest" | "southEast";
+type CipherSpawnVariant = "north" | "south";
+type CipherSpawnRegion = {
+  quadrant: CipherPresenceZone;
+  variant: CipherSpawnVariant;
+};
+type CipherPresenceLane = "west" | "east";
+type CipherLanePressure = {
+  west: number;
+  east: number;
+};
+type CipherNodeState = "active" | "rebooting";
 type CipherHalfTransitionReason = "scoreCap" | "timeExpired";
-type CipherSecondHalfTransitionStage = "none" | "deploy" | "countdown";
+type CipherSecondHalfTransitionStage = "none" | "intermission" | "deploy" | "countdown";
 
 let cipherCurrentHalf: CipherHalfIndex = 1;
 let cipherMatchStage: CipherMatchStage = "half1";
 let cipherHalfScores: number[] = [0, 0];
-let cipherObjectiveKeyCountByCpId: { [cpId: number]: number } = {};
-let cipherCounterWorldIconLastShownByCpId: { [cpId: number]: number | undefined } = {};
+let cipherNodeStateByCpId: { [cpId: number]: CipherNodeState | undefined } = {};
+let cipherNodeRebootUntilSecByCpId: { [cpId: number]: number | undefined } = {};
+let cipherNodeRebootTokenByCpId: { [cpId: number]: number | undefined } = {};
+let cipherNodeOverloadedByTeamByCpId: { [cpId: number]: mod.Team | undefined } = {};
+let cipherCounterWorldIconLastShownByCpId: { [cpId: number]: string | undefined } = {};
 let cipherCounterRuntimeWorldIconObjectByKey: { [key: string]: mod.Object | undefined } = {};
 let cipherCounterRuntimeWorldIconHandleByKey: { [key: string]: mod.WorldIcon | undefined } = {};
 let cipherCounterRuntimeWorldIconLastStateByKey: { [key: string]: string | undefined } = {};
 let cipherCounterRuntimeWorldIconMissingWarnedByKey: { [key: string]: boolean } = {};
+let cipherCounterWorldIconLastStateByCpId: { [cpId: number]: string | undefined } = {};
 let cipherSuddenDeathEliminatedByPlayerId: { [playerId: number]: boolean } = {};
 let cipherSuddenDeathUndeployIgnoreUntilSec = 0;
 let cipherPhaseTransitionUndeployIgnoreUntilSec = 0;
@@ -240,6 +266,7 @@ let cipherTransitionDeployTitleKey: any = undefined;
 let cipherTransitionDeployTitleFallback = "";
 let cipherTransitionStartsTitleKey: any = undefined;
 let cipherTransitionStartsTitleFallback = "";
+let cipherTransitionSubtitleKey: any = undefined;
 let cipherTransitionSubtitleFallback = "";
 let cipherSuddenDeathTransitionActive = false;
 
@@ -643,6 +670,17 @@ const OBJECTIVE_AWARD_EXPLOSION_ONESHOT_ASSET: mod.RuntimeSpawn_Common =
   mod.RuntimeSpawn_Common.FX_Vehicle_Car_Destruction_Death_Explosion_PTV;
 const OBJECTIVE_AWARD_PERSISTENT_FIRE_ENABLED = true;
 const OBJECTIVE_AWARD_BURST_ROTATION = mod.CreateVector(0, 0, 0);
+const OBJECTIVE_DISABLE_EMP_HIT_ASSET: mod.RuntimeSpawn_Common =
+  (mod.RuntimeSpawn_Common as any).FX_Gadget_ReconDrone_EMP_Hit;
+const OBJECTIVE_DISABLE_SPARK_START_ASSET: mod.RuntimeSpawn_Common =
+  (mod.RuntimeSpawn_Common as any).FX_Gadget_Sabotage_01_StartSparks;
+const OBJECTIVE_DISABLE_SPARK_LOOP_ASSET: mod.RuntimeSpawn_Common =
+  (mod.RuntimeSpawn_Common as any).FX_Gadget_Sabotage_02_SparkLoop;
+const OBJECTIVE_DISABLE_3D_SFX_ASSET: mod.RuntimeSpawn_Common =
+  (mod.RuntimeSpawn_Common as any).SFX_Gadgets_EIDOS_Disabled_OneShot3D;
+const OBJECTIVE_DISABLE_UI_SFX_ASSET: mod.RuntimeSpawn_Common =
+  (mod.RuntimeSpawn_Common as any).SFX_UI_Gauntlet_DataUpload_DataDepositPointDisable_OneShot2D;
+const OBJECTIVE_DISABLE_SPARK_LOOP_LIFETIME_SECONDS = 8.0;
 
 type ObjectiveMcomSfxRole = "alarmSimple" | "alarmLeadout" | "arming" | "arm" | "defused" | "defusing";
 type ObjectiveMcomSfxConfig = {
@@ -732,6 +770,7 @@ const OBJECTIVE_MCOM_SFX_BY_CP_ID: { [cpId: number]: ObjectiveMcomSfxConfig } = 
 ================================================================================================= */
 
 type DynamicRouteKey = "A" | "B" | "C" | "AB" | "AC" | "BC" | "ABC" | "NO";
+const BOT_SPAWN_ROUTE_FALLBACK_KEYS: DynamicRouteKey[] = ["NO", "A", "B", "C", "AB", "AC", "BC", "ABC"];
 
 /*
   Godot PlayerSpawner ObjId mapping.
@@ -777,6 +816,9 @@ let safeSpawnUnsafeHqObjIdByPlayerId: { [playerId: number]: number } = {};
 let safeSpawnForcedRedeploys: { [playerId: number]: number } = {};
 let safeSpawnPendingCheck: { [playerId: number]: boolean } = {};
 let safeSpawnForcedUndeploy: { [playerId: number]: boolean } = {};
+let safeSpawnGenerationByPlayerId: { [playerId: number]: number } = {};
+let safeSpawnCheckQueuedGenerationByPlayerId: { [playerId: number]: number | undefined } = {};
+let safeSpawnForcedQueuedGenerationByPlayerId: { [playerId: number]: number | undefined } = {};
 let lastLiveHqSpawnPointObjIdByPlayerId: { [playerId: number]: number } = {};
 let lastForcedSafeSpawnHqObjIdByPlayerId: { [playerId: number]: number } = {};
 
@@ -789,10 +831,15 @@ const HQ_DESYNC_MAX_FORCED_REDEPLOYS = 2;     // safety: prevent infinite loops
 
 /* Safe spawn tuning */
 const SAFE_SPAWN_CHECK_DELAY_SECONDS = 0.1;
-const SAFE_SPAWN_ENEMY_RADIUS_METERS = 8;
+const CIPHER_SPAWN_ENEMY_DANGER_RADIUS_METERS = 18;
+const SAFE_SPAWN_ENEMY_RADIUS_METERS = CIPHER_SPAWN_ENEMY_DANGER_RADIUS_METERS;
 
 // This is the number of unsafe attempts allowed before we stop forcing recycle attempts.
 const SAFE_SPAWN_MAX_FORCED_REDEPLOYS = 5;
+const SAFE_SPAWN_CHECK_DELAY_TICKS = mod.Max(1, mod.Ceiling(SAFE_SPAWN_CHECK_DELAY_SECONDS * TICK_RATE));
+const SAFE_SPAWN_CHECK_QUEUE_BUDGET_PER_TICK = 2;
+const SAFE_SPAWN_FORCED_QUEUE_BUDGET_PER_TICK = 1;
+const SAFE_SPAWN_FORCED_SPAWN_DELAY_TICKS = mod.Max(1, mod.Ceiling(0.2 * TICK_RATE));
 const LIVE_SAFE_SPAWN_TEAM1_HQ_IDS: number[] = [TEAM1_INITIAL_HQ, TEAM1_LIVE_HQ];
 const LIVE_SAFE_SPAWN_TEAM2_HQ_IDS: number[] = [TEAM2_INITIAL_HQ, TEAM2_LIVE_HQ];
 const HQ_TO_PLAYERSPAWNER_ID: { [hqId: number]: number } = {
@@ -811,18 +858,22 @@ const CIPHER_PRESENCE_TRIGGER_ZONE_BY_ID: { [triggerId: number]: CipherPresenceZ
   903: "southWest",
   904: "southEast",
 };
-const CIPHER_NORTH_EAST_ANCHORS: number[] = [1411, 1412, 1413, 1414, 1415, 1421, 1422, 1423, 1424, 1425];
-const CIPHER_NORTH_WEST_ANCHORS: number[] = [2311, 2312, 2313, 2314, 2315, 2321, 2322, 2323, 2324, 2325];
-const CIPHER_SOUTH_EAST_ANCHORS: number[] = [3411, 3412, 3413, 3414, 3415, 3421, 3422, 3423, 3424, 3425];
-const CIPHER_SOUTH_WEST_ANCHORS: number[] = [4311, 4312, 4313, 4314, 4315, 4321, 4322, 4323, 4324, 4325];
+const CIPHER_NORTH_EAST_NORTH_ANCHORS: number[] = [1411, 1412, 1413, 1414, 1415];
+const CIPHER_NORTH_EAST_SOUTH_ANCHORS: number[] = [1421, 1422, 1423, 1424, 1425];
+const CIPHER_NORTH_WEST_NORTH_ANCHORS: number[] = [2311, 2312, 2313, 2314, 2315];
+const CIPHER_NORTH_WEST_SOUTH_ANCHORS: number[] = [2321, 2322, 2323, 2324, 2325];
+const CIPHER_SOUTH_EAST_NORTH_ANCHORS: number[] = [3411, 3412, 3413, 3414, 3415];
+const CIPHER_SOUTH_EAST_SOUTH_ANCHORS: number[] = [3421, 3422, 3423, 3424, 3425];
+const CIPHER_SOUTH_WEST_NORTH_ANCHORS: number[] = [4311, 4312, 4313, 4314, 4315];
+const CIPHER_SOUTH_WEST_SOUTH_ANCHORS: number[] = [4321, 4322, 4323, 4324, 4325];
 const CIPHER_ANCHOR_COOLDOWN_SECONDS = 12;
-const CIPHER_ANCHOR_ENEMY_SAFETY_RADIUS_METERS = 18;
+const CIPHER_ANCHOR_ENEMY_SAFETY_RADIUS_METERS = CIPHER_SPAWN_ENEMY_DANGER_RADIUS_METERS;
 
 type CipherVectorSnapshot = { x: number; y: number; z: number };
 type CipherQueuedSpawnAnchor = {
   anchorObjectId: number;
   side: CipherMapSide;
-  variant: CipherHorizontalVariant;
+  region: CipherSpawnRegion;
 };
 type CipherSpawnJobKind = "queue-anchor" | "teleport-deployed";
 type CipherSpawnJob = {
@@ -831,22 +882,40 @@ type CipherSpawnJob = {
   createdAtSec: number;
   attempt: number;
 };
+type SafeSpawnCheckQueueItem = {
+  playerId: number;
+  generation: number;
+  dueTick: number;
+};
+type ForcedSafeSpawnStage = "undeploy" | "spawn";
+type ForcedSafeSpawnQueueItem = {
+  playerId: number;
+  generation: number;
+  hqObjId: number;
+  spawnerObjId: number;
+  stage: ForcedSafeSpawnStage;
+  dueTick: number;
+  waitTicks: number;
+};
 
 let cipherPresenceZoneActivePlayersByZone: { [zone: string]: { [playerId: number]: mod.Team } } = {};
 let cipherPresenceZonesByPlayerId: { [playerId: number]: { [zone: string]: boolean } } = {};
 let cipherAnchorPositionByObjectId: { [objectId: number]: mod.Vector | undefined } = {};
-let cipherAnchorPositionSnapshotByObjectId: { [objectId: number]: CipherVectorSnapshot | undefined } = {};
 let cipherCapturePointPositionByObjectId: { [objectId: number]: mod.Vector | undefined } = {};
 let cipherCapturePointPositionSnapshotByObjectId: { [objectId: number]: CipherVectorSnapshot | undefined } = {};
 let cipherPlayerPositionSnapshotByPlayerId: { [playerId: number]: CipherVectorSnapshot | undefined } = {};
 let cipherAnchorCooldownUntilSecByObjectId: { [objectId: number]: number } = {};
 let cipherAnchorRoundRobinIndexByKey: { [key: string]: number } = {};
-let cipherVariantTieFlipBySide: { [side: string]: number } = {};
+let cipherSpawnRegionTieFlipByKey: { [key: string]: number } = {};
+let cipherLastSpawnRegionByTeamId: { [teamId: string]: CipherSpawnRegion | undefined } = {};
+let cipherLastSpawnRegionAtSecByTeamId: { [teamId: string]: number | undefined } = {};
 let cipherQueuedAnchorByPlayerId: { [playerId: number]: CipherQueuedSpawnAnchor | undefined } = {};
 let cipherPendingSpawnJobs: CipherSpawnJob[] = [];
 let cipherUrgentSpawnJobs: CipherSpawnJob[] = [];
 const CIPHER_SPAWN_JOBS_PER_TICK = 1;
 const CIPHER_SPAWN_RETRY_WINDOW_SECONDS = 0.75;
+let safeSpawnCheckQueue: SafeSpawnCheckQueueItem[] = [];
+let safeSpawnForcedQueue: ForcedSafeSpawnQueueItem[] = [];
 
 
 
@@ -1027,7 +1096,7 @@ type BombRestoreEquipment = { kind: "gadget"; gadget: mod.Gadgets };
 
 type BombPickupDelta = {
   replacedEquipment?: BombRestoreEquipment;
-  replacedSlot: mod.InventorySlots;
+  replacedSlot?: mod.InventorySlots;
 };
 
 type BombRestoreAmmoState = {
@@ -1082,6 +1151,27 @@ type BombDroppedSourceKind = "none" | "carrier_drop";
 type BombCarrierVerticalState = "stable" | "rising" | "falling";
 type BombBeepMode = "none" | "base" | "dropped" | "carrier";
 type BombSpawnAnnouncementMode = "new_location_found" | "bomb_located";
+type BotObjectiveRole =
+  | "seekKey"
+  | "deliverKey"
+  | "escortCarrier"
+  | "interceptCarrier"
+  | "revive"
+  | "pressureObjective"
+  | "regroup";
+type RuntimeBotSlot = {
+  slotId: number;
+  desiredTeam: mod.Team;
+  classToSpawn: mod.SoldierClass;
+  spawner: mod.Spawner | undefined;
+  spawnerObjId: number;
+  player: mod.Player | undefined;
+  playerId: number | undefined;
+  nextSpawnAtSec: number;
+  forceRespawnAfterSec: number;
+  spawning: boolean;
+  retired: boolean;
+};
 type BombDynamicLaneMidpoint = {
   lane: BombDynamicLane;
   midpoint: mod.Vector;
@@ -1173,6 +1263,19 @@ let bombDropOneShotObject: mod.Object | undefined = undefined;
 let bombDropOneShotHandle: mod.SFX | undefined = undefined;
 let bombDropOneShotCleanupToken = 0;
 let lastKnownLivePositionByPlayerId: { [playerId: number]: mod.Vector | undefined } = {};
+let botObjectiveNextThinkAtSec = 0;
+let botObjectiveAssignedRoleByPlayerId: { [playerId: number]: BotObjectiveRole | undefined } = {};
+let botObjectiveLastCommandAtSecByPlayerId: { [playerId: number]: number | undefined } = {};
+let botObjectiveLastTargetByPlayerId: { [playerId: number]: mod.Vector | undefined } = {};
+let botLiveSpawnRequestedByPlayerId: { [playerId: number]: boolean | undefined } = {};
+let botLiveSpawnNextAttemptAtSecByPlayerId: { [playerId: number]: number | undefined } = {};
+let botBackfillKnownByPlayerId: { [playerId: number]: boolean | undefined } = {};
+let runtimeBotSlotsBySlotId: { [slotId: number]: RuntimeBotSlot | undefined } = {};
+let runtimeBotSlotByPlayerId: { [playerId: number]: number | undefined } = {};
+let runtimeBotSlotBySpawnerObjId: { [spawnerObjId: number]: number | undefined } = {};
+let runtimeBotReleasedPlayerId: { [playerId: number]: boolean | undefined } = {};
+let runtimeBotNextSlotId = 1;
+let runtimeBotNextReconcileAtSec = 0;
 let visualSubtickLastOutputSec = 0;
 let visualSubtickLastPreferredSec = -1;
 let visualSubtickLastPreferredFloorSec = -1;
@@ -3513,7 +3616,6 @@ function isEligibleBombRadiusPickupCandidate(sp: Player): boolean {
   if (!sp.isDeployed) return false;
   if (!mod.IsPlayerValid(sp.player)) return false;
   if (!isPlayerAlive(sp.player)) return false;
-  if (isBotBackfillPlayer(sp.player)) return false;
 
   const team = getCipherKeyTeamSnapshot(sp.id) ?? sp.team;
   if (!mod.Equals(team, team1) && !mod.Equals(team, team2)) return false;
@@ -3578,6 +3680,7 @@ function getDeployedPlayerPositionsForBombBaseSelection(): mod.Vector[] {
     if (!sp || !sp.isDeployed) return;
     if (!mod.IsPlayerValid(sp.player)) return;
     if (!isPlayerAlive(sp.player)) return;
+    if (isCipherRuntimeBotPlayerId(sp.id)) return;
     if (isBotBackfillPlayer(sp.player)) return;
 
     const playerTeam = getCipherKeyTeamSnapshot(sp.id) ?? sp.team;
@@ -3600,6 +3703,857 @@ function getObjectiveCapturePointPosition(cpId: number): mod.Vector | undefined 
   } catch (_err) {
     return undefined;
   }
+}
+
+function clearBotObjectiveStateForPlayer(playerId: number): void {
+  delete botObjectiveAssignedRoleByPlayerId[playerId];
+  delete botObjectiveLastCommandAtSecByPlayerId[playerId];
+  delete botObjectiveLastTargetByPlayerId[playerId];
+  delete botLiveSpawnRequestedByPlayerId[playerId];
+  delete botLiveSpawnNextAttemptAtSecByPlayerId[playerId];
+}
+
+function clearBotObjectiveAssignments(): void {
+  botObjectiveAssignedRoleByPlayerId = {};
+  botObjectiveLastCommandAtSecByPlayerId = {};
+  botObjectiveLastTargetByPlayerId = {};
+  botObjectiveNextThinkAtSec = 0;
+}
+
+function clearBotObjectiveState(): void {
+  clearBotObjectiveAssignments();
+  botLiveSpawnRequestedByPlayerId = {};
+  botLiveSpawnNextAttemptAtSecByPlayerId = {};
+}
+
+function getPlayerIdSafe(player: mod.Player): number | undefined {
+  try {
+    return modlib.getPlayerId(player);
+  } catch (_err) {
+    return undefined;
+  }
+}
+
+function markBotBackfillPlayerId(playerId: number): void {
+  botBackfillKnownByPlayerId[playerId] = true;
+}
+
+function isKnownBotBackfillPlayerId(playerId: number): boolean {
+  return botBackfillKnownByPlayerId[playerId] === true;
+}
+
+function isBotBackfillPlayerSafe(player: mod.Player): boolean {
+  const playerId = getPlayerIdSafe(player);
+  try {
+    const isBot = isBotBackfillPlayer(player);
+    if (isBot && playerId !== undefined) markBotBackfillPlayerId(playerId);
+    if (isBot) return true;
+  } catch (_err) {
+    return playerId !== undefined && isKnownBotBackfillPlayerId(playerId);
+  }
+  return playerId !== undefined && isKnownBotBackfillPlayerId(playerId);
+}
+
+function getRuntimeBotSlotById(slotId: number | undefined): RuntimeBotSlot | undefined {
+  if (slotId === undefined) return undefined;
+  const slot = runtimeBotSlotsBySlotId[slotId];
+  if (!slot || slot.retired) return undefined;
+  return slot;
+}
+
+function getRuntimeBotSlotForPlayerId(playerId: number): RuntimeBotSlot | undefined {
+  return getRuntimeBotSlotById(runtimeBotSlotByPlayerId[playerId]);
+}
+
+function isCipherRuntimeBotPlayerId(playerId: number): boolean {
+  return getRuntimeBotSlotForPlayerId(playerId) !== undefined || runtimeBotReleasedPlayerId[playerId] === true;
+}
+
+function isCipherRuntimeBotPlayer(player: mod.Player): boolean {
+  const playerId = getPlayerIdSafe(player);
+  return playerId !== undefined && isCipherRuntimeBotPlayerId(playerId);
+}
+
+function clearRuntimeBotPlayerBinding(slot: RuntimeBotSlot, releaseOldPlayerId: boolean): void {
+  const oldPlayerId = slot.playerId;
+  if (oldPlayerId !== undefined) {
+    delete runtimeBotSlotByPlayerId[oldPlayerId];
+    if (releaseOldPlayerId) runtimeBotReleasedPlayerId[oldPlayerId] = true;
+  }
+  slot.player = undefined;
+  slot.playerId = undefined;
+  slot.spawning = false;
+  slot.forceRespawnAfterSec = 0;
+}
+
+function configureRuntimeBotCombat(player: mod.Player): void {
+  try {
+    mod.AIEnableTargeting(player, true);
+  } catch (_errTargeting) {}
+  try {
+    mod.AIEnableShooting(player, true);
+  } catch (_errShooting) {}
+  try {
+    mod.AIGadgetSettings(player, true, true, true);
+  } catch (_errGadgets) {}
+}
+
+function routeRuntimeBotToCipherSpawnAnchor(player: mod.Player, playerId: number, context: string): void {
+  requestCipherSpawnAnchorForPlayer(playerId, true);
+  processCipherSpawnJobs(context + "_anchor");
+  requestCipherSpawnTeleportForPlayer(playerId, true);
+  processCipherSpawnJobs(context + "_teleport");
+  teleportCipherPlayerToRoutedAnchor(player, playerId);
+  if (gameStatus === 3) SafeSpawnCheckOrRedeploy(playerId);
+  if (bombCarrierPlayerId === playerId) {
+    syncCipherCarrierVisualsNow(getCurrentSchedulerNowSeconds(), context + "_carrier_visuals");
+  }
+}
+
+function getRuntimeBotClassForSlot(slotId: number): mod.SoldierClass {
+  const classSlot = (slotId - 1) % 4;
+  if (classSlot === 0) return mod.SoldierClass.Assault;
+  if (classSlot === 1) return mod.SoldierClass.Engineer;
+  if (classSlot === 2) return mod.SoldierClass.Recon;
+  return mod.SoldierClass.Support;
+}
+
+function forEachRuntimeBotSlot(callback: (slot: RuntimeBotSlot) => void): void {
+  for (const slotIdKey in runtimeBotSlotsBySlotId) {
+    const slot = runtimeBotSlotsBySlotId[Number(slotIdKey)];
+    if (!slot || slot.retired) continue;
+    callback(slot);
+  }
+}
+
+function countActiveRuntimeBotSlots(): number {
+  let count = 0;
+  forEachRuntimeBotSlot(() => {
+    count += 1;
+  });
+  return count;
+}
+
+function countRuntimeControlledPlayersByTeam(): { team1Count: number; team2Count: number; total: number } {
+  let team1Count = 0;
+  let team2Count = 0;
+
+  serverPlayers.forEach((sp) => {
+    if (!sp || !mod.IsPlayerValid(sp.player)) return;
+    if (isCipherRuntimeBotPlayerId(sp.id)) return;
+    if (isBotBackfillPlayerSafe(sp.player)) return;
+
+    const team = getCipherKeyTeamSnapshot(sp.id) ?? mod.GetTeam(sp.player);
+    if (mod.Equals(team, team1)) team1Count += 1;
+    else if (mod.Equals(team, team2)) team2Count += 1;
+  });
+
+  forEachRuntimeBotSlot((slot) => {
+    if (mod.Equals(slot.desiredTeam, team1)) team1Count += 1;
+    else if (mod.Equals(slot.desiredTeam, team2)) team2Count += 1;
+  });
+
+  return {
+    team1Count,
+    team2Count,
+    total: team1Count + team2Count,
+  };
+}
+
+function chooseRuntimeBotTeamForNewSlot(): mod.Team {
+  const counts = countRuntimeControlledPlayersByTeam();
+  return counts.team1Count <= counts.team2Count ? team1 : team2;
+}
+
+function createRuntimeBotSlot(desiredTeam: mod.Team, nowSec: number): RuntimeBotSlot {
+  const slotId = runtimeBotNextSlotId;
+  runtimeBotNextSlotId += 1;
+
+  const slot: RuntimeBotSlot = {
+    slotId,
+    desiredTeam,
+    classToSpawn: getRuntimeBotClassForSlot(slotId),
+    spawner: undefined,
+    spawnerObjId: 0,
+    player: undefined,
+    playerId: undefined,
+    nextSpawnAtSec: nowSec,
+    forceRespawnAfterSec: 0,
+    spawning: false,
+    retired: false,
+  };
+
+  runtimeBotSlotsBySlotId[slotId] = slot;
+  return slot;
+}
+
+function getRuntimeBotSpawnerCandidateIdsForTeam(team: mod.Team): number[] {
+  const candidates: number[] = [];
+  const addedById: { [spawnerObjId: number]: boolean } = {};
+
+  addBotSpawnCandidate(candidates, addedById, getInitialSpawnPointObjIdForTeam(team));
+
+  const safeSpawnerIds = getLiveSafeSpawnPlayerSpawnerIdsForTeam(team);
+  for (let i = 0; i < safeSpawnerIds.length; i++) {
+    addBotSpawnCandidate(candidates, addedById, safeSpawnerIds[i]);
+  }
+
+  for (let i = 0; i < BOT_SPAWN_ROUTE_FALLBACK_KEYS.length; i++) {
+    const routeSpawners = getSpawnersForTeamAndRoute(team, BOT_SPAWN_ROUTE_FALLBACK_KEYS[i]);
+    for (let j = 0; j < routeSpawners.length; j++) {
+      addBotSpawnCandidate(candidates, addedById, routeSpawners[j]);
+    }
+  }
+
+  return candidates;
+}
+
+function resolveRuntimeBotSpawnerPosition(slot: RuntimeBotSlot): mod.Vector | undefined {
+  const candidates = getRuntimeBotSpawnerCandidateIdsForTeam(slot.desiredTeam);
+  for (let i = 0; i < candidates.length; i++) {
+    const pos = tryGetSpawnPointPositionSafe(candidates[i]);
+    if (pos) return getBotOffsetTarget(pos, slot.slotId, 1.25);
+  }
+
+  return undefined;
+}
+
+function ensureRuntimeBotSpawnerForSlot(slot: RuntimeBotSlot): boolean {
+  if (slot.retired) return false;
+  if (slot.spawner && slot.spawnerObjId > 0) return true;
+
+  const pos = resolveRuntimeBotSpawnerPosition(slot);
+  if (!pos) return false;
+
+  let spawner: mod.Spawner | undefined = undefined;
+  try {
+    spawner = mod.SpawnObject(mod.RuntimeSpawn_Common.AI_Spawner, pos, BOMB_DROP_ROTATION) as mod.Spawner;
+  } catch (err) {
+    LogRuntimeError("runtime_bot_spawn_ai_spawner", err);
+    return false;
+  }
+
+  if (!spawner) return false;
+
+  slot.spawner = spawner;
+  try {
+    slot.spawnerObjId = mod.GetObjId(spawner as mod.Object);
+    runtimeBotSlotBySpawnerObjId[slot.spawnerObjId] = slot.slotId;
+  } catch (_errObjId) {
+    slot.spawnerObjId = 0;
+  }
+
+  try {
+    mod.AISetUnspawnOnDead(spawner, true);
+  } catch (_errUnspawnOnDead) {}
+  try {
+    mod.SetUnspawnDelayInSeconds(spawner, CIPHER_RUNTIME_BOT_UNSPAWN_DELAY_SECONDS);
+  } catch (_errUnspawnDelay) {}
+
+  return slot.spawnerObjId > 0;
+}
+
+function spawnRuntimeBotFromSlot(slot: RuntimeBotSlot, nowSec: number, context: string): void {
+  if (slot.retired) return;
+  if (!ensureRuntimeBotSpawnerForSlot(slot)) {
+    slot.nextSpawnAtSec = nowSec + CIPHER_RUNTIME_BOT_SPAWN_RETRY_SECONDS;
+    return;
+  }
+  if (!slot.spawner) return;
+  if (nowSec < slot.nextSpawnAtSec) return;
+
+  try {
+    mod.SpawnAIFromAISpawner(
+      slot.spawner,
+      slot.classToSpawn,
+      mod.Message("Cipher Bot {}", slot.slotId),
+      slot.desiredTeam
+    );
+    slot.spawning = true;
+    slot.nextSpawnAtSec = nowSec + CIPHER_RUNTIME_BOT_SPAWN_RETRY_SECONDS;
+    slot.forceRespawnAfterSec = 0;
+  } catch (err) {
+    LogRuntimeError("runtime_bot_spawn/" + context, err);
+    slot.spawning = false;
+    slot.nextSpawnAtSec = nowSec + CIPHER_RUNTIME_BOT_SPAWN_RETRY_SECONDS;
+  }
+}
+
+function retireRuntimeBotSlot(slot: RuntimeBotSlot, context: string): void {
+  slot.retired = true;
+  clearRuntimeBotPlayerBinding(slot, true);
+
+  if (slot.spawner) {
+    try {
+      mod.UnspawnAllAIsFromAISpawner(slot.spawner);
+    } catch (_errUnspawnAi) {}
+    try {
+      mod.UnspawnObject(slot.spawner as mod.Object);
+    } catch (_errUnspawnSpawner) {}
+  }
+
+  if (slot.spawnerObjId > 0) delete runtimeBotSlotBySpawnerObjId[slot.spawnerObjId];
+  delete runtimeBotSlotsBySlotId[slot.slotId];
+  void context;
+}
+
+function clearRuntimeBotState(unspawnSpawners: boolean): void {
+  for (const slotIdKey in runtimeBotSlotsBySlotId) {
+    const slot = runtimeBotSlotsBySlotId[Number(slotIdKey)];
+    if (!slot) continue;
+    if (unspawnSpawners) {
+      retireRuntimeBotSlot(slot, "clear_runtime_bot_state");
+    }
+  }
+
+  runtimeBotSlotsBySlotId = {};
+  runtimeBotSlotByPlayerId = {};
+  runtimeBotSlotBySpawnerObjId = {};
+  runtimeBotNextSlotId = 1;
+  runtimeBotNextReconcileAtSec = 0;
+}
+
+function chooseRuntimeBotSlotToRetire(): RuntimeBotSlot | undefined {
+  let best: RuntimeBotSlot | undefined = undefined;
+  forEachRuntimeBotSlot((slot) => {
+    if (!best || slot.slotId > best.slotId) best = slot;
+  });
+  return best;
+}
+
+function reconcileRuntimeBotSlotCount(nowSec: number): void {
+  let counts = countRuntimeControlledPlayersByTeam();
+
+  while (counts.total > CIPHER_RUNTIME_BOT_TARGET_TOTAL_PLAYERS) {
+    const slot = chooseRuntimeBotSlotToRetire();
+    if (!slot) return;
+    retireRuntimeBotSlot(slot, "over_target");
+    counts = countRuntimeControlledPlayersByTeam();
+  }
+
+  while (counts.total < CIPHER_RUNTIME_BOT_TARGET_TOTAL_PLAYERS) {
+    createRuntimeBotSlot(chooseRuntimeBotTeamForNewSlot(), nowSec);
+    counts = countRuntimeControlledPlayersByTeam();
+  }
+}
+
+function shouldRuntimeBotSlotSpawn(slot: RuntimeBotSlot, nowSec: number): boolean {
+  if (slot.retired) return false;
+  if (slot.playerId === undefined) return true;
+
+  const sp = serverPlayers.get(slot.playerId);
+  if (!sp || !mod.IsPlayerValid(sp.player)) return true;
+  if (!sp.isDeployed) return true;
+
+  if (slot.forceRespawnAfterSec > 0 && nowSec >= slot.forceRespawnAfterSec && !isPlayerAliveSafe(sp.player)) {
+    clearRuntimeBotPlayerBinding(slot, true);
+    return true;
+  }
+
+  return false;
+}
+
+function reconcileRuntimeBotSpawns(nowSec: number): void {
+  forEachRuntimeBotSlot((slot) => {
+    if (!shouldRuntimeBotSlotSpawn(slot, nowSec)) return;
+    if (slot.spawning && nowSec < slot.nextSpawnAtSec) return;
+    spawnRuntimeBotFromSlot(slot, nowSec, "reconcile");
+  });
+}
+
+function reconcileRuntimeBots(nowSec: number): void {
+  if (!CIPHER_RUNTIME_BOTS_ENABLED) {
+    if (countActiveRuntimeBotSlots() > 0) clearRuntimeBotState(true);
+    return;
+  }
+  if (gameStatus !== 3 || cipherSecondHalfTransitionActive || cipherSuddenDeathTransitionActive) return;
+  if (nowSec < runtimeBotNextReconcileAtSec) return;
+  runtimeBotNextReconcileAtSec = nowSec + CIPHER_RUNTIME_BOT_RECONCILE_INTERVAL_SECONDS;
+
+  reconcileRuntimeBotSlotCount(nowSec);
+  reconcileRuntimeBotSpawns(nowSec);
+}
+
+function bindRuntimeBotPlayerToSlot(slot: RuntimeBotSlot, player: mod.Player): void {
+  const playerId = modlib.getPlayerId(player);
+  clearRuntimeBotPlayerBinding(slot, false);
+
+  slot.player = player;
+  slot.playerId = playerId;
+  slot.spawning = false;
+  slot.forceRespawnAfterSec = 0;
+  runtimeBotSlotByPlayerId[playerId] = slot.slotId;
+  delete runtimeBotReleasedPlayerId[playerId];
+
+  mod.SetTeam(player, slot.desiredTeam);
+  configureRuntimeBotCombat(player);
+
+  let sp = serverPlayers.get(playerId);
+  if (!sp) {
+    sp = new Player(player);
+    serverPlayers.set(playerId, sp);
+  } else {
+    sp.player = player;
+  }
+
+  sp.team = slot.desiredTeam;
+  sp.isDeployed = true;
+  sp.setTeam();
+  applyPhaseInputRestrictionsForPlayer(player);
+  applyPrematch889HealthForPlayer(playerId);
+  mod.SetRedeployTime(player, REDEPLOY_TIME);
+  routeRuntimeBotToCipherSpawnAnchor(player, playerId, "runtime_bot_spawned");
+  repairCipherKeyHudCacheForPlayer(sp, true);
+  botObjectiveNextThinkAtSec = 0;
+}
+
+function markRuntimeBotSlotForRespawn(playerId: number, delaySeconds: number): void {
+  const slot = getRuntimeBotSlotForPlayerId(playerId);
+  if (!slot) return;
+  slot.forceRespawnAfterSec = getCurrentSchedulerNowSeconds() + delaySeconds;
+  slot.nextSpawnAtSec = slot.forceRespawnAfterSec;
+  slot.spawning = false;
+}
+
+function detachRuntimeBotPlayerForRespawn(playerId: number, delaySeconds: number): void {
+  const slot = getRuntimeBotSlotForPlayerId(playerId);
+  if (!slot) return;
+  if (slot.spawner) {
+    try {
+      mod.UnspawnAllAIsFromAISpawner(slot.spawner);
+    } catch (_errUnspawnAi) {}
+  }
+  clearRuntimeBotPlayerBinding(slot, true);
+  slot.nextSpawnAtSec = getCurrentSchedulerNowSeconds() + delaySeconds;
+}
+
+function isLiveBotPlayer(sp: Player | undefined): boolean {
+  if (!sp) return false;
+  if (!mod.IsPlayerValid(sp.player)) return false;
+  if (!CIPHER_RUNTIME_BOTS_ENABLED) return false;
+  if (!getRuntimeBotSlotForPlayerId(sp.id)) return false;
+  const team = getCipherKeyTeamSnapshot(sp.id) ?? mod.GetTeam(sp.player);
+  return mod.Equals(team, team1) || mod.Equals(team, team2);
+}
+
+function isLiveBotDeployedAndAlive(sp: Player | undefined): sp is Player {
+  if (!sp) return false;
+  if (!isLiveBotPlayer(sp)) return false;
+  if (!sp.isDeployed) return false;
+  return isPlayerAliveSafe(sp.player);
+}
+
+function hasLiveBots(): boolean {
+  let found = false;
+  serverPlayers.forEach((sp) => {
+    if (found) return;
+    if (isLiveBotPlayer(sp)) found = true;
+  });
+  return found;
+}
+
+function requestLiveBotSpawnForPlayerId(
+  playerId: number,
+  source: string,
+  delaySeconds: number = BOT_LIVE_SPAWN_INITIAL_DELAY_SECONDS
+): void {
+  if (gameStatus !== 3) return;
+  if (cipherSecondHalfTransitionActive || cipherSuddenDeathTransitionActive) return;
+
+  const slot = getRuntimeBotSlotForPlayerId(playerId);
+  if (!slot) return;
+  if (source.indexOf("Undeploy") >= 0) {
+    detachRuntimeBotPlayerForRespawn(playerId, delaySeconds);
+  } else {
+    markRuntimeBotSlotForRespawn(playerId, delaySeconds);
+  }
+  runtimeBotNextReconcileAtSec = 0;
+}
+
+function requestLiveBotSpawnsForAllBots(_source: string): void {
+  runtimeBotNextReconcileAtSec = 0;
+  reconcileRuntimeBots(getCurrentSchedulerNowSeconds());
+}
+
+function processLiveBotSpawnRequests(nowSec: number): void {
+  reconcileRuntimeBots(nowSec);
+}
+
+function addBotSpawnCandidate(
+  candidates: number[],
+  addedById: { [spawnerObjId: number]: boolean },
+  spawnerObjId: number
+): void {
+  if (!spawnerObjId) return;
+  if (addedById[spawnerObjId] === true) return;
+  addedById[spawnerObjId] = true;
+  candidates.push(spawnerObjId);
+}
+
+function resolveBotLiveSpawnSpawnerObjId(playerId: number, team: mod.Team): number {
+  const candidates: number[] = [];
+  const addedById: { [spawnerObjId: number]: boolean } = {};
+
+  addBotSpawnCandidate(candidates, addedById, resolveSafeSpawnSpawnerObjId(playerId, team));
+  addBotSpawnCandidate(candidates, addedById, getInitialSpawnPointObjIdForTeam(team));
+
+  const safeSpawnerIds = getLiveSafeSpawnPlayerSpawnerIdsForTeam(team);
+  for (let i = 0; i < safeSpawnerIds.length; i++) {
+    addBotSpawnCandidate(candidates, addedById, safeSpawnerIds[i]);
+  }
+
+  for (let i = 0; i < BOT_SPAWN_ROUTE_FALLBACK_KEYS.length; i++) {
+    const routeSpawners = getSpawnersForTeamAndRoute(team, BOT_SPAWN_ROUTE_FALLBACK_KEYS[i]);
+    for (let j = 0; j < routeSpawners.length; j++) {
+      addBotSpawnCandidate(candidates, addedById, routeSpawners[j]);
+    }
+  }
+
+  for (let i = 0; i < candidates.length; i++) {
+    const candidate = candidates[i];
+    if (tryGetSpawnPointPositionSafe(candidate) !== undefined) return candidate;
+  }
+
+  return 0;
+}
+
+function shouldIssueBotMoveCommand(playerId: number, role: BotObjectiveRole, target: mod.Vector, nowSec: number): boolean {
+  const lastRole = botObjectiveAssignedRoleByPlayerId[playerId];
+  const lastCommandAt = botObjectiveLastCommandAtSecByPlayerId[playerId] ?? -999999;
+  const lastTarget = botObjectiveLastTargetByPlayerId[playerId];
+
+  if (lastRole !== role) return true;
+  if (!lastTarget) return true;
+  if (mod.DistanceBetween(lastTarget, target) > BOT_OBJECTIVE_TARGET_REISSUE_DISTANCE_METERS) return true;
+  return nowSec - lastCommandAt >= BOT_OBJECTIVE_COMMAND_REFRESH_SECONDS;
+}
+
+function issueBotMoveCommand(sp: Player, role: BotObjectiveRole, target: mod.Vector, nowSec: number): void {
+  if (!isLiveBotDeployedAndAlive(sp)) return;
+  if (!shouldIssueBotMoveCommand(sp.id, role, target, nowSec)) return;
+
+  let issued = false;
+  try {
+    mod.AIValidatedMoveToBehavior(sp.player, target);
+    issued = true;
+  } catch (_errValidated) {
+    try {
+      mod.AIMoveToBehavior(sp.player, target);
+      issued = true;
+    } catch (_errMove) {}
+  }
+
+  if (!issued) return;
+  botObjectiveAssignedRoleByPlayerId[sp.id] = role;
+  botObjectiveLastCommandAtSecByPlayerId[sp.id] = nowSec;
+  botObjectiveLastTargetByPlayerId[sp.id] = target;
+}
+
+function getBotOffsetTarget(baseTarget: mod.Vector, playerId: number, radiusMeters: number): mod.Vector {
+  const slot = playerId % 8;
+  let x = 0;
+  let z = 0;
+
+  if (slot === 0) x = radiusMeters;
+  else if (slot === 1) x = -radiusMeters;
+  else if (slot === 2) z = radiusMeters;
+  else if (slot === 3) z = -radiusMeters;
+  else if (slot === 4) {
+    x = radiusMeters;
+    z = radiusMeters;
+  } else if (slot === 5) {
+    x = -radiusMeters;
+    z = radiusMeters;
+  } else if (slot === 6) {
+    x = radiusMeters;
+    z = -radiusMeters;
+  } else {
+    x = -radiusMeters;
+    z = -radiusMeters;
+  }
+
+  return mod.Add(baseTarget, mod.CreateVector(x, 0, z));
+}
+
+function getBotCipherKeyTargetPosition(): mod.Vector | undefined {
+  if (bombCarrierPlayerId !== undefined) return undefined;
+  if (hasDroppedBombRuntimeObjects()) {
+    const droppedIconTarget = bombDroppedWorldIconObject
+      ? (bombDroppedWorldIconObject as unknown)
+      : (bombDroppedWorldIconHandle as unknown);
+    const droppedIconPosition = getObjectPositionSafeValidated(droppedIconTarget, "bot_dropped_key_world_icon").position;
+    return droppedIconPosition ?? tryResolveDroppedBombAnchorPosition();
+  }
+  if (bombPickupTriggerEnabled) {
+    return tryResolveBombBaseRuntimeLootPosition("bot_base_key_runtime") ?? tryGetActiveBasePickupAnchor();
+  }
+  return undefined;
+}
+
+function canBotRunToCipherKey(sp: Player, keyIsDropped: boolean): boolean {
+  if (!isLiveBotDeployedAndAlive(sp)) return false;
+  if (bombCarrierPlayerId === sp.id) return false;
+  return keyIsDropped ? isEligibleDroppedBombReclaimCandidate(sp) : isEligibleBombRadiusPickupCandidate(sp);
+}
+
+function isValidBotCarrierDeliveryObjective(cpId: number, carrierTeam: mod.Team): boolean {
+  if (!isObjectiveCpId(cpId)) return false;
+  if (isObjectiveDisabledAfterAward(cpId)) return false;
+  if (!isCipherNodeActive(cpId)) return false;
+  if (mod.Equals(carrierTeam, teamNeutral)) return false;
+  return !mod.Equals(carrierTeam, getObjectiveDefendingTeamForCurrentHalf(cpId));
+}
+
+function chooseNearestBotDeliveryPositionFromOrigin(origin: mod.Vector, carrierTeam: mod.Team): mod.Vector | undefined {
+  let bestPos: mod.Vector | undefined = undefined;
+  let bestDistance = 999999;
+
+  for (let i = 0; i < OBJECTIVE_DEFINITIONS.length; i++) {
+    const cpId = OBJECTIVE_DEFINITIONS[i].cpId;
+    if (!isValidBotCarrierDeliveryObjective(cpId, carrierTeam)) continue;
+
+    const cpPos = getObjectiveCapturePointPosition(cpId);
+    if (!cpPos) continue;
+    const dist = mod.DistanceBetween(origin, cpPos);
+    if (!bestPos || dist < bestDistance - 0.0001) {
+      bestPos = cpPos;
+      bestDistance = dist;
+    }
+  }
+
+  return bestPos;
+}
+
+function chooseNearestBotCarrierDeliveryPosition(carrier: Player, carrierTeam: mod.Team): mod.Vector | undefined {
+  const carrierPos = tryGetPlayerPositionSafe(carrier.player);
+  if (!carrierPos) return undefined;
+  return chooseNearestBotDeliveryPositionFromOrigin(carrierPos, carrierTeam);
+}
+
+function chooseNearestBotTeammatePosition(sp: Player, botTeam: mod.Team): mod.Vector | undefined {
+  const botPos = tryGetPlayerPositionSafe(sp.player);
+  if (!botPos) return undefined;
+
+  let bestPos: mod.Vector | undefined = undefined;
+  let bestDistance = 999999;
+  let bestPlayerId = 999999;
+
+  serverPlayers.forEach((candidate) => {
+    if (!candidate || candidate.id === sp.id) return;
+    if (!candidate.isDeployed || !mod.IsPlayerValid(candidate.player) || !isPlayerAliveSafe(candidate.player)) return;
+    const candidateTeam = getCipherKeyTeamSnapshot(candidate.id) ?? mod.GetTeam(candidate.player);
+    if (!mod.Equals(candidateTeam, botTeam)) return;
+
+    const candidatePos = tryGetPlayerPositionSafe(candidate.player);
+    if (!candidatePos) return;
+    const dist = mod.DistanceBetween(botPos, candidatePos);
+    if (!bestPos || dist < bestDistance - 0.0001 || (Math.abs(dist - bestDistance) <= 0.0001 && candidate.id < bestPlayerId)) {
+      bestPos = candidatePos;
+      bestDistance = dist;
+      bestPlayerId = candidate.id;
+    }
+  });
+
+  return bestPos;
+}
+
+function tryIssueBotReviveAssignment(sp: Player, nowSec: number): boolean {
+  if (!isLiveBotDeployedAndAlive(sp)) return false;
+  if (bombCarrierPlayerId === sp.id) return false;
+
+  const botTeam = getCipherKeyTeamSnapshot(sp.id) ?? mod.GetTeam(sp.player);
+  const botPos = tryGetPlayerPositionSafe(sp.player);
+  if (!botPos) return false;
+
+  const best = {
+    player: undefined as mod.Player | undefined,
+    playerId: 999999,
+    pos: undefined as mod.Vector | undefined,
+    distance: CIPHER_RUNTIME_BOT_REVIVE_SCAN_RADIUS_METERS + 0.0001,
+  };
+
+  serverPlayers.forEach((candidate) => {
+    if (!candidate || candidate.id === sp.id) return;
+    if (playerInMandownByPlayerId[candidate.id] !== true) return;
+    if (!mod.IsPlayerValid(candidate.player)) return;
+
+    const candidateTeam = getCipherKeyTeamSnapshot(candidate.id) ?? mod.GetTeam(candidate.player);
+    if (!mod.Equals(candidateTeam, botTeam)) return;
+
+    const candidatePos = tryGetPlayerPositionSafe(candidate.player);
+    if (!candidatePos) return;
+
+    const dist = mod.DistanceBetween(botPos, candidatePos);
+    if (dist > CIPHER_RUNTIME_BOT_REVIVE_SCAN_RADIUS_METERS) return;
+    if (
+      best.player === undefined ||
+      dist < best.distance - 0.0001 ||
+      (Math.abs(dist - best.distance) <= 0.0001 && candidate.id < best.playerId)
+    ) {
+      best.player = candidate.player;
+      best.pos = candidatePos;
+      best.distance = dist;
+      best.playerId = candidate.id;
+    }
+  });
+
+  if (!best.player || !best.pos) return false;
+
+  if (best.distance <= CIPHER_RUNTIME_BOT_REVIVE_FORCE_RADIUS_METERS) {
+    try {
+      mod.ForceRevive(best.player);
+      delete playerInMandownByPlayerId[best.playerId];
+      botObjectiveNextThinkAtSec = 0;
+      return true;
+    } catch (_errRevive) {}
+  }
+
+  issueBotMoveCommand(sp, "revive", getBotOffsetTarget(best.pos, sp.id, 1.25), nowSec);
+  return true;
+}
+
+function chooseBotFallbackAssignment(sp: Player): { role: BotObjectiveRole; target: mod.Vector } | undefined {
+  const botTeam = getCipherKeyTeamSnapshot(sp.id) ?? mod.GetTeam(sp.player);
+  const botPos = tryGetPlayerPositionSafe(sp.player);
+  if (!botPos) return undefined;
+
+  const teammatePos = chooseNearestBotTeammatePosition(sp, botTeam);
+  if (teammatePos) {
+    return {
+      role: "regroup",
+      target: getBotOffsetTarget(teammatePos, sp.id, 2.25),
+    };
+  }
+
+  const pressurePos = chooseNearestBotDeliveryPositionFromOrigin(botPos, botTeam);
+  if (pressurePos) {
+    return {
+      role: "pressureObjective",
+      target: getBotOffsetTarget(pressurePos, sp.id, 2.75),
+    };
+  }
+
+  return {
+    role: "regroup",
+    target: botPos,
+  };
+}
+
+type BotCarrierRoutingResult = {
+  carrierId: number | undefined;
+  carrierTeam: mod.Team | undefined;
+  carrierPos: mod.Vector | undefined;
+  routed: boolean;
+};
+
+function evaluateBotCarrierRouting(nowSec: number): BotCarrierRoutingResult {
+  if (bombCarrierPlayerId === undefined) {
+    return { carrierId: undefined, carrierTeam: undefined, carrierPos: undefined, routed: false };
+  }
+
+  const carrier = serverPlayers.get(bombCarrierPlayerId);
+  if (!carrier || !carrier.isDeployed || !mod.IsPlayerValid(carrier.player) || !isPlayerAliveSafe(carrier.player)) {
+    return { carrierId: bombCarrierPlayerId, carrierTeam: undefined, carrierPos: undefined, routed: false };
+  }
+
+  const carrierTeam = getCipherKeyTeamSnapshot(carrier.id) ?? mod.GetTeam(carrier.player);
+  const carrierPos = tryGetPlayerPositionSafe(carrier.player);
+  if (!isLiveBotPlayer(carrier)) {
+    return { carrierId: carrier.id, carrierTeam, carrierPos, routed: false };
+  }
+
+  tryDeliverCipherKeyFromActiveObjectiveAreaForCarrier(carrier.id);
+  if (bombCarrierPlayerId !== carrier.id) {
+    return { carrierId: carrier.id, carrierTeam, carrierPos, routed: true };
+  }
+
+  const target = chooseNearestBotCarrierDeliveryPosition(carrier, carrierTeam);
+  if (!target) {
+    const fallback = chooseBotFallbackAssignment(carrier);
+    if (fallback) {
+      issueBotMoveCommand(carrier, fallback.role, fallback.target, nowSec);
+      return { carrierId: carrier.id, carrierTeam, carrierPos, routed: true };
+    }
+    return { carrierId: carrier.id, carrierTeam, carrierPos, routed: false };
+  }
+
+  issueBotMoveCommand(carrier, "deliverKey", target, nowSec);
+  return { carrierId: carrier.id, carrierTeam, carrierPos, routed: true };
+}
+
+function evaluateBotKeyRunnerRouting(nowSec: number, excludedPlayerId: number | undefined): { [playerId: number]: boolean } {
+  const routedByPlayerId: { [playerId: number]: boolean } = {};
+  const keyTarget = getBotCipherKeyTargetPosition();
+  if (!keyTarget) return routedByPlayerId;
+
+  const keyIsDropped = hasDroppedBombRuntimeObjects();
+  serverPlayers.forEach((sp) => {
+    if (!canBotRunToCipherKey(sp, keyIsDropped)) return;
+    if (excludedPlayerId !== undefined && sp.id === excludedPlayerId) return;
+    if (tryIssueBotReviveAssignment(sp, nowSec)) {
+      routedByPlayerId[sp.id] = true;
+      return;
+    }
+    issueBotMoveCommand(sp, "seekKey", keyTarget, nowSec);
+    routedByPlayerId[sp.id] = true;
+  });
+
+  return routedByPlayerId;
+}
+
+function evaluateBotCarrierSupportRouting(
+  nowSec: number,
+  carrierRouting: BotCarrierRoutingResult,
+  routedByPlayerId: { [playerId: number]: boolean }
+): void {
+  if (carrierRouting.carrierId === undefined) return;
+  if (carrierRouting.carrierTeam === undefined || !carrierRouting.carrierPos) return;
+
+  serverPlayers.forEach((sp) => {
+    if (!isLiveBotDeployedAndAlive(sp)) return;
+    if (sp.id === carrierRouting.carrierId) return;
+
+    const botTeam = getCipherKeyTeamSnapshot(sp.id) ?? mod.GetTeam(sp.player);
+    const friendlyCarrier = mod.Equals(botTeam, carrierRouting.carrierTeam);
+    const role: BotObjectiveRole = friendlyCarrier ? "escortCarrier" : "interceptCarrier";
+    const offsetMeters = friendlyCarrier ? 2.75 : 3.5;
+    issueBotMoveCommand(sp, role, getBotOffsetTarget(carrierRouting.carrierPos as mod.Vector, sp.id, offsetMeters), nowSec);
+    routedByPlayerId[sp.id] = true;
+  });
+}
+
+function evaluateBotObjectiveController(nowSec: number): void {
+  if (gameStatus !== 3) {
+    clearBotObjectiveAssignments();
+    return;
+  }
+
+  reconcileRuntimeBots(nowSec);
+
+  if (!hasLiveBots()) {
+    clearBotObjectiveAssignments();
+    return;
+  }
+
+  if (cipherSecondHalfTransitionActive || cipherSuddenDeathTransitionActive) return;
+  if (nowSec < botObjectiveNextThinkAtSec) return;
+  botObjectiveNextThinkAtSec = nowSec + BOT_OBJECTIVE_THINK_INTERVAL_SECONDS;
+
+  const carrierRouting = evaluateBotCarrierRouting(nowSec);
+  const routedByPlayerId = evaluateBotKeyRunnerRouting(nowSec, carrierRouting.carrierId);
+  if (carrierRouting.carrierId !== undefined && carrierRouting.routed) {
+    routedByPlayerId[carrierRouting.carrierId] = true;
+  }
+  evaluateBotCarrierSupportRouting(nowSec, carrierRouting, routedByPlayerId);
+
+  serverPlayers.forEach((sp) => {
+    if (!isLiveBotDeployedAndAlive(sp)) return;
+    if (routedByPlayerId[sp.id] === true) return;
+    if (tryIssueBotReviveAssignment(sp, nowSec)) return;
+    const fallback = chooseBotFallbackAssignment(sp);
+    if (!fallback) return;
+    issueBotMoveCommand(sp, fallback.role, fallback.target, nowSec);
+  });
 }
 
 function getBombVectorMidpoint(a: mod.Vector, b: mod.Vector): mod.Vector {
@@ -3628,13 +4582,14 @@ function resetCipherSpawnRoutingState(): void {
   cipherPresenceZoneActivePlayersByZone = {};
   cipherPresenceZonesByPlayerId = {};
   cipherAnchorPositionByObjectId = {};
-  cipherAnchorPositionSnapshotByObjectId = {};
   cipherCapturePointPositionByObjectId = {};
   cipherCapturePointPositionSnapshotByObjectId = {};
   cipherPlayerPositionSnapshotByPlayerId = {};
   cipherAnchorCooldownUntilSecByObjectId = {};
   cipherAnchorRoundRobinIndexByKey = {};
-  cipherVariantTieFlipBySide = {};
+  cipherSpawnRegionTieFlipByKey = {};
+  cipherLastSpawnRegionByTeamId = {};
+  cipherLastSpawnRegionAtSecByTeamId = {};
   cipherQueuedAnchorByPlayerId = {};
   cipherPendingSpawnJobs = [];
   cipherUrgentSpawnJobs = [];
@@ -3697,7 +4652,6 @@ function getCachedCipherAnchorPosition(anchorId: number): mod.Vector | undefined
     const spatialAnchor = mod.GetSpatialObject(anchorId);
     const position = mod.GetObjectPosition(spatialAnchor);
     cipherAnchorPositionByObjectId[anchorId] = position;
-    cipherAnchorPositionSnapshotByObjectId[anchorId] = snapshotVector(position);
     return position;
   } catch (_err) {
     cipherAnchorPositionByObjectId[anchorId] = undefined;
@@ -3739,45 +4693,238 @@ function refreshCipherPlayerPositionSnapshots(): void {
   });
 }
 
-function countCipherEnemyPresence(zone: CipherPresenceZone, enemyTeam: mod.Team): number {
+function getCipherTeamRoutingKey(team: mod.Team): string {
+  return String(modlib.getTeamId(team));
+}
+
+function getCipherSpawnRegionKey(region: CipherSpawnRegion): string {
+  return region.quadrant + ":" + region.variant;
+}
+
+function copyCipherSpawnRegion(region: CipherSpawnRegion): CipherSpawnRegion {
+  return {
+    quadrant: region.quadrant,
+    variant: region.variant,
+  };
+}
+
+function getCipherPresenceZoneSide(zone: CipherPresenceZone): CipherMapSide {
+  return zone === "northWest" || zone === "northEast" ? "north" : "south";
+}
+
+function getCipherRequiredSpawnVariantForSide(side: CipherMapSide): CipherSpawnVariant {
+  return side;
+}
+
+function isCipherSpawnRegionStrictForSide(region: CipherSpawnRegion, side: CipherMapSide): boolean {
+  return (
+    getCipherPresenceZoneSide(region.quadrant) === side &&
+    region.variant === getCipherRequiredSpawnVariantForSide(side)
+  );
+}
+
+function getCipherStrictSpawnRegionForQuadrant(quadrant: CipherPresenceZone): CipherSpawnRegion {
+  const side = getCipherPresenceZoneSide(quadrant);
+  return {
+    quadrant,
+    variant: getCipherRequiredSpawnVariantForSide(side),
+  };
+}
+
+function getCipherStrictSpawnRegionsForSide(side: CipherMapSide): CipherSpawnRegion[] {
+  if (side === "north") {
+    return [
+      { quadrant: "northWest", variant: "north" },
+      { quadrant: "northEast", variant: "north" },
+    ];
+  }
+
+  return [
+    { quadrant: "southWest", variant: "south" },
+    { quadrant: "southEast", variant: "south" },
+  ];
+}
+
+function getCipherAnchorIdsForRegion(region: CipherSpawnRegion): number[] {
+  if (region.quadrant === "northEast") {
+    return region.variant === "north" ? CIPHER_NORTH_EAST_NORTH_ANCHORS : CIPHER_NORTH_EAST_SOUTH_ANCHORS;
+  }
+  if (region.quadrant === "northWest") {
+    return region.variant === "north" ? CIPHER_NORTH_WEST_NORTH_ANCHORS : CIPHER_NORTH_WEST_SOUTH_ANCHORS;
+  }
+  if (region.quadrant === "southEast") {
+    return region.variant === "north" ? CIPHER_SOUTH_EAST_NORTH_ANCHORS : CIPHER_SOUTH_EAST_SOUTH_ANCHORS;
+  }
+  return region.variant === "north" ? CIPHER_SOUTH_WEST_NORTH_ANCHORS : CIPHER_SOUTH_WEST_SOUTH_ANCHORS;
+}
+
+function getCipherPresenceZoneLane(zone: CipherPresenceZone): CipherPresenceLane {
+  return zone === "northWest" || zone === "southWest" ? "west" : "east";
+}
+
+function getCipherStrictQuadrantForSideAndLane(side: CipherMapSide, lane: CipherPresenceLane): CipherPresenceZone {
+  if (side === "north") return lane === "west" ? "northWest" : "northEast";
+  return lane === "west" ? "southWest" : "southEast";
+}
+
+function isCipherPresenceEntryCountableEnemy(
+  playerId: number,
+  zone: CipherPresenceZone,
+  storedTeam: mod.Team | undefined,
+  enemyTeam: mod.Team
+): boolean {
+  const sp = serverPlayers.get(playerId);
+  let currentTeam: mod.Team | undefined = undefined;
+  let stale = false;
+
+  if (!sp || !mod.IsPlayerValid(sp.player) || !sp.isDeployed || !isPlayerAliveSafe(sp.player)) {
+    stale = true;
+  } else {
+    currentTeam = mod.GetTeam(sp.player);
+    if (storedTeam !== undefined && !mod.Equals(currentTeam, storedTeam)) {
+      stale = true;
+    }
+  }
+
+  if (stale) {
+    const players = cipherPresenceZoneActivePlayersByZone[zone];
+    if (players) delete players[playerId];
+    const zones = cipherPresenceZonesByPlayerId[playerId];
+    if (zones) delete zones[zone];
+    delete cipherPlayerPositionSnapshotByPlayerId[playerId];
+    return false;
+  }
+
+  return currentTeam !== undefined && mod.Equals(currentTeam, enemyTeam);
+}
+
+function countCipherEnemyPresenceInZone(zone: CipherPresenceZone, enemyTeam: mod.Team): number {
   const players = cipherPresenceZoneActivePlayersByZone[zone];
   if (!players) return 0;
 
   let count = 0;
   for (const playerIdKey in players) {
     const playerId = Number(playerIdKey);
-    const sp = serverPlayers.get(playerId);
-    if (!sp || !mod.IsPlayerValid(sp.player) || !sp.isDeployed) continue;
-    const team = players[playerId];
-    if (mod.Equals(team, enemyTeam)) count += 1;
+    if (isCipherPresenceEntryCountableEnemy(playerId, zone, players[playerId], enemyTeam)) {
+      count += 1;
+    }
   }
   return count;
 }
 
-function chooseCipherSpawnVariant(side: CipherMapSide, team: mod.Team): CipherHorizontalVariant {
-  const enemyTeam = getOpposingTeam(team);
-  const westZone: CipherPresenceZone = side === "north" ? "northWest" : "southWest";
-  const eastZone: CipherPresenceZone = side === "north" ? "northEast" : "southEast";
-  const westPressure = countCipherEnemyPresence(westZone, enemyTeam);
-  const eastPressure = countCipherEnemyPresence(eastZone, enemyTeam);
-
-  if (westPressure > eastPressure) return "east";
-  if (eastPressure > westPressure) return "west";
-
-  const tieKey = side;
-  const next = (cipherVariantTieFlipBySide[tieKey] ?? 0) + 1;
-  cipherVariantTieFlipBySide[tieKey] = next;
-  return mod.Modulo(next, 2) === 0 ? "west" : "east";
+function countCipherEnemyPresenceInRegion(region: CipherSpawnRegion, enemyTeam: mod.Team): number {
+  return countCipherEnemyPresenceInZone(region.quadrant, enemyTeam);
 }
 
-function getCipherAnchorIdsForSideVariant(
-  side: CipherMapSide,
-  variant: CipherHorizontalVariant
-): number[] {
-  if (side === "north") {
-    return variant === "east" ? CIPHER_NORTH_EAST_ANCHORS : CIPHER_NORTH_WEST_ANCHORS;
+function getCipherEnemyLanePressure(team: mod.Team): CipherLanePressure {
+  const enemyTeam = getOpposingTeam(team);
+  if (!mod.Equals(enemyTeam, team1) && !mod.Equals(enemyTeam, team2)) {
+    return { west: 0, east: 0 };
   }
-  return variant === "east" ? CIPHER_SOUTH_EAST_ANCHORS : CIPHER_SOUTH_WEST_ANCHORS;
+
+  const pressure: CipherLanePressure = { west: 0, east: 0 };
+  const zones: CipherPresenceZone[] = ["northWest", "northEast", "southWest", "southEast"];
+
+  for (let i = 0; i < zones.length; i++) {
+    const zone = zones[i];
+    const lane = getCipherPresenceZoneLane(zone);
+    pressure[lane] += countCipherEnemyPresenceInZone(zone, enemyTeam);
+  }
+
+  return pressure;
+}
+
+function getCipherLanePressureSpawnRegion(team: mod.Team, side: CipherMapSide): CipherSpawnRegion | undefined {
+  const pressure = getCipherEnemyLanePressure(team);
+  if (pressure.west <= 0 && pressure.east <= 0) return undefined;
+  if (pressure.west === pressure.east) return undefined;
+
+  const targetLane: CipherPresenceLane = pressure.west > pressure.east ? "east" : "west";
+  return getCipherStrictSpawnRegionForQuadrant(getCipherStrictQuadrantForSideAndLane(side, targetLane));
+}
+
+function getDefaultCipherSpawnRegion(team: mod.Team, side: CipherMapSide): CipherSpawnRegion {
+  const teamKey = getCipherTeamRoutingKey(team);
+  const lastSpawnRegion = cipherLastSpawnRegionByTeamId[teamKey];
+  if (lastSpawnRegion && isCipherSpawnRegionStrictForSide(lastSpawnRegion, side)) {
+    return copyCipherSpawnRegion(lastSpawnRegion);
+  }
+
+  const tieKey = teamKey + ":" + side;
+  const next = (cipherSpawnRegionTieFlipByKey[tieKey] ?? 0) + 1;
+  cipherSpawnRegionTieFlipByKey[tieKey] = next;
+
+  if (side === "north") {
+    return {
+      quadrant: mod.Modulo(next, 2) === 0 ? "northWest" : "northEast",
+      variant: "north",
+    };
+  }
+
+  return {
+    quadrant: mod.Modulo(next, 2) === 0 ? "southWest" : "southEast",
+    variant: "south",
+  };
+}
+
+function addCipherSpawnRegionCandidate(
+  candidates: CipherSpawnRegion[],
+  addedByKey: { [key: string]: boolean },
+  region: CipherSpawnRegion
+): void {
+  const key = getCipherSpawnRegionKey(region);
+  if (addedByKey[key] === true) return;
+  addedByKey[key] = true;
+  candidates.push(copyCipherSpawnRegion(region));
+}
+
+function appendCipherRegionsByLowestPressure(
+  candidates: CipherSpawnRegion[],
+  addedByKey: { [key: string]: boolean },
+  team: mod.Team,
+  side: CipherMapSide
+): void {
+  const enemyTeam = getOpposingTeam(team);
+  const remaining: CipherSpawnRegion[] = [];
+  const strictRegions = getCipherStrictSpawnRegionsForSide(side);
+
+  for (let i = 0; i < strictRegions.length; i++) {
+    const region = strictRegions[i];
+    if (addedByKey[getCipherSpawnRegionKey(region)] === true) continue;
+    remaining.push(copyCipherSpawnRegion(region));
+  }
+
+  remaining.sort((a, b) => {
+    const pressureA = countCipherEnemyPresenceInRegion(a, enemyTeam);
+    const pressureB = countCipherEnemyPresenceInRegion(b, enemyTeam);
+    if (pressureA !== pressureB) return pressureA - pressureB;
+    const keyA = getCipherSpawnRegionKey(a);
+    const keyB = getCipherSpawnRegionKey(b);
+    if (keyA < keyB) return -1;
+    if (keyA > keyB) return 1;
+    return 0;
+  });
+
+  for (let i = 0; i < remaining.length; i++) {
+    addCipherSpawnRegionCandidate(candidates, addedByKey, remaining[i]);
+  }
+}
+
+function buildCipherSpawnRegionCandidates(team: mod.Team, side: CipherMapSide): CipherSpawnRegion[] {
+  const candidates: CipherSpawnRegion[] = [];
+  const addedByKey: { [key: string]: boolean } = {};
+  const pressuredRegion = getCipherLanePressureSpawnRegion(team, side);
+
+  if (pressuredRegion) {
+    addCipherSpawnRegionCandidate(candidates, addedByKey, pressuredRegion);
+    appendCipherRegionsByLowestPressure(candidates, addedByKey, team, side);
+    return candidates;
+  }
+
+  const defaultRegion = getDefaultCipherSpawnRegion(team, side);
+  addCipherSpawnRegionCandidate(candidates, addedByKey, defaultRegion);
+  appendCipherRegionsByLowestPressure(candidates, addedByKey, team, side);
+  return candidates;
 }
 
 function isCipherAnchorSafeFromEnemies(anchorPos: mod.Vector, team: mod.Team): boolean {
@@ -3786,10 +4933,17 @@ function isCipherAnchorSafeFromEnemies(anchorPos: mod.Vector, team: mod.Team): b
     const playerId = Number(playerIdKey);
     const sp = serverPlayers.get(playerId);
     if (!sp || !mod.IsPlayerValid(sp.player)) continue;
+    if (!sp.isDeployed) continue;
     if (!mod.Equals(mod.GetTeam(sp.player), enemyTeam)) continue;
+    if (!isPlayerAliveSafe(sp.player)) continue;
 
-    const snapshot = cipherPlayerPositionSnapshotByPlayerId[playerId];
-    if (!snapshot) continue;
+    const liveEnemyPos = tryGetPlayerPositionSafe(sp.player);
+    const snapshot = liveEnemyPos ? snapshotVector(liveEnemyPos) : cipherPlayerPositionSnapshotByPlayerId[playerId];
+    if (!snapshot) {
+      delete cipherPlayerPositionSnapshotByPlayerId[playerId];
+      continue;
+    }
+    cipherPlayerPositionSnapshotByPlayerId[playerId] = snapshot;
     const enemyPos = mod.CreateVector(snapshot.x, snapshot.y, snapshot.z);
     if (getBombVectorHorizontalDistanceMeters(anchorPos, enemyPos) <= CIPHER_ANCHOR_ENEMY_SAFETY_RADIUS_METERS) {
       return false;
@@ -3798,42 +4952,68 @@ function isCipherAnchorSafeFromEnemies(anchorPos: mod.Vector, team: mod.Team): b
   return true;
 }
 
-function chooseCipherAnchorIdForPlayer(
+function chooseCipherAnchorIdForRegion(
   playerId: number,
   team: mod.Team,
-  side: CipherMapSide,
-  variant: CipherHorizontalVariant
+  region: CipherSpawnRegion
 ): number | undefined {
-  const anchorIds = getCipherAnchorIdsForSideVariant(side, variant);
+  const anchorIds = getCipherAnchorIdsForRegion(region);
   if (anchorIds.length <= 0) return undefined;
 
   const nowSec = getCurrentSchedulerNowSeconds();
-  const key = side + ":" + variant + ":" + String(modlib.getTeamId(team));
+  const key = getCipherSpawnRegionKey(region) + ":" + String(modlib.getTeamId(team));
   const startIndex = cipherAnchorRoundRobinIndexByKey[key] ?? 0;
-  let fallbackAnchorId: number | undefined = undefined;
+  let safeCooldownFallbackAnchorId: number | undefined = undefined;
+  let safeCooldownFallbackIndex = startIndex;
 
   for (let offset = 0; offset < anchorIds.length; offset++) {
     const idx = mod.Modulo(startIndex + offset, anchorIds.length);
     const anchorId = anchorIds[idx];
     const anchorPos = getCachedCipherAnchorPosition(anchorId);
     if (!anchorPos) continue;
-    if (fallbackAnchorId === undefined) fallbackAnchorId = anchorId;
+    if (!isCipherAnchorSafeFromEnemies(anchorPos, team)) continue;
 
     const cooldownUntil = cipherAnchorCooldownUntilSecByObjectId[anchorId] ?? 0;
-    if (cooldownUntil > nowSec) continue;
-    if (!isCipherAnchorSafeFromEnemies(anchorPos, team)) continue;
+    if (cooldownUntil > nowSec) {
+      if (safeCooldownFallbackAnchorId === undefined) {
+        safeCooldownFallbackAnchorId = anchorId;
+        safeCooldownFallbackIndex = idx;
+      }
+      continue;
+    }
 
     cipherAnchorRoundRobinIndexByKey[key] = mod.Modulo(idx + 1, anchorIds.length);
     cipherAnchorCooldownUntilSecByObjectId[anchorId] = nowSec + CIPHER_ANCHOR_COOLDOWN_SECONDS;
     return anchorId;
   }
 
-  if (fallbackAnchorId !== undefined) {
-    cipherAnchorRoundRobinIndexByKey[key] = mod.Modulo(startIndex + 1, anchorIds.length);
-    cipherAnchorCooldownUntilSecByObjectId[fallbackAnchorId] = nowSec + CIPHER_ANCHOR_COOLDOWN_SECONDS;
+  if (safeCooldownFallbackAnchorId !== undefined) {
+    cipherAnchorRoundRobinIndexByKey[key] = mod.Modulo(safeCooldownFallbackIndex + 1, anchorIds.length);
+    cipherAnchorCooldownUntilSecByObjectId[safeCooldownFallbackAnchorId] = nowSec + CIPHER_ANCHOR_COOLDOWN_SECONDS;
   }
   void playerId;
-  return fallbackAnchorId;
+  return safeCooldownFallbackAnchorId;
+}
+
+function chooseCipherSpawnAnchorForPlayer(
+  playerId: number,
+  team: mod.Team,
+  defaultSide: CipherMapSide
+): CipherQueuedSpawnAnchor | undefined {
+  const candidates = buildCipherSpawnRegionCandidates(team, defaultSide);
+
+  for (let i = 0; i < candidates.length; i++) {
+    const region = candidates[i];
+    const anchorId = chooseCipherAnchorIdForRegion(playerId, team, region);
+    if (anchorId === undefined) continue;
+    return {
+      anchorObjectId: anchorId,
+      side: getCipherPresenceZoneSide(region.quadrant),
+      region: copyCipherSpawnRegion(region),
+    };
+  }
+
+  return undefined;
 }
 
 function getCipherAttackObjectiveCenterForSide(side: CipherMapSide): mod.Vector | undefined {
@@ -3860,9 +5040,16 @@ function getCipherQueuedSpawnAnchorForPlayer(playerId: number): CipherQueuedSpaw
   return cipherQueuedAnchorByPlayerId[playerId];
 }
 
+function isCipherQueuedSpawnAnchorValidForTeam(queuedAnchor: CipherQueuedSpawnAnchor, team: mod.Team): boolean {
+  const expectedSide = getCipherTeamSideForCurrentHalf(team);
+  if (!expectedSide) return false;
+  if (queuedAnchor.side !== expectedSide) return false;
+  if (!isCipherSpawnRegionStrictForSide(queuedAnchor.region, expectedSide)) return false;
+  return getCipherAnchorIdsForRegion(queuedAnchor.region).indexOf(queuedAnchor.anchorObjectId) >= 0;
+}
+
 function prepareCipherQueuedAnchorForPlayer(playerId: number, forceRefresh: boolean = false): boolean {
   if (!isCipherSpawnRoutingPhaseActive()) return false;
-  if (!forceRefresh && cipherQueuedAnchorByPlayerId[playerId] !== undefined) return true;
 
   const sp = serverPlayers.get(playerId);
   if (!sp || !mod.IsPlayerValid(sp.player)) return false;
@@ -3870,19 +5057,20 @@ function prepareCipherQueuedAnchorForPlayer(playerId: number, forceRefresh: bool
   const team = mod.GetTeam(sp.player);
   if (!mod.Equals(team, team1) && !mod.Equals(team, team2)) return false;
 
-  const side = getCipherTeamSideForCurrentHalf(team);
-  if (!side) return false;
+  const defaultSide = getCipherTeamSideForCurrentHalf(team);
+  if (!defaultSide) return false;
+
+  const queuedAnchor = cipherQueuedAnchorByPlayerId[playerId];
+  if (!forceRefresh && queuedAnchor !== undefined) {
+    if (isCipherQueuedSpawnAnchorValidForTeam(queuedAnchor, team)) return true;
+    delete cipherQueuedAnchorByPlayerId[playerId];
+  }
 
   refreshCipherPlayerPositionSnapshots();
-  const variant = chooseCipherSpawnVariant(side, team);
-  const anchorId = chooseCipherAnchorIdForPlayer(playerId, team, side, variant);
-  if (anchorId === undefined) return false;
+  const selectedAnchor = chooseCipherSpawnAnchorForPlayer(playerId, team, defaultSide);
+  if (!selectedAnchor) return false;
 
-  cipherQueuedAnchorByPlayerId[playerId] = {
-    anchorObjectId: anchorId,
-    side,
-    variant,
-  };
+  cipherQueuedAnchorByPlayerId[playerId] = selectedAnchor;
   return true;
 }
 
@@ -3983,23 +5171,50 @@ function teleportCipherPlayerToRoutedAnchor(player: mod.Player, playerId: number
 
   const queuedAnchor = getCipherQueuedSpawnAnchorForPlayer(playerId);
   if (!queuedAnchor) return false;
+  if (!isCipherQueuedSpawnAnchorValidForTeam(queuedAnchor, team)) {
+    delete cipherQueuedAnchorByPlayerId[playerId];
+    if (!prepareCipherQueuedAnchorForPlayer(playerId, true)) return false;
+  }
 
-  const anchorPos = getCachedCipherAnchorPosition(queuedAnchor.anchorObjectId);
+  const refreshedQueuedAnchor = getCipherQueuedSpawnAnchorForPlayer(playerId);
+  if (!refreshedQueuedAnchor) return false;
+
+  let finalQueuedAnchor = refreshedQueuedAnchor;
+  let anchorPos = getCachedCipherAnchorPosition(finalQueuedAnchor.anchorObjectId);
   if (!anchorPos) return false;
+  refreshCipherPlayerPositionSnapshots();
+  if (!isCipherAnchorSafeFromEnemies(anchorPos, team)) {
+    delete cipherQueuedAnchorByPlayerId[playerId];
+    if (!prepareCipherQueuedAnchorForPlayer(playerId, true)) return false;
 
-  const targetCenter = getCipherAttackObjectiveCenterForSide(queuedAnchor.side);
+    const safeQueuedAnchor = getCipherQueuedSpawnAnchorForPlayer(playerId);
+    if (!safeQueuedAnchor) return false;
+    finalQueuedAnchor = safeQueuedAnchor;
+    anchorPos = getCachedCipherAnchorPosition(finalQueuedAnchor.anchorObjectId);
+    if (!anchorPos) return false;
+    refreshCipherPlayerPositionSnapshots();
+    if (!isCipherAnchorSafeFromEnemies(anchorPos, team)) {
+      delete cipherQueuedAnchorByPlayerId[playerId];
+      return false;
+    }
+  }
+
+  const targetCenter = getCipherAttackObjectiveCenterForSide(finalQueuedAnchor.side);
   const yawRadians = getCipherTeleportYawRadians(anchorPos, targetCenter);
 
   try {
     (mod as any).Teleport(player, anchorPos, yawRadians);
     cipherPlayerPositionSnapshotByPlayerId[playerId] = snapshotVector(anchorPos);
+    const teamKey = getCipherTeamRoutingKey(team);
+    cipherLastSpawnRegionByTeamId[teamKey] = copyCipherSpawnRegion(finalQueuedAnchor.region);
+    cipherLastSpawnRegionAtSecByTeamId[teamKey] = getCurrentSchedulerNowSeconds();
     delete cipherQueuedAnchorByPlayerId[playerId];
     if (isCipherLiveTransitionActive()) {
       cipherTransitionTeleportedByPlayerId[playerId] = true;
     }
     return true;
   } catch (err) {
-    LogRuntimeError("CipherSpawnTeleport/" + String(playerId) + "/" + String(queuedAnchor.anchorObjectId), err);
+    LogRuntimeError("CipherSpawnTeleport/" + String(playerId) + "/" + String(finalQueuedAnchor.anchorObjectId), err);
   }
   return false;
 }
@@ -4984,6 +6199,7 @@ function assignBombCarrierFromDelta(
   if (gameStatus === 3 && initialization[3] === true) {
     syncLiveHybridObjectiveSurfaceState("assignBombCarrierFromDelta");
   }
+  clearBotObjectiveAssignments();
 }
 
 function transferBombToPlayerAsCarrier(
@@ -5003,15 +6219,13 @@ function transferBombToPlayerAsCarrier(
   const playerTeam = getCipherKeyTeamSnapshot(sp.id) ?? sp.team;
   if (!mod.Equals(playerTeam, team1) && !mod.Equals(playerTeam, team2)) return false;
 
-  const restoredEquipment = getCachedGadgetOneRestoreForBombTransfer(sp.id);
-  cacheBombCarrierRestoreAmmoForPlayer(sp.id, sp.player, BOMB_CARRIER_INVENTORY_SLOT);
-  addEquipmentToSlotSafe(sp.player, BOMB_LOOT_GADGET, BOMB_CARRIER_INVENTORY_SLOT);
+  removeBombEquipmentSafe(sp.player);
 
   assignBombCarrierFromDelta(
     sp.id,
     {
-      replacedSlot: BOMB_CARRIER_INVENTORY_SLOT,
-      replacedEquipment: restoredEquipment,
+      replacedSlot: undefined,
+      replacedEquipment: undefined,
     },
     fromDroppedBomb,
     resolver
@@ -5047,10 +6261,8 @@ function forceBombDropFromCarrier(playerId: number, reason: string, dropPosition
   const sp = serverPlayers.get(playerId);
   const replacedSlot = bombCarrierReplacedSlotByPlayerId[playerId];
   const previousEquipment = bombCarrierPreviousEquipmentByPlayerId[playerId];
-  const isManualSlotSwitch = reason === "manual_slot_switch";
   const shouldShowDropNotice =
     reason === "death" ||
-    isManualSlotSwitch ||
     reason === "restricted_area" ||
     reason === "hq_area" ||
     reason === "combat_boundary_exit";
@@ -5086,6 +6298,7 @@ function forceBombDropFromCarrier(playerId: number, reason: string, dropPosition
     );
   }
   clearBombCarrierState();
+  clearBotObjectiveAssignments();
   if (shouldShowDropNotice) {
     showCipherKeyDroppedNoticeForTeam(carrierTeamForNotice);
   }
@@ -5129,6 +6342,7 @@ function forceBombDropFromCarrier(playerId: number, reason: string, dropPosition
 }
 
 function resetBombCarrierRuntimeState(hideBaseIcon: boolean, preserveDeployRestoreCache = false): void {
+  clearBotObjectiveState();
   invalidateBombReturnToBaseTimer();
   invalidateDeferredBombSpawnTimer();
   if (bombCarrierPlayerId !== undefined) {
@@ -5270,15 +6484,6 @@ function EvaluateBombPickupAndCarrierState(): void {
       return;
     }
 
-    const carrierSlot = bombCarrierReplacedSlotByPlayerId[carrierId] ?? BOMB_CARRIER_INVENTORY_SLOT;
-    if (
-      isInventorySlotActiveSafe(carrier.player, carrierSlot) &&
-      !hasEquipmentSafe(carrier.player, BOMB_LOOT_GADGET)
-    ) {
-      forceBombDropFromCarrier(carrierId, "carrier_gadget_missing");
-      return;
-    }
-
     return;
   }
   // No carrier: pickup authority is radius-based (base from active base slot, dropped from dropped anchor).
@@ -5346,42 +6551,7 @@ function EvaluateResponsiveBombPickupRadiusScans(): void {
 }
 
 function EvaluateBombCarrierManualSlotSwitchAndLock(): void {
-  if (gameStatus !== 3) return;
-  if (bombCarrierPlayerId === undefined) return;
-
-  const carrierId = bombCarrierPlayerId;
-  const carrier = serverPlayers.get(carrierId);
-  if (!carrier) return;
-  if (!carrier.isDeployed) return;
-  if (!mod.IsPlayerValid(carrier.player)) return;
-  if (!isPlayerAlive(carrier.player)) return;
-
-  const replacedSlot = bombCarrierReplacedSlotByPlayerId[carrierId];
-  if (replacedSlot === undefined) return;
-
-  const nowSec = getCurrentSchedulerNowSeconds();
-  const carrierPos = updateBombCarrierVerticalTrackingState(carrier.player, nowSec);
-  const slotIsActive = isInventorySlotActiveSafe(carrier.player, replacedSlot);
-
-  if (!bombCarrierManualDropArmed) {
-    if (!slotIsActive) {
-      bombCarrierManualDropArmed = true;
-      bombCarrierPendingManualDrop = false;
-    }
-    return;
-  }
-
-  if (!slotIsActive) {
-    bombCarrierPendingManualDrop = false;
-    return;
-  }
-
-  if (!hasEquipmentSafe(carrier.player, BOMB_LOOT_GADGET)) {
-    forceBombDropFromCarrier(carrierId, "carrier_gadget_missing", carrierPos);
-    return;
-  }
-
-  forceBombDropFromCarrier(carrierId, "manual_slot_switch", carrierPos);
+  return;
 }
 
 async function runLiveStartBombSpawnAfterDelay(
@@ -6040,6 +7210,152 @@ function isObjectiveDisabledAfterAward(cpId: number): boolean {
   return objectiveDisabledAfterAwardByCpId[cpId] === true;
 }
 
+function resetCipherNodeStates(context: string): void {
+  const nextTokenByCpId: { [cpId: number]: number | undefined } = {};
+  cipherNodeStateByCpId = {};
+  cipherNodeRebootUntilSecByCpId = {};
+  cipherNodeOverloadedByTeamByCpId = {};
+  disableAllNeutralObjectiveCapturePointObjectives("resetCipherNodeStates/" + context);
+
+  for (let i = 0; i < OBJECTIVE_DEFINITIONS.length; i++) {
+    const cpId = OBJECTIVE_DEFINITIONS[i].cpId;
+    cipherNodeStateByCpId[cpId] = "active";
+    nextTokenByCpId[cpId] = (cipherNodeRebootTokenByCpId[cpId] ?? 0) + 1;
+    cipherNodeOverloadedByTeamByCpId[cpId] = teamNeutral;
+  }
+
+  cipherNodeRebootTokenByCpId = nextTokenByCpId;
+  cipherCounterWorldIconLastShownByCpId = {};
+  cipherCounterWorldIconLastStateByCpId = {};
+
+  if (gameStatus === 3) {
+    updateCipherCounterWorldIcons(true);
+    UpdateTopFlagColorsForAllPlayers();
+  }
+}
+
+function isCipherNodeActive(cpId: number): boolean {
+  const state = cipherNodeStateByCpId[cpId];
+  return state === undefined || state === "active";
+}
+
+function isCipherNodeRebooting(cpId: number): boolean {
+  return cipherNodeStateByCpId[cpId] === "rebooting";
+}
+
+function getCipherNodeRebootRemainingSeconds(cpId: number): number {
+  if (!isCipherNodeRebooting(cpId)) return 0;
+  const rebootUntilSec = cipherNodeRebootUntilSecByCpId[cpId];
+  if (rebootUntilSec === undefined || !Number.isFinite(rebootUntilSec)) return 0;
+  return mod.Max(0, mod.Ceiling(rebootUntilSec - getCurrentSchedulerNowSeconds()));
+}
+
+function showCipherNodeRebootingDeniedMessage(playerId: number, cpId: number): void {
+  const sp = serverPlayers.get(playerId);
+  if (!sp || !mod.IsPlayerValid(sp.player)) return;
+
+  const cp = serverCapturePoints[cpId];
+  const symbol = getObjectiveLaneSymbol(cpId, cp ? cp.symbol : "A");
+  modlib.ShowHighlightedGameModeMessage(
+    mod.Message((mod.stringkeys as any).CipherNodeCannotScoreRebooting, symbol),
+    sp.player
+  );
+}
+
+function startCipherNodeReboot(cpId: number, attackingTeam: mod.Team, context: string): void {
+  if (!isObjectiveCpId(cpId)) return;
+  if (mod.Equals(attackingTeam, teamNeutral)) return;
+
+  captureObjectiveDestroyExplosionPositionForCp(cpId);
+  cipherNodeStateByCpId[cpId] = "rebooting";
+  cipherNodeRebootUntilSecByCpId[cpId] = getCurrentSchedulerNowSeconds() + NODE_OVERLOAD_COOLDOWN_SECONDS;
+  cipherNodeOverloadedByTeamByCpId[cpId] = attackingTeam;
+  const token = (cipherNodeRebootTokenByCpId[cpId] ?? 0) + 1;
+  cipherNodeRebootTokenByCpId[cpId] = token;
+
+  const cp = serverCapturePoints[cpId];
+  if (cp) {
+    (cp as any)._capturingTeam = teamNeutral;
+    (cp as any)._captureProgress = 0;
+    (cp as any)._previousCaptureProgress = 0;
+    cp.clearOnPoint();
+  }
+
+  if (isObjectiveCaptureAttemptActive(cpId)) endObjectiveCaptureAttempt(cpId);
+  safeEnableCapturePointObjectiveByCpId(cpId, false, "startCipherNodeReboot/" + context, true);
+  safeEnableObjectiveMcomByCpId(cpId, false, "startCipherNodeReboot/" + context, true);
+  setObjectiveCaptureInteractEnabled(cpId, false);
+  setObjectiveAwardVfxEnabled(cpId, false);
+  stopObjectiveMcomAttemptLoopSfxForCp(cpId);
+  setObjectiveMcomSfxEnabledForCp(cpId, "alarmSimple", false);
+  setObjectiveMcomSfxEnabledForCp(cpId, "alarmLeadout", false);
+  setObjectiveAuthoritativeOwner(cpId, teamNeutral, "startCipherNodeReboot/" + context);
+  setNeutralObjectiveCapturePointEnabledForActiveCp(cpId, true, "startCipherNodeReboot/" + context);
+  playObjectiveDisableEmpPresentationForCp(cpId, attackingTeam);
+  playObjectiveAwardSuccessSfxToAll();
+
+  const symbol = getObjectiveLaneSymbol(cpId, cp ? cp.symbol : "A");
+  if (modlib.Equals(attackingTeam, team1)) {
+    modlib.ShowHighlightedGameModeMessage(
+      mod.Message((mod.stringkeys as any).CipherObjectiveDisabled, symbol),
+      team1
+    );
+    modlib.ShowHighlightedGameModeMessage(
+      mod.Message((mod.stringkeys as any).CipherObjectiveDisabledEnemy, symbol),
+      team2
+    );
+  } else if (modlib.Equals(attackingTeam, team2)) {
+    modlib.ShowHighlightedGameModeMessage(
+      mod.Message((mod.stringkeys as any).CipherObjectiveDisabled, symbol),
+      team2
+    );
+    modlib.ShowHighlightedGameModeMessage(
+      mod.Message((mod.stringkeys as any).CipherObjectiveDisabledEnemy, symbol),
+      team1
+    );
+  }
+
+  clearObjectivePendingAward(cpId);
+  clearObjectiveSuccessfulArmContext(cpId);
+  clearBotObjectiveAssignments();
+  updateCipherCounterWorldIconForCp(cpId, true);
+  if (isRoutingCpId(cpId)) markHqRoutingDirty();
+  syncLiveHybridObjectiveSurfaceState("startCipherNodeReboot/" + context, true);
+  UpdateTopFlagColorsForAllPlayers();
+
+  void reactivateCipherNode(cpId, token, context);
+}
+
+async function reactivateCipherNode(cpId: number, token: number, context: string): Promise<void> {
+  await mod.Wait(NODE_OVERLOAD_COOLDOWN_SECONDS);
+  if (gameStatus !== 3) return;
+  if (cipherNodeRebootTokenByCpId[cpId] !== token) return;
+  if (!isCipherNodeRebooting(cpId)) return;
+
+  cipherNodeStateByCpId[cpId] = "active";
+  cipherNodeRebootUntilSecByCpId[cpId] = undefined;
+  cipherNodeOverloadedByTeamByCpId[cpId] = teamNeutral;
+  setObjectiveAuthoritativeOwner(
+    cpId,
+    getObjectiveDefendingTeamForCurrentHalf(cpId),
+    "reactivateCipherNode/" + context
+  );
+  setNeutralObjectiveCapturePointEnabledForActiveCp(cpId, false, "reactivateCipherNode/" + context);
+  clearObjectivePendingAward(cpId);
+  setObjectiveAwardVfxEnabled(cpId, false);
+  syncObjectiveArmedPendingVisualStateForCp(cpId);
+  syncLiveHybridObjectiveSurfaceState("reactivateCipherNode/" + context, true);
+  updateCipherCounterWorldIconForCp(cpId, true);
+
+  const cp = serverCapturePoints[cpId];
+  const symbol = getObjectiveLaneSymbol(cpId, cp ? cp.symbol : "A");
+  modlib.ShowHighlightedGameModeMessage(mod.Message((mod.stringkeys as any).CipherNodeRebooted, symbol), team1);
+  modlib.ShowHighlightedGameModeMessage(mod.Message((mod.stringkeys as any).CipherNodeRebooted, symbol), team2);
+
+  if (isRoutingCpId(cpId)) markHqRoutingDirty();
+  UpdateTopFlagColorsForAllPlayers();
+}
+
 function isObjectiveCaptureAttemptActive(cpId: number): boolean {
   return objectiveCaptureAttemptEnabledByCpId[cpId] === true;
 }
@@ -6077,6 +7393,7 @@ function getValidObjectiveInteractionPlayer(playerId: number): Player | undefine
 function isPlayerEligibleToArmObjectiveCp(cpId: number, playerId: number): boolean {
   if (gameStatus !== 3) return false;
   if (isObjectiveDisabledAfterAward(cpId)) return false;
+  if (!isCipherNodeActive(cpId)) return false;
   if (isObjectivePendingAwardActive(cpId)) return false;
   if (bombCarrierPlayerId !== playerId) return false;
   if (!isPlayerInsideObjectiveAreaForCp(playerId, cpId)) return false;
@@ -6130,7 +7447,7 @@ function hasAnyAuthorizedObjectiveInteractorForCp(cpId: number): boolean {
 function updateObjectiveCaptureInteractionForCp(cpId: number): void {
   if (!isObjectiveCpId(cpId)) return;
 
-  if (isObjectiveDisabledAfterAward(cpId) || isObjectiveCaptureAttemptActive(cpId)) {
+  if (isObjectiveDisabledAfterAward(cpId) || !isCipherNodeActive(cpId) || isObjectiveCaptureAttemptActive(cpId)) {
     setObjectiveCaptureInteractEnabled(cpId, false);
     return;
   }
@@ -6340,6 +7657,7 @@ function getLiveHybridPromotedObjectiveCpId(): number | undefined {
     const def = getObjectiveDef(cpId);
     if (!def) continue;
     if (mod.Equals(carrierTeam, getObjectiveDefendingTeamForCurrentHalf(cpId))) continue;
+    if (!isCipherNodeActive(cpId)) continue;
     if (candidateCpIds.indexOf(cpId) >= 0) continue;
     candidateCpIds.push(cpId);
   }
@@ -6387,7 +7705,7 @@ function applyLiveHybridObjectiveSurfaceStateForCp(
   void promotedCpId;
   const disabled = isObjectiveDisabledAfterAward(cpId);
   const armed = isObjectivePendingAwardActive(cpId);
-  const capturePointEnabled = !disabled && !armed;
+  const capturePointEnabled = !disabled && !armed && isCipherNodeActive(cpId);
   const mcomEnabled = false;
 
   safeEnableCapturePointObjectiveByCpId(
@@ -6559,22 +7877,35 @@ function updateObjectiveArmedWorldIconCountdowns(): void {
   }
 }
 
-function getCipherObjectiveKeyCount(cpId: number): number {
-  const count = cipherObjectiveKeyCountByCpId[cpId] ?? 0;
-  if (!Number.isFinite(count) || count < 0) return 0;
-  if (count > CIPHER_KEYS_TO_DESTROY_OBJECTIVE) return CIPHER_KEYS_TO_DESTROY_OBJECTIVE;
-  return count;
+function getCipherNodeRebootingWorldIconMessage(totalSeconds: number): any {
+  let safeSeconds = totalSeconds;
+  if (!Number.isFinite(safeSeconds) || safeSeconds < 0) safeSeconds = 0;
+  safeSeconds = mod.Floor(safeSeconds);
+  const minutes = mod.Floor(safeSeconds / 60);
+  const totalSecondsRemainder = mod.Floor(safeSeconds % 60);
+  const seconds1 = totalSecondsRemainder % 10;
+  const seconds10 = mod.Floor(totalSecondsRemainder / 10);
+  if (minutes < 10) {
+    return mod.Message(
+      (mod.stringkeys as any).CipherNodeRebootingSecondsSingleDigitMinute,
+      minutes,
+      seconds10,
+      seconds1
+    );
+  }
+  return mod.Message(
+    (mod.stringkeys as any).CipherNodeRebootingSecondsDoubleDigitMinute,
+    minutes,
+    seconds10,
+    seconds1
+  );
 }
 
-function setCipherObjectiveKeyCount(cpId: number, value: number): void {
-  let next = value;
-  if (!Number.isFinite(next) || next < 0) next = 0;
-  if (next > CIPHER_KEYS_TO_DESTROY_OBJECTIVE) next = CIPHER_KEYS_TO_DESTROY_OBJECTIVE;
-  cipherObjectiveKeyCountByCpId[cpId] = next;
-}
-
-function getCipherCounterMessage(count: number): any {
-  return mod.Message((mod.stringkeys as any).CipherKeyCounter, count);
+function getCipherNodeStatusWorldIconMessage(cpId: number): any {
+  if (isCipherNodeRebooting(cpId)) {
+    return getCipherNodeRebootingWorldIconMessage(getCipherNodeRebootRemainingSeconds(cpId));
+  }
+  return mod.Message((mod.stringkeys as any).CipherNodeActive);
 }
 
 function getCipherCounterRuntimeIconKey(cpId: number, ownerTeam: mod.Team): string {
@@ -6629,6 +7960,7 @@ function clearCipherCounterRuntimeWorldIconsForCp(cpId: number): void {
   for (let i = 0; i < keys.length; i++) {
     clearCipherCounterRuntimeWorldIconByKey(keys[i]);
   }
+  delete cipherCounterWorldIconLastStateByCpId[cpId];
 }
 
 function clearAllCipherCounterRuntimeWorldIcons(): void {
@@ -6641,25 +7973,61 @@ function clearAllCipherCounterRuntimeWorldIcons(): void {
     clearCipherCounterRuntimeWorldIconByKey(keys[i]);
   }
   cipherCounterRuntimeWorldIconMissingWarnedByKey = {};
+  cipherCounterWorldIconLastStateByCpId = {};
+}
+
+function hasCipherCounterRuntimeWorldIconForTeam(cpId: number, ownerTeam: mod.Team): boolean {
+  if (mod.Equals(ownerTeam, teamNeutral)) return false;
+  const key = getCipherCounterRuntimeIconKey(cpId, ownerTeam);
+  return !!cipherCounterRuntimeWorldIconHandleByKey[key];
+}
+
+function getCipherCounterWorldIconStateKey(
+  cpId: number,
+  attackingTeam: mod.Team,
+  defendingTeam: mod.Team
+): string {
+  return (
+    String(cpId) +
+    ":" +
+    String(cipherNodeStateByCpId[cpId] ?? "active") +
+    ":" +
+    String(getCipherNodeRebootRemainingSeconds(cpId)) +
+    ":" +
+    String(modlib.getTeamId(attackingTeam)) +
+    ":" +
+    String(modlib.getTeamId(defendingTeam)) +
+    ":" +
+    String(gameStatus)
+  );
 }
 
 function configureCipherCounterRuntimeWorldIcon(
   cpId: number,
   ownerTeam: mod.Team,
   textColor: mod.Vector,
-  count: number,
   force: boolean
 ): void {
   if (mod.Equals(ownerTeam, teamNeutral)) return;
 
   const key = getCipherCounterRuntimeIconKey(cpId, ownerTeam);
+  const stateKey =
+    String(cipherNodeStateByCpId[cpId] ?? "active") +
+    ":" +
+    String(getCipherNodeRebootRemainingSeconds(cpId)) +
+    ":" +
+    String(modlib.getTeamId(ownerTeam));
+  let handle = cipherCounterRuntimeWorldIconHandleByKey[key];
+  if (!force && handle && cipherCounterRuntimeWorldIconLastStateByKey[key] === stateKey) {
+    return;
+  }
+
   const pos = getCipherCounterAnchorPositionForCp(cpId);
   if (!pos) {
     warnCipherCounterRuntimeIconMissingOnce(key, cpId, "missing_position");
     return;
   }
 
-  let handle = cipherCounterRuntimeWorldIconHandleByKey[key];
   if (!handle) {
     const spawned = spawnRuntimeCommonObjectSafe(
       mod.RuntimeSpawn_Common.WorldIcon,
@@ -6693,10 +8061,9 @@ function configureCipherCounterRuntimeWorldIcon(
     }
   }
 
-  const stateKey = String(count) + ":" + String(modlib.getTeamId(ownerTeam));
   if (force || cipherCounterRuntimeWorldIconLastStateByKey[key] !== stateKey) {
     try {
-      mod.SetWorldIconText(handle, getCipherCounterMessage(count));
+      mod.SetWorldIconText(handle, getCipherNodeStatusWorldIconMessage(cpId));
       mod.SetWorldIconColor(handle, textColor);
       mod.SetWorldIconOwner(handle, ownerTeam);
       cipherCounterRuntimeWorldIconLastStateByKey[key] = stateKey;
@@ -6718,13 +8085,24 @@ function updateCipherCounterWorldIconForCp(cpId: number, force: boolean = false)
   const iconId = getObjectiveArmedWorldIconIdByCpId(cpId);
   if (!iconId) {
     delete cipherCounterWorldIconLastShownByCpId[cpId];
+    delete cipherCounterWorldIconLastStateByCpId[cpId];
     return;
   }
 
-  const count = getCipherObjectiveKeyCount(cpId);
   const enabled = gameStatus === 3;
   const defendingTeam = getObjectiveDefendingTeamForCurrentHalf(cpId);
   const attackingTeam = getOpposingTeam(defendingTeam);
+  const stateKey = getCipherCounterWorldIconStateKey(cpId, attackingTeam, defendingTeam);
+
+  if (
+    !force &&
+    enabled &&
+    cipherCounterWorldIconLastStateByCpId[cpId] === stateKey &&
+    hasCipherCounterRuntimeWorldIconForTeam(cpId, attackingTeam) &&
+    hasCipherCounterRuntimeWorldIconForTeam(cpId, defendingTeam)
+  ) {
+    return;
+  }
 
   try {
     const icon = mod.GetWorldIcon(iconId);
@@ -6736,13 +8114,17 @@ function updateCipherCounterWorldIconForCp(cpId: number, force: boolean = false)
 
   if (!enabled) {
     delete cipherCounterWorldIconLastShownByCpId[cpId];
+    delete cipherCounterWorldIconLastStateByCpId[cpId];
     clearCipherCounterRuntimeWorldIconsForCp(cpId);
     return;
   }
 
-  configureCipherCounterRuntimeWorldIcon(cpId, attackingTeam, COLOR_FRIENDLY, count, force);
-  configureCipherCounterRuntimeWorldIcon(cpId, defendingTeam, COLOR_ENEMY, count, force);
-  cipherCounterWorldIconLastShownByCpId[cpId] = count;
+  const attackingIconColor = isCipherNodeRebooting(cpId) ? COLOR_NEUTRAL : COLOR_ENEMY;
+  const defendingIconColor = isCipherNodeRebooting(cpId) ? COLOR_NEUTRAL : COLOR_FRIENDLY;
+  configureCipherCounterRuntimeWorldIcon(cpId, attackingTeam, attackingIconColor, force);
+  configureCipherCounterRuntimeWorldIcon(cpId, defendingTeam, defendingIconColor, force);
+  cipherCounterWorldIconLastShownByCpId[cpId] = stateKey;
+  cipherCounterWorldIconLastStateByCpId[cpId] = stateKey;
 }
 
 function updateCipherCounterWorldIcons(force: boolean = false): void {
@@ -6757,6 +8139,7 @@ function hideAllCipherCounterWorldIcons(): void {
     const cpId = OBJECTIVE_DEFINITIONS[i].cpId;
     const iconId = getObjectiveArmedWorldIconIdByCpId(cpId);
     delete cipherCounterWorldIconLastShownByCpId[cpId];
+    delete cipherCounterWorldIconLastStateByCpId[cpId];
     if (!iconId) continue;
     try {
       const icon = mod.GetWorldIcon(iconId);
@@ -6769,12 +8152,7 @@ function hideAllCipherCounterWorldIcons(): void {
 }
 
 function resetCipherObjectiveCounters(): void {
-  cipherObjectiveKeyCountByCpId = {};
-  cipherCounterWorldIconLastShownByCpId = {};
-  for (let i = 0; i < OBJECTIVE_DEFINITIONS.length; i++) {
-    setCipherObjectiveKeyCount(OBJECTIVE_DEFINITIONS[i].cpId, 0);
-  }
-  updateCipherCounterWorldIcons(true);
+  resetCipherNodeStates("resetCipherObjectiveCounters");
 }
 
 function isObjectivePendingAwardActive(cpId: number): boolean {
@@ -6797,6 +8175,12 @@ function syncObjectiveArmedPendingVisualStateForCp(cpId: number): void {
   if (armedPending) {
     safeEnableCapturePointObjectiveByCpId(cpId, false, "syncObjectiveArmedPendingVisualStateForCp_armed");
     safeEnableObjectiveMcomByCpId(cpId, false, "syncObjectiveArmedPendingVisualStateForCp_armed");
+    return;
+  }
+
+  if (isCipherNodeRebooting(cpId)) {
+    safeEnableCapturePointObjectiveByCpId(cpId, false, "syncObjectiveArmedPendingVisualStateForCp_rebooting");
+    safeEnableObjectiveMcomByCpId(cpId, false, "syncObjectiveArmedPendingVisualStateForCp_rebooting");
     return;
   }
 
@@ -6879,7 +8263,12 @@ function spawnObjectiveAwardRuntimeFxAtPosition(
   asset: mod.RuntimeSpawn_Common,
   pos: mod.Vector
 ): mod.VFX | mod.Object | undefined {
-  const spawned = mod.SpawnObject(asset, pos, OBJECTIVE_AWARD_BURST_ROTATION);
+  let spawned: any = undefined;
+  try {
+    spawned = mod.SpawnObject(asset, pos, OBJECTIVE_AWARD_BURST_ROTATION);
+  } catch (_err) {
+    return undefined;
+  }
 
   if (mod.IsType(spawned, mod.Types.VFX)) {
     const vfx = spawned as mod.VFX;
@@ -6967,8 +8356,12 @@ function stopAllObjectiveAwardBursts(): void {
   }
 }
 
-async function cleanupObjectiveAwardBurstAfterDelay(cpId: number, token: number): Promise<void> {
-  await mod.Wait(OBJECTIVE_AWARD_BURST_LIFETIME_SECONDS);
+async function cleanupObjectiveAwardBurstAfterDelay(
+  cpId: number,
+  token: number,
+  delaySeconds: number = OBJECTIVE_AWARD_BURST_LIFETIME_SECONDS
+): Promise<void> {
+  await mod.Wait(delaySeconds);
   if ((objectiveAwardBurstTokenByCpId[cpId] ?? 0) !== token) return;
   stopObjectiveAwardBurstForCp(cpId);
 }
@@ -7013,6 +8406,43 @@ function playObjectiveAwardBurstForCp(cpId: number, ownerTeam: mod.Team): void {
   }
 }
 
+function spawnObjectiveDisableFxOneShot(asset: mod.RuntimeSpawn_Common, pos: mod.Vector, lifetimeSeconds: number): void {
+  const spawned = spawnObjectiveAwardRuntimeFxAtPosition(asset, pos);
+  if (!spawned) return;
+  void cleanupRuntimeFxAfterDelay(spawned, lifetimeSeconds);
+}
+
+function playObjectiveDisableEmpPresentationForCp(cpId: number, ownerTeam: mod.Team): void {
+  if (mod.Equals(ownerTeam, teamNeutral)) return;
+
+  const pos = tryResolveObjectiveDestroyExplosionPosition(cpId);
+  if (!pos) return;
+
+  stopObjectiveAwardBurstForCp(cpId);
+  stopObjectiveAwardPersistentFireForCp(cpId);
+  setObjectiveAwardVfxEnabled(cpId, false);
+
+  spawnObjectiveDisableFxOneShot(OBJECTIVE_DISABLE_EMP_HIT_ASSET, pos, 2.5);
+  spawnObjectiveDisableFxOneShot(OBJECTIVE_DISABLE_SPARK_START_ASSET, pos, 2.5);
+
+  const token = (objectiveAwardBurstTokenByCpId[cpId] ?? 0) + 1;
+  objectiveAwardBurstTokenByCpId[cpId] = token;
+  const sparkLoop = spawnObjectiveAwardRuntimeFxAtPosition(OBJECTIVE_DISABLE_SPARK_LOOP_ASSET, pos);
+  if (sparkLoop) {
+    objectiveAwardBurstActiveByCpId[cpId] = sparkLoop;
+    void cleanupObjectiveAwardBurstAfterDelay(cpId, token, OBJECTIVE_DISABLE_SPARK_LOOP_LIFETIME_SECONDS);
+  }
+
+  playRuntimeOneShotSfxAtPosition(
+    OBJECTIVE_DISABLE_3D_SFX_ASSET,
+    pos,
+    OBJECTIVE_MCOM_SFX_VOLUME,
+    OBJECTIVE_MCOM_SFX_ATTENUATION_RANGE,
+    3.0,
+    "objective_disable_emp_sfx"
+  );
+}
+
 function setObjectiveAwardVfxEnabled(cpId: number, enabled: boolean): void {
   const vfx = getObjectiveAwardVfxByCpId(cpId);
   if (!vfx) return;
@@ -7029,12 +8459,16 @@ function disableObjectiveAfterAwardSuccess(cpId: number, ownerTeam: mod.Team): v
   safeEnableCapturePointObjectiveByCpId(cpId, false, "disableObjectiveAfterAwardSuccess", true);
   safeEnableObjectiveMcomByCpId(cpId, false, "disableObjectiveAfterAwardSuccess");
   setObjectiveCaptureInteractEnabled(cpId, false);
-  setObjectiveAwardVfxEnabled(cpId, true);
-  playObjectiveAwardBurstForCp(cpId, ownerTeam);
+  setObjectiveAwardVfxEnabled(cpId, false);
+  stopObjectiveMcomAttemptLoopSfxForCp(cpId);
+  setObjectiveMcomSfxEnabledForCp(cpId, "alarmSimple", false);
+  setObjectiveMcomSfxEnabledForCp(cpId, "alarmLeadout", false);
+  playObjectiveDisableEmpPresentationForCp(cpId, ownerTeam);
   clearObjectivePendingAward(cpId);
   setObjectiveAuthoritativeOwner(cpId, teamNeutral, "disableObjectiveAfterAwardSuccess");
   setNeutralObjectiveCapturePointEnabledForActiveCp(cpId, true, "disableObjectiveAfterAwardSuccess");
   clearObjectiveSuccessfulArmContext(cpId);
+  clearBotObjectiveAssignments();
 
   serverPlayers.forEach((p) => UpdateTopFlagColorsForPlayer(p));
 }
@@ -7109,7 +8543,8 @@ function resetObjectiveRuntimeState(): void {
 
 function EvaluatePostCaptureAwardTimers(): void {
   if (gameStatus !== 3) return;
-  updateObjectiveArmedWorldIconCountdowns();
+  // Cipher-key delivery disables MCOMs immediately on the second key.
+  // Keep the old pending-award lane dormant so no 00:45 armed countdown or alarm is reintroduced.
 }
 
 function getObjectiveArmingTeam(cpId: number): mod.Team {
@@ -7169,10 +8604,11 @@ async function completeObjectiveDestroyPresentationAfterDelay(
   if (!mod.Equals(objectivePendingAwardTeamByCpId[cpId] ?? teamNeutral, attackingTeam)) return;
   if (isObjectiveDisabledAfterAward(cpId)) return;
 
-  handleObjectiveDestroySuccess(cpId, attackingTeam);
-  resolvePendingCipherScoreTransitionIfReady();
+  clearObjectivePendingAward(cpId);
+  syncLiveHybridObjectiveSurfaceState("completeObjectiveDestroyPresentationAfterDelay", true);
+  updateCipherCounterWorldIconForCp(cpId, true);
   logObjectiveDelayedAward(
-    mod.Message("[OBJECTIVE AWARD] timed success cp/token {}", String(cpId) + "/" + String(token))
+    mod.Message("[OBJECTIVE AWARD] timed pending cleared cp/token {}", String(cpId) + "/" + String(token))
   );
 }
 
@@ -7198,6 +8634,7 @@ function clearCipherCarrierAfterDelivery(playerId: number | undefined): void {
   setBombBaseAvailabilityState(false);
   clearBombBaseRuntimeLootSpawner();
   clearDroppedBombRuntimeObjects();
+  clearBotObjectiveAssignments();
 }
 
 function addCipherScore(attackingTeam: mod.Team): void {
@@ -7220,6 +8657,7 @@ function willCipherScoreTriggerPhaseTransition(scoringTeam: mod.Team): boolean {
   if (mod.Equals(scoringTeam, teamNeutral)) return false;
   if (cipherMatchStage === "suddenDeath") return true;
   if (getCipherTeamTotalScore(scoringTeam) >= WIN_SCORE) return true;
+  if (cipherMatchStage !== "half1") return false;
 
   const scoreIndex = getCipherTeamScoreIndex(scoringTeam);
   if (scoreIndex < 0) return false;
@@ -7230,12 +8668,11 @@ function finalizePendingObjectiveAwardsForImmediateTransition(context: string): 
   for (let i = 0; i < OBJECTIVE_DEFINITIONS.length; i++) {
     const cpId = OBJECTIVE_DEFINITIONS[i].cpId;
     if (!isObjectivePendingAwardActive(cpId)) continue;
-    const pendingTeam = objectivePendingAwardTeamByCpId[cpId] ?? teamNeutral;
     setObjectiveMcomSfxEnabledForCp(cpId, "alarmSimple", false);
     setObjectiveMcomSfxEnabledForCp(cpId, "alarmLeadout", false);
-    handleObjectiveDestroySuccess(cpId, pendingTeam);
+    clearObjectivePendingAward(cpId);
     logObjectiveDelayedAward(
-      mod.Message("[OBJECTIVE AWARD] immediate transition finalize cp/context {}", String(cpId) + "/" + context)
+      mod.Message("[OBJECTIVE AWARD] immediate transition clear cp/context {}", String(cpId) + "/" + context)
     );
   }
 }
@@ -7243,19 +8680,18 @@ function finalizePendingObjectiveAwardsForImmediateTransition(context: string): 
 function handleCipherKeyDelivery(cpId: number, carrierPlayerId: number | undefined, attackingTeam: mod.Team): void {
   if (gameStatus !== 3) return;
   if (isObjectiveDisabledAfterAward(cpId)) return;
+  if (!isCipherNodeActive(cpId)) {
+    if (carrierPlayerId !== undefined) showCipherNodeRebootingDeniedMessage(carrierPlayerId, cpId);
+    return;
+  }
   if (mod.Equals(attackingTeam, teamNeutral)) return;
 
   const cp = serverCapturePoints[cpId];
   if (!cp) return;
 
-  const currentCount = getCipherObjectiveKeyCount(cpId);
-  if (currentCount >= CIPHER_KEYS_TO_DESTROY_OBJECTIVE) return;
-
   const symbol = getObjectiveLaneSymbol(cpId, cp.symbol);
   const deliveryPlayer = carrierPlayerId !== undefined ? serverPlayers.get(carrierPlayerId) : undefined;
-  const nextCount = currentCount + 1;
 
-  setCipherObjectiveKeyCount(cpId, nextCount);
   if (carrierPlayerId !== undefined) {
     recordObjectiveSuccessfulArmContext(cpId, carrierPlayerId);
   }
@@ -7265,6 +8701,7 @@ function handleCipherKeyDelivery(cpId: number, carrierPlayerId: number | undefin
   if (deliveryPlayer) {
     deliveryPlayer.addScore(150);
     deliveryPlayer.addArmed();
+    deliveryPlayer.addDestroyed();
   }
 
   if (modlib.Equals(attackingTeam, team1)) {
@@ -7281,16 +8718,9 @@ function handleCipherKeyDelivery(cpId: number, carrierPlayerId: number | undefin
   }
 
   playObjectiveOutcomeVoForTeams("arm", attackingTeam, symbol);
+  startCipherNodeReboot(cpId, attackingTeam, "handleCipherKeyDelivery");
   clearCipherCarrierAfterDelivery(carrierPlayerId);
   updateCipherCounterWorldIconForCp(cpId, true);
-
-  if (nextCount >= CIPHER_KEYS_TO_DESTROY_OBJECTIVE) {
-    if (scoreTriggersPhaseTransition) {
-      handleObjectiveDestroySuccess(cpId, attackingTeam);
-    } else {
-      beginObjectiveDestroyPresentationAfterSecondKey(cpId, attackingTeam);
-    }
-  }
 
   if (!scoreTriggersPhaseTransition) {
     scheduleDeferredBombRespawnAfterDelay(
@@ -7312,7 +8742,11 @@ function tryDeliverCipherKeyForCarrierAtObjective(playerId: number, cpId: number
   if (gameStatus !== 3) return false;
   if (bombCarrierPlayerId !== playerId) return false;
   if (isObjectiveDisabledAfterAward(cpId)) return false;
-  if (getCipherObjectiveKeyCount(cpId) >= CIPHER_KEYS_TO_DESTROY_OBJECTIVE) return false;
+  if (isCipherNodeRebooting(cpId)) {
+    showCipherNodeRebootingDeniedMessage(playerId, cpId);
+    return false;
+  }
+  if (!isCipherNodeActive(cpId)) return false;
   if (!isPlayerInsideObjectiveAreaForCp(playerId, cpId)) return false;
 
   const attackingTeam = getCipherCarrierAttackingTeam(playerId);
@@ -7429,14 +8863,25 @@ function handleObjectiveDestroySuccess(cpId: number, ownerTeam: mod.Team): void 
   disableObjectiveAfterAwardSuccess(cpId, ownerTeam);
 
   if (modlib.Equals(ownerTeam, team1)) {
-    modlib.ShowHighlightedGameModeMessage(mod.Message(mod.stringkeys.ObjectiveDestroyed, symbol), team1);
-    modlib.ShowHighlightedGameModeMessage(mod.Message(mod.stringkeys.ObjectiveDestroyedEnemy, symbol), team2);
+    modlib.ShowHighlightedGameModeMessage(
+      mod.Message((mod.stringkeys as any).CipherObjectiveDisabled, symbol),
+      team1
+    );
+    modlib.ShowHighlightedGameModeMessage(
+      mod.Message((mod.stringkeys as any).CipherObjectiveDisabledEnemy, symbol),
+      team2
+    );
   } else if (modlib.Equals(ownerTeam, team2)) {
-    modlib.ShowHighlightedGameModeMessage(mod.Message(mod.stringkeys.ObjectiveDestroyed, symbol), team2);
-    modlib.ShowHighlightedGameModeMessage(mod.Message(mod.stringkeys.ObjectiveDestroyedEnemy, symbol), team1);
+    modlib.ShowHighlightedGameModeMessage(
+      mod.Message((mod.stringkeys as any).CipherObjectiveDisabled, symbol),
+      team2
+    );
+    modlib.ShowHighlightedGameModeMessage(
+      mod.Message((mod.stringkeys as any).CipherObjectiveDisabledEnemy, symbol),
+      team1
+    );
   }
 
-  playObjectiveOutcomeVoForTeams("destroyed", ownerTeam, symbol);
   updateCipherCounterWorldIconForCp(cpId, true);
   SetUIScores();
   ClampTicketsAndMaybeEndMatch();
@@ -7523,19 +8968,32 @@ function isFriendlyHudSlot(lane: TopHudLane): boolean {
   return lane === "A" || lane === "B";
 }
 
-function getHudCpIdForViewerLane(viewerTeam: mod.Team, lane: TopHudLane): number {
-  if (mod.Equals(viewerTeam, team1)) {
-    if (lane === "A") return CP_A_ID;
-    if (lane === "B") return CP_B_ID;
-    if (lane === "E") return CP_T2_B_ID;
-    return CP_T2_C_ID;
+function getHudSlotDisplayLane(lane: TopHudLane): ObjectiveLetter {
+  return lane === "A" || lane === "E" ? "A" : "B";
+}
+
+function getObjectiveCpIdForCurrentDefenderAndDisplayLane(
+  defendingTeam: mod.Team,
+  displayLane: ObjectiveLetter
+): number | undefined {
+  if (!mod.Equals(defendingTeam, team1) && !mod.Equals(defendingTeam, team2)) return undefined;
+
+  for (let i = 0; i < ALL_OBJECTIVE_CP_IDS.length; i++) {
+    const cpId = ALL_OBJECTIVE_CP_IDS[i];
+    if (!mod.Equals(getObjectiveDefendingTeamForCurrentHalf(cpId), defendingTeam)) continue;
+    if (getObjectiveDisplayLaneForCpId(cpId) !== displayLane) continue;
+    return cpId;
   }
 
-  if (mod.Equals(viewerTeam, team2)) {
-    if (lane === "A") return CP_T2_B_ID;
-    if (lane === "B") return CP_T2_C_ID;
-    if (lane === "E") return CP_A_ID;
-    return CP_B_ID;
+  return undefined;
+}
+
+function getHudCpIdForViewerLane(viewerTeam: mod.Team, lane: TopHudLane): number {
+  const displayLane = getHudSlotDisplayLane(lane);
+  if (mod.Equals(viewerTeam, team1) || mod.Equals(viewerTeam, team2)) {
+    const targetDefendingTeam = isFriendlyHudSlot(lane) ? viewerTeam : getOpposingTeam(viewerTeam);
+    const cpId = getObjectiveCpIdForCurrentDefenderAndDisplayLane(targetDefendingTeam, displayLane);
+    if (cpId !== undefined) return cpId;
   }
 
   if (lane === "A") return CP_A_ID;
@@ -7597,8 +9055,8 @@ function getTopHudArmedPulseMultiplier(): number {
 }
 
 function getTopHudObjectiveAlphaMultiplier(cpId: number): number {
-  if (getCipherObjectiveKeyCount(cpId) >= CIPHER_KEYS_TO_DESTROY_OBJECTIVE) return 1.0;
   if (isObjectiveDisabledAfterAward(cpId)) return 1.0;
+  if (isCipherNodeRebooting(cpId)) return getTopHudArmedPulseMultiplier();
   if (isObjectivePendingAwardActive(cpId)) return getTopHudArmedPulseMultiplier();
   return 1.0;
 }
@@ -7628,8 +9086,8 @@ function getTopHudArmedFlipFlopIsNeutral(cpId: number, nowSec?: number): boolean
 }
 
 function getTopHudObjectiveDisplayColor(cpId: number, laneColor: mod.Vector, nowSec?: number): mod.Vector {
-  if (getCipherObjectiveKeyCount(cpId) >= CIPHER_KEYS_TO_DESTROY_OBJECTIVE) return COLOR_NEUTRAL;
   if (isObjectiveDisabledAfterAward(cpId)) return COLOR_NEUTRAL;
+  if (isCipherNodeRebooting(cpId)) return COLOR_NEUTRAL;
   if (isObjectivePendingAwardActive(cpId)) {
     return getTopHudArmedFlipFlopIsNeutral(cpId, nowSec) ? COLOR_NEUTRAL : laneColor;
   }
@@ -7799,6 +9257,7 @@ function applyObjectiveRoundStartOwnership(resetRoundState: boolean = true): voi
     captureCreditByCpId = {};
   }
 
+  resetCipherNodeStates("applyObjectiveRoundStartOwnership");
   objectiveAreaActiveTriggersByPlayerId = {};
   objectiveAreaLastEnteredTriggerByPlayerId = {};
   seedObjectiveNativeMcomState("applyObjectiveRoundStartOwnership");
@@ -7829,6 +9288,7 @@ function applyObjectiveLiveHybridRoundStartState(resetRoundState: boolean = true
     captureCreditByCpId = {};
   }
 
+  resetCipherNodeStates("applyObjectiveLiveHybridRoundStartState");
   objectiveAreaActiveTriggersByPlayerId = {};
   objectiveAreaLastEnteredTriggerByPlayerId = {};
   seedObjectiveNativeMcomState("applyObjectiveLiveHybridRoundStartState");
@@ -8454,12 +9914,7 @@ function HqDesyncCheckAndRecycle(eventPlayer: mod.Player, playerId: number): voi
   const spawnerObjId = getLiveSafeSpawnPlayerSpawnerIdForHq(chosenHqId);
   if (!isValidLiveSafeSpawnPlayerSpawnerIdForTeam(team, spawnerObjId)) return;
 
-  safeSpawnForcedUndeploy[playerId] = true;
-  safeSpawnUnsafePending[playerId] = true;
-  safeSpawnUnsafeHqObjIdByPlayerId[playerId] = chosenHqId;
-  safeSpawnUnsafeSpawnerObjId[playerId] = spawnerObjId;
-
-  mod.UndeployPlayer(eventPlayer);
+  queueForcedSafeSpawnRetry(playerId, chosenHqId, spawnerObjId);
 }
 
 function resolveSafeSpawnSpawnerObjId(playerId: number, team: mod.Team): number {
@@ -8691,108 +10146,297 @@ function getSafeSpawnEnemyRadiusMeters(attemptUsed: number): number {
   return SAFE_SPAWN_ENEMY_RADIUS_METERS;
 }
 
+function getSafeSpawnGeneration(playerId: number): number {
+  return safeSpawnGenerationByPlayerId[playerId] ?? 0;
+}
 
+function bumpSafeSpawnGeneration(playerId: number): number {
+  const nextGeneration = getSafeSpawnGeneration(playerId) + 1;
+  safeSpawnGenerationByPlayerId[playerId] = nextGeneration;
+  return nextGeneration;
+}
 
+function clearQueuedSafeSpawnStateForPlayer(playerId: number): void {
+  delete safeSpawnCheckQueuedGenerationByPlayerId[playerId];
+  delete safeSpawnForcedQueuedGenerationByPlayerId[playerId];
+  delete cipherQueuedAnchorByPlayerId[playerId];
+  safeSpawnPendingCheck[playerId] = false;
+}
 
+function isSafeSpawnCheckQueueItemCurrent(item: SafeSpawnCheckQueueItem): boolean {
+  if (safeSpawnCheckQueuedGenerationByPlayerId[item.playerId] !== item.generation) return false;
+  if (getSafeSpawnGeneration(item.playerId) !== item.generation) return false;
+  return serverPlayers.get(item.playerId) !== undefined;
+}
 
-/*
-  Safe spawn check:
-    - Runs shortly after deploy (live only).
-    - If enemy is within 8m, force an undeploy and re-spawn from a safer HQ spawnpoint.
-    - Makes up to SAFE_SPAWN_MAX_FORCED_REDEPLOYS attempts.
-    - First forced attempt uses the player's recorded last live HQ source (fallback: initial HQ).
-    - Additional forced attempts alternate between the team's live HQ pair.
-    - Bypasses recycling if it looks like a squad spawn.
-*/
-async function SafeSpawnCheckOrRedeploy(eventPlayer: mod.Player, playerId: number): Promise<void> {
+function isForcedSafeSpawnQueueItemCurrent(item: ForcedSafeSpawnQueueItem): boolean {
+  if (safeSpawnForcedQueuedGenerationByPlayerId[item.playerId] !== item.generation) return false;
+  if (getSafeSpawnGeneration(item.playerId) !== item.generation) return false;
+  return serverPlayers.get(item.playerId) !== undefined;
+}
+
+function isSafeSpawnUnsafePendingForPlayer(playerId: number): boolean {
+  return safeSpawnUnsafePending[playerId] === true;
+}
+
+function queueForcedSafeSpawnRetry(playerId: number, hqObjId: number, spawnerObjId: number): void {
+  const p = serverPlayers.get(playerId);
+  if (!p || !spawnerObjId) return;
+
+  delete cipherQueuedAnchorByPlayerId[playerId];
+  const generation = getSafeSpawnGeneration(playerId);
+  if (safeSpawnForcedQueuedGenerationByPlayerId[playerId] === generation) return;
+
+  safeSpawnForcedUndeploy[playerId] = true;
+  safeSpawnUnsafePending[playerId] = true;
+  safeSpawnUnsafeHqObjIdByPlayerId[playerId] = hqObjId;
+  safeSpawnUnsafeSpawnerObjId[playerId] = spawnerObjId;
+  safeSpawnForcedQueuedGenerationByPlayerId[playerId] = generation;
+  safeSpawnForcedQueue.push({
+    playerId,
+    generation,
+    hqObjId,
+    spawnerObjId,
+    stage: "undeploy",
+    dueTick: phaseTickCount + 1,
+    waitTicks: 0,
+  });
+}
+
+function queueForcedSafeSpawnRetryForCurrentRoute(
+  eventPlayer: mod.Player,
+  playerId: number,
+  source: string
+): boolean {
+  void source;
+  if (!mod.IsPlayerValid(eventPlayer)) return false;
+
+  const team = mod.GetTeam(eventPlayer);
+  if (!mod.Equals(team, team1) && !mod.Equals(team, team2)) return false;
+
+  const used = safeSpawnForcedRedeploys[playerId] ?? 0;
+  const nextUsed =
+    used >= SAFE_SPAWN_MAX_FORCED_REDEPLOYS ? SAFE_SPAWN_MAX_FORCED_REDEPLOYS : used + 1;
+  safeSpawnForcedRedeploys[playerId] = nextUsed;
+
+  const chosenHqId = sanitizeForcedSafeSpawnHqForTeam(
+    team,
+    resolveForcedSafeSpawnHqObjId(playerId, team, nextUsed)
+  );
+  const spawnerObjId = getLiveSafeSpawnPlayerSpawnerIdForHq(chosenHqId);
+
+  if (!isValidLiveSafeSpawnPlayerSpawnerIdForTeam(team, spawnerObjId)) return false;
+
+  queueForcedSafeSpawnRetry(playerId, chosenHqId, spawnerObjId);
+  return true;
+}
+
+function finalizeSafeSpawnDeploySuccess(eventPlayer: mod.Player, playerId: number): void {
+  if (safeSpawnUnsafePending[playerId] === true) return;
+
+  requestCipherSpawnTeleportForPlayer(playerId, true);
+  processCipherSpawnJobs("SafeSpawnSuccess_LiveTeleport");
+  const teleported = teleportCipherPlayerToRoutedAnchor(eventPlayer, playerId);
+  if (!teleported && gameStatus === 3) {
+    if (queueForcedSafeSpawnRetryForCurrentRoute(eventPlayer, playerId, "SafeSpawnSuccess_NoSafeAnchor")) return;
+  }
+  if (
+    teleported &&
+    hasEnemyNearPosition(
+      mod.GetTeam(eventPlayer),
+      getPlayerPosition(eventPlayer),
+      getSafeSpawnEnemyRadiusMeters(safeSpawnForcedRedeploys[playerId] ?? 0),
+      playerId
+    )
+  ) {
+    if (queueForcedSafeSpawnRetryForCurrentRoute(eventPlayer, playerId, "SafeSpawnSuccess_PostTeleportUnsafe")) return;
+  }
+  if (bombCarrierPlayerId === playerId) {
+    syncCipherCarrierVisualsNow(getCurrentSchedulerNowSeconds(), "SafeSpawnSuccess_LiveTeleport");
+  }
+  markCipherSecondHalfDeployReadyForPlayer(playerId, eventPlayer);
+  HqDesyncCheckAndRecycle(eventPlayer, playerId);
+  if (!isSafeSpawnUnsafePendingForPlayer(playerId)) {
+    safeSpawnForcedUndeploy[playerId] = false;
+  }
+}
+
+function finishSafeSpawnAsSafe(eventPlayer: mod.Player, playerId: number): void {
+  safeSpawnForcedRedeploys[playerId] = 0;
+  commitPendingDynamicHqForPlayer(playerId);
+  finalizeSafeSpawnDeploySuccess(eventPlayer, playerId);
+}
+
+function runSafeSpawnCheckOrRedeploy(playerId: number, generation: number): void {
   if (safeSpawnPendingCheck[playerId] === true) return;
   if (safeSpawnUnsafePending[playerId] === true) return;
+  if (generation !== getSafeSpawnGeneration(playerId)) return;
+
+  const p = serverPlayers.get(playerId);
+  if (!p) return;
+
+  const eventPlayer = p.player;
+  if (!mod.IsPlayerValid(eventPlayer)) return;
 
   safeSpawnPendingCheck[playerId] = true;
 
   try {
-    await mod.Wait(SAFE_SPAWN_CHECK_DELAY_SECONDS);
-
-    // 1) Hard bypass if spawn is near ANY friendly within 8m
-    if (isSpawnNearFriendlyPlayer(eventPlayer, playerId, FRIENDLY_SPAWN_BYPASS_RADIUS_METERS)) {
-      safeSpawnForcedRedeploys[playerId] = 0;
-      commitPendingDynamicHqForPlayer(playerId);
-      return;
-    }
-
-
-    // 2) Keep your existing bypass if you still want it
-    if (isSquadSpawnBypassActive(playerId)) {
-      safeSpawnForcedRedeploys[playerId] = 0;
-      return;
-    }
-
     if (gameStatus !== 3) return;
-
-    const p = serverPlayers.get(playerId);
-    if (!p) return;
-
     if (!p.isDeployed) return;
     if (!isPlayerAlive(eventPlayer)) return;
 
-    const used = safeSpawnForcedRedeploys[playerId] ?? 0;
-    const radius = getSafeSpawnEnemyRadiusMeters(used);
-
-
-    // If we already hit the cap previously, do not loop forever.
-    if (used >= SAFE_SPAWN_MAX_FORCED_REDEPLOYS) return;
-
-    // If this looks like a squad spawn, do not force recycle.
-    if (checkIfSpawnedOnSquadmate(eventPlayer)) {
-      safeSpawnForcedRedeploys[playerId] = 0;
-      return;
-    }
-
     const team = mod.GetTeam(eventPlayer);
     const pos = getPlayerPosition(eventPlayer);
-
-    
+    const used = safeSpawnForcedRedeploys[playerId] ?? 0;
+    const radius = getSafeSpawnEnemyRadiusMeters(used);
     const unsafe = hasEnemyNearPosition(team, pos, radius, playerId);
 
-
-
-    if (!unsafe) {
-      // Successful safe spawn: reset attempt counter.
-      safeSpawnForcedRedeploys[playerId] = 0;
-      commitPendingDynamicHqForPlayer(playerId);
+    if (unsafe) {
+      queueForcedSafeSpawnRetryForCurrentRoute(eventPlayer, playerId, "SafeSpawnCheck_Unsafe");
       return;
     }
 
+    if (isSpawnNearFriendlyPlayer(eventPlayer, playerId, FRIENDLY_SPAWN_BYPASS_RADIUS_METERS)) {
+      finishSafeSpawnAsSafe(eventPlayer, playerId);
+      return;
+    }
 
-    // Unsafe: consume one attempt.
-    const nextUsed = used + 1;
-    safeSpawnForcedRedeploys[playerId] = nextUsed;
-    safeSpawnForcedUndeploy[playerId] = true;
+    if (isSquadSpawnBypassActive(playerId)) {
+      finishSafeSpawnAsSafe(eventPlayer, playerId);
+      return;
+    }
 
-    const chosenHqId = sanitizeForcedSafeSpawnHqForTeam(
-      team,
-      resolveForcedSafeSpawnHqObjId(playerId, team, nextUsed)
-    );
-    const spawnerObjId = getLiveSafeSpawnPlayerSpawnerIdForHq(chosenHqId);
+    if (checkIfSpawnedOnSquadmate(eventPlayer)) {
+      finishSafeSpawnAsSafe(eventPlayer, playerId);
+      return;
+    }
 
-    // Defensive: if mapping is empty/misconfigured, do nothing (avoids random fallback behavior).
-    if (!isValidLiveSafeSpawnPlayerSpawnerIdForTeam(team, spawnerObjId)) return;
-
-    safeSpawnUnsafePending[playerId] = true;
-    safeSpawnUnsafeHqObjIdByPlayerId[playerId] = chosenHqId;
-    safeSpawnUnsafeSpawnerObjId[playerId] = spawnerObjId;
-
-    p.isDeployed = false;
-
-    mod.SetRedeployTime(eventPlayer, 9999);
-
-    mod.DisplayNotificationMessage(mod.Message(mod.stringkeys.SafeSpawnRetryToast), eventPlayer);
-    mod.UndeployPlayer(eventPlayer);
+    finishSafeSpawnAsSafe(eventPlayer, playerId);
   } finally {
     safeSpawnPendingCheck[playerId] = false;
   }
 }
 
+function SafeSpawnCheckOrRedeploy(playerId: number): void {
+  if (safeSpawnUnsafePending[playerId] === true) return;
+
+  const generation = getSafeSpawnGeneration(playerId);
+  if (safeSpawnCheckQueuedGenerationByPlayerId[playerId] === generation) return;
+
+  safeSpawnCheckQueuedGenerationByPlayerId[playerId] = generation;
+  safeSpawnCheckQueue.push({
+    playerId,
+    generation,
+    dueTick: phaseTickCount + SAFE_SPAWN_CHECK_DELAY_TICKS,
+  });
+}
+
+function processSafeSpawnCheckQueue(): void {
+  if (gameStatus !== 3 || safeSpawnCheckQueue.length <= 0) return;
+
+  let processed = 0;
+  const remaining: SafeSpawnCheckQueueItem[] = [];
+
+  for (let i = 0; i < safeSpawnCheckQueue.length; i++) {
+    const item = safeSpawnCheckQueue[i];
+
+    if (!isSafeSpawnCheckQueueItemCurrent(item)) continue;
+
+    if (processed >= SAFE_SPAWN_CHECK_QUEUE_BUDGET_PER_TICK || item.dueTick > phaseTickCount) {
+      remaining.push(item);
+      continue;
+    }
+
+    delete safeSpawnCheckQueuedGenerationByPlayerId[item.playerId];
+    processed += 1;
+    runSafeSpawnCheckOrRedeploy(item.playerId, item.generation);
+  }
+
+  safeSpawnCheckQueue = remaining;
+}
+
+function processForcedSafeSpawnQueue(): void {
+  if (gameStatus !== 3 || safeSpawnForcedQueue.length <= 0) return;
+
+  let processed = 0;
+  const remaining: ForcedSafeSpawnQueueItem[] = [];
+
+  for (let i = 0; i < safeSpawnForcedQueue.length; i++) {
+    const item = safeSpawnForcedQueue[i];
+
+    if (!isForcedSafeSpawnQueueItemCurrent(item)) continue;
+
+    if (processed >= SAFE_SPAWN_FORCED_QUEUE_BUDGET_PER_TICK || item.dueTick > phaseTickCount) {
+      remaining.push(item);
+      continue;
+    }
+
+    const p = serverPlayers.get(item.playerId);
+    if (!p || !mod.IsPlayerValid(p.player)) {
+      delete safeSpawnForcedQueuedGenerationByPlayerId[item.playerId];
+      safeSpawnUnsafePending[item.playerId] = false;
+      safeSpawnUnsafeSpawnerObjId[item.playerId] = 0;
+      safeSpawnUnsafeHqObjIdByPlayerId[item.playerId] = 0;
+      continue;
+    }
+
+    processed += 1;
+
+    if (item.stage === "undeploy") {
+      safeSpawnForcedUndeploy[item.playerId] = true;
+      safeSpawnUnsafePending[item.playerId] = true;
+      safeSpawnUnsafeHqObjIdByPlayerId[item.playerId] = item.hqObjId;
+      safeSpawnUnsafeSpawnerObjId[item.playerId] = item.spawnerObjId;
+      p.isDeployed = false;
+
+      mod.SetRedeployTime(p.player, 9999);
+      mod.DisplayNotificationMessage(mod.Message(mod.stringkeys.SafeSpawnRetryToast), p.player);
+      mod.UndeployPlayer(p.player);
+
+      remaining.push({
+        playerId: item.playerId,
+        generation: item.generation,
+        hqObjId: item.hqObjId,
+        spawnerObjId: item.spawnerObjId,
+        stage: "spawn",
+        dueTick: phaseTickCount + SAFE_SPAWN_FORCED_SPAWN_DELAY_TICKS,
+        waitTicks: 0,
+      });
+      continue;
+    }
+
+    if (p.isDeployed && item.waitTicks < TICK_RATE) {
+      remaining.push({
+        playerId: item.playerId,
+        generation: item.generation,
+        hqObjId: item.hqObjId,
+        spawnerObjId: item.spawnerObjId,
+        stage: "spawn",
+        dueTick: phaseTickCount + 1,
+        waitTicks: item.waitTicks + 1,
+      });
+      continue;
+    }
+
+    safeSpawnUnsafePending[item.playerId] = false;
+    safeSpawnUnsafeSpawnerObjId[item.playerId] = 0;
+    safeSpawnUnsafeHqObjIdByPlayerId[item.playerId] = 0;
+    delete safeSpawnForcedQueuedGenerationByPlayerId[item.playerId];
+
+    lastLiveHqSpawnPointObjIdByPlayerId[item.playerId] = item.hqObjId;
+    lastForcedSafeSpawnHqObjIdByPlayerId[item.playerId] = item.hqObjId;
+    mod.SetRedeployTime(p.player, 0);
+    trySpawnPlayerFromSpawnPointSafe(p.player, item.spawnerObjId, "SafeSpawnForcedQueue");
+    mod.SetRedeployTime(p.player, REDEPLOY_TIME);
+  }
+
+  safeSpawnForcedQueue = remaining;
+}
+
+function processLiveSafeSpawnQueues(): void {
+  processForcedSafeSpawnQueue();
+  processSafeSpawnCheckQueue();
+}
 /* =================================================================================================
    5) AUDIO (SFX / VO)
 ================================================================================================= */
@@ -8808,7 +10452,7 @@ let SFX_CountdownHeartbeat: any = null;
 let SFX_ThumpFriendly: any = null;
 let SFX_ThumpEnemy: any = null;
 let SFX_MatchStartStinger: any = null;
-let SFX_MCOMDestroyed: any = null;
+let SFX_ObjectiveDisabledUi: any = null;
 let SFX_ObjectiveArmingLocal: any = null;
 let SFX_ObjectiveArmLocal: any = null;
 let SFX_ObjectiveDefusedLocal: any = null;
@@ -8966,8 +10610,8 @@ function ensureAudioSpawned(): void {
     mod.CreateVector(0, 0, 0)
   );
 
-  SFX_MCOMDestroyed = mod.SpawnObject(
-    mod.RuntimeSpawn_Common.SFX_UI_Gauntlet_Wreckage_MCOMDestroyed_OneShot2D,
+  SFX_ObjectiveDisabledUi = mod.SpawnObject(
+    OBJECTIVE_DISABLE_UI_SFX_ASSET,
     mod.CreateVector(0, 0, 0),
     mod.CreateVector(0, 0, 0),
     mod.CreateVector(0, 0, 0)
@@ -9500,11 +11144,11 @@ function playBombDropOneShotAtPosition(pos: mod.Vector): void {
 }
 
 function playObjectiveAwardSuccessSfxToAll(): void {
-  if (!SFX_MCOMDestroyed) return;
+  if (!SFX_ObjectiveDisabledUi) return;
 
   serverPlayers.forEach((p) => {
     if (!p || !mod.IsPlayerValid(p.player)) return;
-    mod.PlaySound(SFX_MCOMDestroyed, OBJECTIVE_AWARD_SUCCESS_VOLUME, p.player);
+    mod.PlaySound(SFX_ObjectiveDisabledUi, OBJECTIVE_AWARD_SUCCESS_VOLUME, p.player);
   });
 }
 
@@ -9786,7 +11430,7 @@ const MAX_ROSTER_LINES = 32;
 let prematchRosterBuilt: boolean = false;
 let prematchRosterTeam1: (mod.UIWidget | null)[] = [];
 let prematchRosterTeam2: (mod.UIWidget | null)[] = [];
-const PREMATCH_PANEL_POS_X = -780;
+const PREMATCH_PANEL_POS_X = -560;
 const PREMATCH_PANEL_WIDTH = 292;
 const PREMATCH_PANEL_MIN_HEIGHT = 572;
 const PREMATCH_PANEL_MAX_HEIGHT = 760;
@@ -9816,6 +11460,7 @@ const PREMATCH_ROSTER_LINE_WIDTH = 118;
 const PREMATCH_ROSTER_LINE_HEIGHT = 1;
 const POSTMATCH_MAX_LINES = 24;
 let prematchPanelLayoutKey = "";
+const PREMATCH_PANEL_WIDGET_NAME = "PreMatchPanel";
 
 interface PrematchPanelLayout {
   rows: number;
@@ -9884,7 +11529,7 @@ function computePrematchPanelLayoutFromServerPlayers(): PrematchPanelLayout {
 }
 
 function applyPrematchPanelLayout(layout: PrematchPanelLayout, force: boolean = false): void {
-  const panel = SafeFindWidget("PreMatchContainer");
+  const panel = SafeFindWidget(PREMATCH_PANEL_WIDGET_NAME);
   const team1Header = SafeFindWidget("Text_Team_1");
   const team2Header = SafeFindWidget("Text_Team_2");
 
@@ -9921,6 +11566,170 @@ function applyPrematchPanelLayout(layout: PrematchPanelLayout, force: boolean = 
 
 let postMatchWidgetsToDelete: string[] = [];
 
+const POSTMATCH_SHOWCASE_PARENT_ID = 4747;
+const POSTMATCH_CAMERA_ID = 4646;
+const POSTMATCH_SHOWCASE_HEAD_TEXT_Y_OFFSET_METERS = 2.4;
+const POSTMATCH_SHOWCASE_FEET_TEXT_Y_OFFSET_METERS = -0.25;
+const POSTMATCH_RESULT_TEXT_Y = -360;
+const POSTMATCH_SCORE_TEXT_Y = -275;
+const POSTMATCH_HINT_TEXT_Y = -215;
+const POSTMATCH_RESULT_TEXT_WIDTH = 900;
+const POSTMATCH_RESULT_TEXT_HEIGHT = 120;
+const POSTMATCH_SCORE_TEXT_WIDTH = 160;
+const POSTMATCH_SCORE_TEXT_HEIGHT = 56;
+const POSTMATCH_HINT_TEXT_WIDTH = 900;
+const POSTMATCH_HINT_TEXT_HEIGHT = 44;
+const POSTMATCH_HINT_TEXT_SIZE = 28;
+
+type PostmatchShowcaseStatKind = "eliminations" | "keys" | "destroyed" | "moralSupport";
+type PostmatchShowcaseIconKind = "head" | "feet";
+
+type PostmatchShowcaseSlot = {
+  anchorId: number;
+  statKind: PostmatchShowcaseStatKind;
+  player: Player;
+  statValue: number;
+  headIconObject?: mod.Object;
+  headIconHandle?: mod.WorldIcon;
+  feetIconObject?: mod.Object;
+  feetIconHandle?: mod.WorldIcon;
+};
+
+type PostmatchQuaternion = {
+  w: number;
+  x: number;
+  y: number;
+  z: number;
+};
+
+type PostmatchShowcaseRuntimeObjectConfig = {
+  key: string;
+  anchorId?: number;
+  asset: mod.RuntimeSpawn_Common;
+  localOffset: mod.Vector;
+  localRotation: mod.Vector;
+  scale?: mod.Vector;
+};
+
+type PostmatchShowcaseRuntimeObjectCache = {
+  key: string;
+  position?: mod.Vector;
+  rotation?: mod.Vector;
+  runtimeObject?: mod.Object;
+  runtimeSpawned: boolean;
+};
+
+// Local transforms are relative to authored parent ObjId 4747. Runtime assets use spatial type names.
+const POSTMATCH_SHOWCASE_RUNTIME_OBJECT_CONFIGS: PostmatchShowcaseRuntimeObjectConfig[] = [
+  {
+    key: "postmatch_wall_180",
+    asset: mod.RuntimeSpawn_Common.CinderblockStack_01_C_180,
+    localOffset: mod.CreateVector(-1.88476568, 0.06756592, 0.10205078),
+    localRotation: mod.CreateVector(0, -1.56557786, 0),
+  },
+  {
+    key: "postmatch_wall_181",
+    asset: mod.RuntimeSpawn_Common.CinderblockStack_01_C_180,
+    localOffset: mod.CreateVector(0.04083252, 0.06756592, 0.09197998),
+    localRotation: mod.CreateVector(0, -1.56557786, 0),
+  },
+  {
+    key: "postmatch_wall_182",
+    asset: mod.RuntimeSpawn_Common.CinderblockStack_01_C_180,
+    localOffset: mod.CreateVector(1.95547498, 0.06756592, 0.08197022),
+    localRotation: mod.CreateVector(0, -1.56557786, 0),
+  },
+  {
+    key: "postmatch_wall_183",
+    asset: mod.RuntimeSpawn_Common.CinderblockStack_01_C_180,
+    localOffset: mod.CreateVector(-1.88476568, 1.856842, 0.10205078),
+    localRotation: mod.CreateVector(1.18524949, -1.56834724, -1.19420312),
+  },
+  {
+    key: "postmatch_wall_184",
+    asset: mod.RuntimeSpawn_Common.CinderblockStack_01_C_180,
+    localOffset: mod.CreateVector(0.04083252, 1.856842, 0.09197998),
+    localRotation: mod.CreateVector(1.18524949, -1.56834724, -1.19420312),
+  },
+  {
+    key: "postmatch_wall_185",
+    asset: mod.RuntimeSpawn_Common.CinderblockStack_01_C_180,
+    localOffset: mod.CreateVector(1.95547498, 1.856842, 0.08197022),
+    localRotation: mod.CreateVector(1.18524949, -1.56834724, -1.19420312),
+  },
+  {
+    key: "top_eliminations_pedestal",
+    asset: mod.RuntimeSpawn_Common.BarrierStoneBlock_01_A,
+    localOffset: mod.CreateVector(-1.93911748, -0.59436035, 1.52606206),
+    localRotation: mod.CreateVector(3.14159265, -1.56201727, 3.14159265),
+  },
+  {
+    key: "most_mcoms_destroyed_pedestal",
+    asset: mod.RuntimeSpawn_Common.BarrierStoneBlock_01_A,
+    localOffset: mod.CreateVector(-0.59240722, -0.59436035, 1.53784186),
+    localRotation: mod.CreateVector(3.14159265, -1.56201727, 3.14159265),
+  },
+  {
+    key: "most_keys_delivered_pedestal",
+    asset: mod.RuntimeSpawn_Common.BarrierStoneBlock_01_A,
+    localOffset: mod.CreateVector(0.75463873, -0.59436035, 1.54968267),
+    localRotation: mod.CreateVector(3.14159265, -1.56201727, 3.14159265),
+  },
+  {
+    key: "moral_support_pedestal",
+    asset: mod.RuntimeSpawn_Common.BarrierStoneBlock_01_A,
+    localOffset: mod.CreateVector(2.11074839, -0.59436035, 1.56161507),
+    localRotation: mod.CreateVector(3.14159265, -1.56201727, 3.14159265),
+  },
+  {
+    key: "top_eliminations_anchor",
+    anchorId: 4545,
+    asset: mod.RuntimeSpawn_Common.FiringRange_MatDecal_01,
+    localOffset: mod.CreateVector(-1.97021488, 0.6274719, 1.58447277),
+    localRotation: mod.CreateVector(0, -1.43722636, 0),
+  },
+  {
+    key: "most_mcoms_destroyed_anchor",
+    anchorId: 4546,
+    asset: mod.RuntimeSpawn_Common.FiringRange_MatDecal_01,
+    localOffset: mod.CreateVector(-0.58270266, 0.6274719, 1.59271247),
+    localRotation: mod.CreateVector(0, -1.43722636, 0),
+  },
+  {
+    key: "most_keys_delivered_anchor",
+    anchorId: 4547,
+    asset: mod.RuntimeSpawn_Common.FiringRange_MatDecal_01,
+    localOffset: mod.CreateVector(0.80899053, 0.6274719, 1.62503057),
+    localRotation: mod.CreateVector(0, -1.43722636, 0),
+  },
+  {
+    key: "moral_support_anchor",
+    anchorId: 4548,
+    asset: mod.RuntimeSpawn_Common.FiringRange_MatDecal_01,
+    localOffset: mod.CreateVector(2.15637209, 0.6274719, 1.56951907),
+    localRotation: mod.CreateVector(0, -1.43722636, 0),
+  },
+];
+
+let postmatchShowcaseRuntimeObjectCacheByKey: { [key: string]: PostmatchShowcaseRuntimeObjectCache } = {};
+let postmatchShowcaseAnchorPositionById: { [anchorId: number]: mod.Vector | undefined } = {};
+
+const POSTMATCH_SHOWCASE_SLOT_CONFIGS: { anchorId: number; statKind: PostmatchShowcaseStatKind }[] = [
+  { anchorId: 4545, statKind: "eliminations" },
+  { anchorId: 4546, statKind: "destroyed" },
+  { anchorId: 4547, statKind: "keys" },
+  { anchorId: 4548, statKind: "moralSupport" },
+];
+const POSTMATCH_SHOWCASE_STAT_PRIORITY: PostmatchShowcaseStatKind[] = [
+  "eliminations",
+  "destroyed",
+  "keys",
+  "moralSupport",
+];
+
+let postmatchShowcaseSlots: PostmatchShowcaseSlot[] = [];
+let postmatchShowcaseCameraAppliedByPlayerId: { [playerId: number]: boolean } = {};
+
 /* VoiceOver flag mapping */
 const voflags: { [key: string]: mod.VoiceOverFlags } = {
   A: mod.VoiceOverFlags.Alpha,
@@ -9935,6 +11744,50 @@ function getVoiceOverFlagForSymbol(symbol: ObjectiveLetter): mod.VoiceOverFlags 
   return voflags[symbol] ?? mod.VoiceOverFlags.Alpha;
 }
 
+const SAFE_UI_ROOT_WIDTH = 7000;
+const SAFE_UI_ROOT_HEIGHT = 7000;
+const SAFE_UI_ROOT_SIZE = mod.CreateVector(SAFE_UI_ROOT_WIDTH, SAFE_UI_ROOT_HEIGHT, 0);
+const SAFE_UI_CONTENT_WIDTH = 1440;
+const SAFE_UI_CONTENT_HEIGHT = 1080;
+const SCREEN_UI_REFERENCE_WIDTH = 1920;
+const SCREEN_UI_REFERENCE_HEIGHT = 1080;
+
+function safeRootPosFromTopLeft(x: number, y: number, width: number, height: number): [number, number] {
+  return [
+    x + width / 2 - SCREEN_UI_REFERENCE_WIDTH / 2,
+    y + height / 2 - SCREEN_UI_REFERENCE_HEIGHT / 2,
+  ];
+}
+
+function safeRootPosFromTopCenter(x: number, y: number, _width: number, height: number): [number, number] {
+  return [
+    x,
+    y + height / 2 - SCREEN_UI_REFERENCE_HEIGHT / 2,
+  ];
+}
+
+function safeContentPosFromTopLeft(x: number, y: number, width: number, height: number): [number, number] {
+  return [
+    x + width / 2 - SAFE_UI_CONTENT_WIDTH / 2,
+    y + height / 2 - SAFE_UI_CONTENT_HEIGHT / 2,
+  ];
+}
+
+function safeRootVectorFromTopLeft(x: number, y: number, width: number, height: number): mod.Vector {
+  const pos = safeRootPosFromTopLeft(x, y, width, height);
+  return mod.CreateVector(pos[0], pos[1], 0);
+}
+
+function safeRootVectorFromTopCenter(x: number, y: number, width: number, height: number): mod.Vector {
+  const pos = safeRootPosFromTopCenter(x, y, width, height);
+  return mod.CreateVector(pos[0], pos[1], 0);
+}
+
+function safeContentVectorFromTopLeft(x: number, y: number, width: number, height: number): mod.Vector {
+  const pos = safeContentPosFromTopLeft(x, y, width, height);
+  return mod.CreateVector(pos[0], pos[1], 0);
+}
+
 /* -----------------------------------------------------------------------------------------------
    Top-level UI layout
 ------------------------------------------------------------------------------------------------ */
@@ -9943,8 +11796,8 @@ const UIWidget = modlib.ParseUI({
   name: "UIContainer",
   type: "Container",
   position: [0, 0],
-  size: [7000, 5000],
-  anchor: mod.UIAnchor.TopCenter,
+  size: [SAFE_UI_ROOT_WIDTH, SAFE_UI_ROOT_HEIGHT],
+  anchor: mod.UIAnchor.Center,
   visible: true,
   padding: 0,
   bgColor: [0, 0, 0],
@@ -9955,7 +11808,7 @@ const UIWidget = modlib.ParseUI({
       name: "LiveContainer",
       type: "Container",
       position: [0, 0],
-      size: [1920, 1080],
+      size: [SAFE_UI_ROOT_WIDTH, SAFE_UI_ROOT_HEIGHT],
       anchor: mod.UIAnchor.Center,
       visible: false,
       padding: 0,
@@ -9967,9 +11820,14 @@ const UIWidget = modlib.ParseUI({
         {
           name: "matchtime",
           type: "Container",
-          position: [LIVE_TIMER_DEFAULT_POS_X, LIVE_TIMER_DEFAULT_POS_Y],
+          position: safeContentPosFromTopLeft(
+            LIVE_TIMER_DEFAULT_POS_X,
+            LIVE_TIMER_DEFAULT_POS_Y,
+            LIVE_TIMER_DEFAULT_WIDTH,
+            LIVE_TIMER_DEFAULT_HEIGHT
+          ),
           size: [LIVE_TIMER_DEFAULT_WIDTH, LIVE_TIMER_DEFAULT_HEIGHT],
-          anchor: mod.UIAnchor.TopLeft,
+          anchor: mod.UIAnchor.Center,
           visible: true,
           padding: 0,
           bgColor: [0.1216, 0.1216, 0.1216],
@@ -10043,6 +11901,114 @@ const UIWidget = modlib.ParseUI({
             },
           ],
         },
+        {
+          name: "BG_Score_Container",
+          type: "Container",
+          position: safeContentPosFromTopLeft(38.03 + LIVE_BOTTOM_HUD_OFFSET_X, 660.56, 288.02, 88),
+          size: [288.02, 88],
+          anchor: mod.UIAnchor.Center,
+          visible: false,
+          padding: 0,
+          bgColor: [0.0314, 0.0431, 0.0431],
+          bgAlpha: 0.5,
+          bgFill: mod.UIBgFill.Solid,
+        },
+        {
+          name: "Container_A",
+          type: "Container",
+          position: safeContentPosFromTopLeft(38.03 + LIVE_BOTTOM_HUD_OFFSET_X, 660.56, 44, 44),
+          size: [44, 44],
+          anchor: mod.UIAnchor.Center,
+          visible: false,
+          padding: 0,
+          bgColor: [0.0314, 0.0431, 0.0431],
+          bgAlpha: 0.4,
+          bgFill: mod.UIBgFill.None,
+        },
+        {
+          name: "Container_B",
+          type: "Container",
+          position: safeContentPosFromTopLeft(84.33 + LIVE_BOTTOM_HUD_OFFSET_X, 660.56, 44, 44),
+          size: [44, 44],
+          anchor: mod.UIAnchor.Center,
+          visible: false,
+          padding: 0,
+          bgColor: [0.0314, 0.0431, 0.0431],
+          bgAlpha: 0.4,
+          bgFill: mod.UIBgFill.None,
+        },
+        {
+          name: "Container_C",
+          type: "Container",
+          position: safeContentPosFromTopLeft(130.64 + LIVE_BOTTOM_HUD_OFFSET_X, 660.56, 44, 44),
+          size: [44, 44],
+          anchor: mod.UIAnchor.Center,
+          visible: false,
+          padding: 0,
+          bgColor: [0.0314, 0.0431, 0.0431],
+          bgAlpha: 0.4,
+          bgFill: mod.UIBgFill.None,
+        },
+        {
+          name: "Container_D",
+          type: "Container",
+          position: safeContentPosFromTopLeft(181.3 + LIVE_BOTTOM_HUD_OFFSET_X, 660.56, 44, 44),
+          size: [44, 44],
+          anchor: mod.UIAnchor.Center,
+          visible: false,
+          padding: 0,
+          bgColor: [0.0314, 0.0431, 0.0431],
+          bgAlpha: 0.4,
+          bgFill: mod.UIBgFill.None,
+        },
+        {
+          name: "Container_E",
+          type: "Container",
+          position: safeContentPosFromTopLeft(228 + LIVE_BOTTOM_HUD_OFFSET_X, 660.56, 44, 44),
+          size: [44, 44],
+          anchor: mod.UIAnchor.Center,
+          visible: false,
+          padding: 0,
+          bgColor: [0.0314, 0.0431, 0.0431],
+          bgAlpha: 0.4,
+          bgFill: mod.UIBgFill.None,
+        },
+        {
+          name: "Container_F",
+          type: "Container",
+          position: safeContentPosFromTopLeft(274 + LIVE_BOTTOM_HUD_OFFSET_X, 660.56, 44, 44),
+          size: [44, 44],
+          anchor: mod.UIAnchor.Center,
+          visible: false,
+          padding: 0,
+          bgColor: [0.0314, 0.0431, 0.0431],
+          bgAlpha: 0.4,
+          bgFill: mod.UIBgFill.None,
+        },
+        {
+          name: "friendlyscore",
+          type: "Container",
+          position: safeContentPosFromTopLeft(56.33 + LIVE_BOTTOM_HUD_OFFSET_X, 698.56, 100, 50),
+          size: [100, 50],
+          anchor: mod.UIAnchor.Center,
+          visible: false,
+          padding: 0,
+          bgColor: [0.2314, 0.4196, 0.6745],
+          bgAlpha: 0,
+          bgFill: mod.UIBgFill.None,
+        },
+        {
+          name: "enemyscore",
+          type: "Container",
+          position: safeContentPosFromTopLeft(203.91 + LIVE_BOTTOM_HUD_OFFSET_X, 698.56, 100, 50),
+          size: [100, 50],
+          anchor: mod.UIAnchor.Center,
+          visible: false,
+          padding: 0,
+          bgColor: [0.698, 0.1882, 0.1882],
+          bgAlpha: 0,
+          bgFill: mod.UIBgFill.None,
+        },
 
       ],
     },
@@ -10050,8 +12016,8 @@ const UIWidget = modlib.ParseUI({
       name: "PostMatchContainer",
       type: "Container",
       position: [0, 0],
-      size: [7000, 5000],
-      anchor: mod.UIAnchor.TopCenter,
+      size: [SAFE_UI_ROOT_WIDTH, SAFE_UI_ROOT_HEIGHT],
+      anchor: mod.UIAnchor.Center,
       visible: true,
       padding: 0,
       bgColor: [0, 0, 0],
@@ -10060,6 +12026,18 @@ const UIWidget = modlib.ParseUI({
     },
     {
   name: "PreMatchContainer",
+  type: "Container",
+  position: [0, 0],
+  size: [SAFE_UI_ROOT_WIDTH, SAFE_UI_ROOT_HEIGHT],
+  anchor: mod.UIAnchor.Center,
+  visible: true,
+  padding: 0,
+  bgColor: [0, 0, 0],
+  bgAlpha: 0,
+  bgFill: mod.UIBgFill.None,
+  children: [
+    {
+  name: PREMATCH_PANEL_WIDGET_NAME,
   type: "Container",
   position: [PREMATCH_PANEL_POS_X, PREMATCH_PANEL_POS_Y],
   size: [PREMATCH_PANEL_WIDTH, PREMATCH_PANEL_HEIGHT],
@@ -10169,19 +12147,33 @@ const UIWidget = modlib.ParseUI({
       textAnchor: mod.UIAnchor.Center
     }
   ]
+}
+  ]
 },
     {
       name: "CountDownContainer",
       type: "Container",
-      position: [0, 150],
-      size: [300, 150],
-      anchor: mod.UIAnchor.TopCenter,
+      position: [0, 0],
+      size: [SAFE_UI_ROOT_WIDTH, SAFE_UI_ROOT_HEIGHT],
+      anchor: mod.UIAnchor.Center,
       visible: false,
       padding: 0,
       bgColor: [0, 0, 0],
-      bgAlpha: 0.5,
-      bgFill: mod.UIBgFill.Blur,
+      bgAlpha: 0,
+      bgFill: mod.UIBgFill.None,
       children: [
+        {
+          name: "CountDownPanel",
+          type: "Container",
+          position: safeRootPosFromTopCenter(0, 150, 300, 150),
+          size: [300, 150],
+          anchor: mod.UIAnchor.Center,
+          visible: true,
+          padding: 0,
+          bgColor: [0, 0, 0],
+          bgAlpha: 0.5,
+          bgFill: mod.UIBgFill.Blur,
+          children: [
         {
           name: "MatchStartsText",
           type: "Text",
@@ -10215,6 +12207,8 @@ const UIWidget = modlib.ParseUI({
           textAlpha: 1,
           textSize: 100,
           textAnchor: mod.UIAnchor.Center,
+        },
+          ],
         },
       ],
     },
@@ -10266,10 +12260,12 @@ function SetDepthAboveGameUI(name: string): void {
 
 function SetCountdownOverlayDepthAboveGameUI(): void {
   SetDepthAboveGameUI("CountDownContainer");
+  SetDepthAboveGameUI("CountDownPanel");
 }
 
 function SetCountdownOverlayVisible(visible: boolean): void {
   SafeSetWidgetVisibleByName("CountDownContainer", visible);
+  SafeSetWidgetVisibleByName("CountDownPanel", visible);
   SafeSetWidgetVisibleByName("MatchStartsText", visible);
   SafeSetWidgetVisibleByName("CountDownText", visible);
 }
@@ -10300,6 +12296,7 @@ function setLiveScorePanelVisible(visible: boolean): void {
   serverPlayers.forEach((p) => {
     const playerId = p.id;
     const perPlayerWidgets = [
+      getPlayerLiveHudRootWidgetName(playerId),
       "TeamFriendlyScore" + playerId,
       "TeamOpponentScore" + playerId,
       "FriendlyScorePulse" + playerId,
@@ -10329,136 +12326,6 @@ function setLiveScorePanelVisible(visible: boolean): void {
   }
 }
 
-
-
-// Auto-generated-style score panel kept as a dedicated widget block.
-const bgScoreContainerWidget = modlib.ParseUI({
-  name: "BG_Score_Container",
-  type: "Container",
-  position: [38.03, 660.56],
-  size: [288.02, 88],
-  anchor: mod.UIAnchor.TopLeft,
-  visible: false,
-  padding: 0,
-  bgColor: [0.0314, 0.0431, 0.0431],
-  bgAlpha: 0.5,
-  bgFill: mod.UIBgFill.Solid,
-});
-// Keep an explicit reference so the dedicated ParseUI block is retained for side effects.
-void bgScoreContainerWidget;
-
-const containerAWidget = modlib.ParseUI({
-  name: "Container_A",
-  type: "Container",
-  position: [38.03, 660.56],
-  size: [44, 44],
-  anchor: mod.UIAnchor.TopLeft,
-  visible: false,
-  padding: 0,
-  bgColor: [0.0314, 0.0431, 0.0431],
-  bgAlpha: 0.4,
-  bgFill: mod.UIBgFill.None,
-});
-void containerAWidget;
-
-const containerBWidget = modlib.ParseUI({
-  name: "Container_B",
-  type: "Container",
-  position: [84.33, 660.56],
-  size: [44, 44],
-  anchor: mod.UIAnchor.TopLeft,
-  visible: false,
-  padding: 0,
-  bgColor: [0.0314, 0.0431, 0.0431],
-  bgAlpha: 0.4,
-  bgFill: mod.UIBgFill.None,
-});
-void containerBWidget;
-
-const containerCWidget = modlib.ParseUI({
-  name: "Container_C",
-  type: "Container",
-  position: [130.64, 660.56],
-  size: [44, 44],
-  anchor: mod.UIAnchor.TopLeft,
-  visible: false,
-  padding: 0,
-  bgColor: [0.0314, 0.0431, 0.0431],
-  bgAlpha: 0.4,
-  bgFill: mod.UIBgFill.None,
-});
-void containerCWidget;
-
-const containerDWidget = modlib.ParseUI({
-  name: "Container_D",
-  type: "Container",
-  position: [181.3, 660.56],
-  size: [44, 44],
-  anchor: mod.UIAnchor.TopLeft,
-  visible: false,
-  padding: 0,
-  bgColor: [0.0314, 0.0431, 0.0431],
-  bgAlpha: 0.4,
-  bgFill: mod.UIBgFill.None,
-});
-void containerDWidget;
-
-const containerEWidget = modlib.ParseUI({
-  name: "Container_E",
-  type: "Container",
-  position: [228, 660.56],
-  size: [44, 44],
-  anchor: mod.UIAnchor.TopLeft,
-  visible: false,
-  padding: 0,
-  bgColor: [0.0314, 0.0431, 0.0431],
-  bgAlpha: 0.4,
-  bgFill: mod.UIBgFill.None,
-});
-void containerEWidget;
-
-const containerFWidget = modlib.ParseUI({
-  name: "Container_F",
-  type: "Container",
-  position: [274, 660.56],
-  size: [44, 44],
-  anchor: mod.UIAnchor.TopLeft,
-  visible: false,
-  padding: 0,
-  bgColor: [0.0314, 0.0431, 0.0431],
-  bgAlpha: 0.4,
-  bgFill: mod.UIBgFill.None,
-});
-void containerFWidget;
-
-const friendlyScoreWidget = modlib.ParseUI({
-  name: "friendlyscore",
-  type: "Container",
-  position: [56.33, 698.56],
-  size: [100, 50],
-  anchor: mod.UIAnchor.TopLeft,
-  visible: false,
-  padding: 0,
-  bgColor: [0.2314, 0.4196, 0.6745],
-  bgAlpha: 0,
-  bgFill: mod.UIBgFill.None,
-});
-void friendlyScoreWidget;
-
-const enemyScoreWidget = modlib.ParseUI({
-  name: "enemyscore",
-  type: "Container",
-  position: [203.91, 698.56],
-  size: [100, 50],
-  anchor: mod.UIAnchor.TopLeft,
-  visible: false,
-  padding: 0,
-  bgColor: [0.698, 0.1882, 0.1882],
-  bgAlpha: 0,
-  bgFill: mod.UIBgFill.None,
-});
-void enemyScoreWidget;
-
 /* -----------------------------------------------------------------------------------------------
    Match start banner (DOMINATION splash)
 ------------------------------------------------------------------------------------------------ */
@@ -10477,8 +12344,8 @@ const container0nx1gWidget = modlib.ParseUI({
   name: "Container_0NX1G",
   type: "Container",
   position: [0, 0],
-  size: [1920, 1080],
-  anchor: mod.UIAnchor.TopCenter,
+  size: [SAFE_UI_ROOT_WIDTH, SAFE_UI_ROOT_HEIGHT],
+  anchor: mod.UIAnchor.Center,
   visible: false,
   padding: 0,
   bgColor: [0, 0, 0],
@@ -10505,9 +12372,9 @@ const container0nx1gWidget = modlib.ParseUI({
     {
       name: "Intro_DOMINATION_Text",
       type: "Text",
-      position: [0, 200],
+      position: safeRootPosFromTopCenter(0, 200, 650, 110),
       size: [650, 110],
-      anchor: mod.UIAnchor.TopCenter,
+      anchor: mod.UIAnchor.Center,
       visible: true,
       padding: 0,
       bgColor: [1.0, 0.55, 0.18],
@@ -10522,9 +12389,9 @@ const container0nx1gWidget = modlib.ParseUI({
     {
       name: "Intro_DOMINATION_Line_Left",
       type: "Container",
-      position: [-385, 200],
+      position: safeRootPosFromTopCenter(-385, 200, 80, 110),
       size: [80, 110],
-      anchor: mod.UIAnchor.TopCenter,
+      anchor: mod.UIAnchor.Center,
       visible: true,
       padding: 0,
       bgColor: [1.0, 0.45, 0.16],
@@ -10534,9 +12401,9 @@ const container0nx1gWidget = modlib.ParseUI({
     {
       name: "Intro_DOMINATION_Line_Right",
       type: "Container",
-      position: [385, 200],
+      position: safeRootPosFromTopCenter(385, 200, 80, 110),
       size: [80, 110],
-      anchor: mod.UIAnchor.TopCenter,
+      anchor: mod.UIAnchor.Center,
       visible: true,
       padding: 0,
       bgColor: [1.0, 0.45, 0.16],
@@ -10568,6 +12435,7 @@ async function showMatchStartBannerOnce(): Promise<void> {
     }
 
     hasShownMatchStartBanner = true;
+    mod.SetUIWidgetDepth(root, mod.UIDepth.AboveGameUI);
     mod.SetUIWidgetVisible(root, true);
 
     mod.SetUIWidgetBgAlpha(textW, 1);
@@ -10611,345 +12479,61 @@ async function showMatchStartBannerOnce(): Promise<void> {
 /* -----------------------------------------------------------------------------------------------
    Prematch roster UI
 ------------------------------------------------------------------------------------------------ */
-// -------------------- Prematch UI (per-player) --------------------
+const STALE_PREMATCH_BUTTON_WIDGET_PREFIXES = [
+  "UI_PREMATCH_CONTAINER_",
+  "UI_PREMATCH_BUTTON_READY_",
+  "UI_PREMATCH_BUTTON_SWITCH_",
+  "UI_PREMATCH_LABEL_READY_",
+  "UI_PREMATCH_LABEL_SWITCH_",
+];
 
-const UI_PREMATCH_CONTAINER_ID = "UI_PREMATCH_CONTAINER_";
-const UI_PREMATCH_BUTTON_READY_ID = "UI_PREMATCH_BUTTON_READY_";
-const UI_PREMATCH_BUTTON_SWITCH_ID = "UI_PREMATCH_BUTTON_SWITCH_";
-const UI_PREMATCH_LABEL_READY_ID = "UI_PREMATCH_LABEL_READY_";
-const UI_PREMATCH_LABEL_SWITCH_ID = "UI_PREMATCH_LABEL_SWITCH_";
+const STALE_PREMATCH_BUTTON_WIDGET_NAMES = [
+  "Button_Ready",
+  "Button_Switch_Team",
+  "Text_Ready",
+  "Text_Switch_Teams",
+  "Button_Ready_Label",
+  "Button_Switch_Team_Label",
+];
 
-const PREMATCH_BUTTON_TEXT_COLOR = mod.CreateVector(0.0314, 0.0431, 0.0431);
-const PREMATCH_BUTTON_BASE_COLOR = mod.CreateVector(0.0745, 0.1843, 0.2471);
-const PREMATCH_BUTTON_HOVER_COLOR = mod.CreateVector(1, 1, 1);
-const PREMATCH_BUTTON_PRESSED_COLOR = mod.CreateVector(0.4392, 0.9216, 1);
+function deletePrematchButtonWidgetsForPlayer(player: mod.Player): void {
+  if (!player || !mod.IsPlayerValid(player)) return;
 
-function safeFind(name: string): mod.UIWidget | undefined {
+  let objId = -1;
+  let stablePlayerId = -1;
   try {
-    const root = mod.GetUIRoot();
-    try {
-      const wRoot = mod.FindUIWidgetWithName(name, root);
-      if (wRoot && mod.IsType(wRoot, mod.Types.UIWidget)) return wRoot as mod.UIWidget;
-    } catch {
-    }
+    objId = mod.GetObjId(player);
+  } catch (_errObjId) {}
+  try {
+    stablePlayerId = modlib.getPlayerId(player);
+  } catch (_errPlayerId) {}
 
-    const w = mod.FindUIWidgetWithName(name);
-    if (w && mod.IsType(w, mod.Types.UIWidget)) return w as mod.UIWidget;
-  } catch {
+  for (let i = 0; i < STALE_PREMATCH_BUTTON_WIDGET_PREFIXES.length; i++) {
+    const prefix = STALE_PREMATCH_BUTTON_WIDGET_PREFIXES[i];
+    if (objId >= 0) safeDeleteAllWidgetsByName(prefix + objId);
+    if (stablePlayerId >= 0 && stablePlayerId !== objId) safeDeleteAllWidgetsByName(prefix + stablePlayerId);
   }
-  return undefined;
+
+  try {
+    mod.EnableUIInputMode(false, player);
+  } catch (_errInputMode) {}
 }
 
-function applyPrematchLayoutToPlayerWidgets(playerId: number, layout: PrematchPanelLayout): void {
-  const container = safeFind(UI_PREMATCH_CONTAINER_ID + playerId);
-  if (container) {
-    SafeSetWidgetPositionHandle(container, mod.CreateVector(PREMATCH_PANEL_POS_X, layout.panelCenterY, 0));
-    SafeSetWidgetSizeHandle(container, mod.CreateVector(PREMATCH_PANEL_WIDTH, layout.panelHeight, 0));
+function DeletePrematchButtonWidgetsForAllPlayers(): void {
+  for (let i = 0; i < STALE_PREMATCH_BUTTON_WIDGET_NAMES.length; i++) {
+    safeDeleteAllWidgetsByName(STALE_PREMATCH_BUTTON_WIDGET_NAMES[i]);
   }
 
-  const readyButton = safeFind(UI_PREMATCH_BUTTON_READY_ID + playerId);
-  if (readyButton) {
-    SafeSetWidgetPositionHandle(
-      readyButton,
-      mod.CreateVector(-PREMATCH_COLUMN_CENTER_OFFSET, layout.buttonY, 0)
-    );
-    SafeSetWidgetSizeHandle(readyButton, mod.CreateVector(PREMATCH_BUTTON_WIDTH, PREMATCH_BUTTON_HEIGHT, 0));
-  }
-
-  const switchButton = safeFind(UI_PREMATCH_BUTTON_SWITCH_ID + playerId);
-  if (switchButton) {
-    SafeSetWidgetPositionHandle(switchButton, mod.CreateVector(PREMATCH_COLUMN_CENTER_OFFSET, layout.buttonY, 0));
-    SafeSetWidgetSizeHandle(switchButton, mod.CreateVector(PREMATCH_BUTTON_WIDTH, PREMATCH_BUTTON_HEIGHT, 0));
-  }
-
-  const readyLabel = safeFind(UI_PREMATCH_LABEL_READY_ID + playerId);
-  if (readyLabel) {
-    SafeSetWidgetPositionHandle(readyLabel, mod.CreateVector(-PREMATCH_COLUMN_CENTER_OFFSET, layout.labelY, 0));
-    SafeSetWidgetSizeHandle(readyLabel, mod.CreateVector(PREMATCH_LABEL_WIDTH, PREMATCH_LABEL_HEIGHT, 0));
-  }
-
-  const switchLabel = safeFind(UI_PREMATCH_LABEL_SWITCH_ID + playerId);
-  if (switchLabel) {
-    SafeSetWidgetPositionHandle(switchLabel, mod.CreateVector(PREMATCH_COLUMN_CENTER_OFFSET, layout.labelY, 0));
-    SafeSetWidgetSizeHandle(switchLabel, mod.CreateVector(PREMATCH_LABEL_WIDTH, PREMATCH_LABEL_HEIGHT, 0));
-  }
-}
-
-
-function ensurePrematchLabelOverlay(
-  player: mod.Player,
-  container: mod.UIWidget,
-  labelName: string,
-  posX: number,
-  labelY: number,
-  labelKey: any
-): void {
-  const existing = safeFind(labelName);
-  if (!existing) {
-    mod.AddUIText(
-      labelName,
-      mod.CreateVector(posX, labelY, 0),
-      mod.CreateVector(PREMATCH_LABEL_WIDTH, PREMATCH_LABEL_HEIGHT, 0),
-      mod.UIAnchor.TopCenter,
-      container,
-      true,
-      0,
-      mod.CreateVector(0, 0, 0),
-      0,
-      mod.UIBgFill.None,
-      mod.Message(labelKey),
-      22,
-      PREMATCH_BUTTON_TEXT_COLOR,
-      1,
-      mod.UIAnchor.Center,
-      player
-    );
-  }
-
-  const label = safeFind(labelName);
-  if (label) {
-    SafeSetWidgetPositionHandle(label, mod.CreateVector(posX, labelY, 0));
-    SafeSetWidgetSizeHandle(label, mod.CreateVector(PREMATCH_LABEL_WIDTH, PREMATCH_LABEL_HEIGHT, 0));
-    mod.SetUITextLabel(label, mod.Message(labelKey));
-    mod.SetUITextColor(label, PREMATCH_BUTTON_TEXT_COLOR);
-    mod.SetUIWidgetDepth(label, mod.UIDepth.AboveGameUI);
-    mod.SetUIWidgetVisible(label, true);
-  }
-}
-
-function HideLegacyPrematchButtons(): void {
-  const legacyNames = [
-    "Button_Ready",
-    "Button_Switch_Team",
-    "Text_Ready",
-    "Text_Switch_Teams",
-    "Button_Ready_Label",
-    "Button_Switch_Team_Label",
-  ];
-
-  for (let i = 0; i < legacyNames.length; i++) {
-    const w = safeFind(legacyNames[i]);
-    if (!w) continue;
-    try {
-      mod.SetUIWidgetVisible(w, false);
-      // Defensive: ensure legacy buttons never capture input
-      if (legacyNames[i] === "Button_Ready" || legacyNames[i] === "Button_Switch_Team") {
-        mod.EnableUIButtonEvent(w, mod.UIButtonEvent.ButtonDown, false);
-        mod.EnableUIButtonEvent(w, mod.UIButtonEvent.ButtonUp, false);
-      }
-    } catch {
-      // ignore
-    }
-  }
-}
-
-
-function EnsurePrematchButtonsForPlayer(player: mod.Player): void {
-  if (!mod.IsPlayerValid(player)) return;
-
-  HideLegacyPrematchButtons();
-
-  const pid = mod.GetObjId(player);
-  const layout = computePrematchPanelLayoutFromServerPlayers();
-  applyPrematchPanelLayout(layout);
-
-  const containerName = UI_PREMATCH_CONTAINER_ID + pid;
-  const readyBtnName = UI_PREMATCH_BUTTON_READY_ID + pid;
-  const switchBtnName = UI_PREMATCH_BUTTON_SWITCH_ID + pid;
-  const readyLabelName = UI_PREMATCH_LABEL_READY_ID + pid;
-  const switchLabelName = UI_PREMATCH_LABEL_SWITCH_ID + pid;
-
-  const applyButtonBaseAndAlphas = (btn: mod.UIWidget): void => {
-    mod.SetUIButtonEnabled(btn, true);
-
-    mod.SetUIButtonColorBase(btn, PREMATCH_BUTTON_BASE_COLOR);
-    mod.SetUIButtonColorDisabled(btn, PREMATCH_BUTTON_BASE_COLOR);
-    mod.SetUIButtonColorPressed(btn, PREMATCH_BUTTON_PRESSED_COLOR);
-    mod.SetUIButtonColorHover(btn, PREMATCH_BUTTON_HOVER_COLOR);
-    mod.SetUIButtonColorFocused(btn, PREMATCH_BUTTON_BASE_COLOR);
-
-    mod.SetUIButtonAlphaBase(btn, 1);
-    mod.SetUIButtonAlphaDisabled(btn, 1);
-    mod.SetUIButtonAlphaPressed(btn, 1);
-    mod.SetUIButtonAlphaHover(btn, 1);
-    mod.SetUIButtonAlphaFocused(btn, 1);
-
-    mod.SetUIWidgetDepth(btn, mod.UIDepth.AboveGameUI);
-  };
-
-  const existingContainer = safeFind(containerName);
-  if (existingContainer) {
-    mod.EnableUIInputMode(true, player);
-
-    const readyBtn = safeFind(readyBtnName);
-    const switchBtn = safeFind(switchBtnName);
-
-    const rebuild = false;
-
-    if (rebuild) {
-      const readyLabel = safeFind(readyLabelName);
-      const switchLabel = safeFind(switchLabelName);
-
-      if (readyLabel) mod.DeleteUIWidget(readyLabel);
-      if (switchLabel) mod.DeleteUIWidget(switchLabel);
-      if (readyBtn) mod.DeleteUIWidget(readyBtn);
-      if (switchBtn) mod.DeleteUIWidget(switchBtn);
-
-      mod.DeleteUIWidget(existingContainer);
-    } else {
-      mod.SetUIWidgetVisible(existingContainer, true);
-      mod.SetUIWidgetDepth(existingContainer, mod.UIDepth.AboveGameUI);
-      applyPrematchLayoutToPlayerWidgets(pid, layout);
-
-      if (readyBtn) applyButtonBaseAndAlphas(readyBtn);
-      if (switchBtn) applyButtonBaseAndAlphas(switchBtn);
-
-      ensurePrematchLabelOverlay(
-        player,
-        existingContainer,
-        readyLabelName,
-        -PREMATCH_COLUMN_CENTER_OFFSET,
-        layout.labelY,
-        mod.stringkeys.Text_Ready
-      );
-      ensurePrematchLabelOverlay(
-        player,
-        existingContainer,
-        switchLabelName,
-        PREMATCH_COLUMN_CENTER_OFFSET,
-        layout.labelY,
-        mod.stringkeys.Text_Switch_Teams
-      );
-
-      applyPrematchLayoutToPlayerWidgets(pid, layout);
-      return;
-    }
-  }
-
-  mod.EnableUIInputMode(true, player);
-
-  mod.AddUIContainer(
-    containerName,
-    mod.CreateVector(PREMATCH_PANEL_POS_X, layout.panelCenterY, 0),
-    mod.CreateVector(PREMATCH_PANEL_WIDTH, layout.panelHeight, 0),
-    PREMATCH_PANEL_ANCHOR,
-    mod.GetUIRoot(),
-    true,
-    0,
-    mod.CreateVector(0, 0, 0),
-    0,
-    mod.UIBgFill.None,
-    player
-  );
-
-  const container = safeFind(containerName);
-  if (!container) return;
-  mod.SetUIWidgetDepth(container, mod.UIDepth.AboveGameUI);
-
-  mod.AddUIButton(
-    readyBtnName,
-    mod.CreateVector(-PREMATCH_COLUMN_CENTER_OFFSET, layout.buttonY, 0),
-    mod.CreateVector(PREMATCH_BUTTON_WIDTH, PREMATCH_BUTTON_HEIGHT, 0),
-    mod.UIAnchor.TopCenter,
-    container,
-    true,
-    0,
-    mod.CreateVector(1, 1, 1),
-    1,
-    mod.UIBgFill.Solid,
-    true,
-    PREMATCH_BUTTON_BASE_COLOR,
-    1,
-    PREMATCH_BUTTON_BASE_COLOR,
-    1,
-    PREMATCH_BUTTON_PRESSED_COLOR,
-    1,
-    PREMATCH_BUTTON_HOVER_COLOR,
-    1,
-    PREMATCH_BUTTON_BASE_COLOR,
-    1,
-    player
-  );
-
-  mod.AddUIButton(
-    switchBtnName,
-    mod.CreateVector(PREMATCH_COLUMN_CENTER_OFFSET, layout.buttonY, 0),
-    mod.CreateVector(PREMATCH_BUTTON_WIDTH, PREMATCH_BUTTON_HEIGHT, 0),
-    mod.UIAnchor.TopCenter,
-    container,
-    true,
-    0,
-    mod.CreateVector(1, 1, 1),
-    1,
-    mod.UIBgFill.Solid,
-    true,
-    PREMATCH_BUTTON_BASE_COLOR,
-    1,
-    PREMATCH_BUTTON_BASE_COLOR,
-    1,
-    PREMATCH_BUTTON_PRESSED_COLOR,
-    1,
-    PREMATCH_BUTTON_HOVER_COLOR,
-    1,
-    PREMATCH_BUTTON_BASE_COLOR,
-    1,
-    player
-  );
-
-  const readyBtn2 = safeFind(readyBtnName);
-  const switchBtn2 = safeFind(switchBtnName);
-  if (!readyBtn2 || !switchBtn2) return;
-
-  applyButtonBaseAndAlphas(readyBtn2);
-  applyButtonBaseAndAlphas(switchBtn2);
-
-  ensurePrematchLabelOverlay(
-    player,
-    container,
-    readyLabelName,
-    -PREMATCH_COLUMN_CENTER_OFFSET,
-    layout.labelY,
-    mod.stringkeys.Text_Ready
-  );
-  ensurePrematchLabelOverlay(
-    player,
-    container,
-    switchLabelName,
-    PREMATCH_COLUMN_CENTER_OFFSET,
-    layout.labelY,
-    mod.stringkeys.Text_Switch_Teams
-  );
-
-  applyPrematchLayoutToPlayerWidgets(pid, layout);
-}
-
-
-
-
-function SetPrematchButtonsVisibleForPlayer(player: mod.Player, visible: boolean): void {
-  if (!mod.IsPlayerValid(player)) return;
-
-  const pid = mod.GetObjId(player);
-  const container = safeFind(UI_PREMATCH_CONTAINER_ID + pid);
-  const rdybutton = safeFind(UI_PREMATCH_BUTTON_READY_ID + pid);
-  const switchbutton = safeFind(UI_PREMATCH_BUTTON_SWITCH_ID + pid);
-  const txtready = safeFind(UI_PREMATCH_LABEL_READY_ID + pid);
-  const txtswitch = safeFind(UI_PREMATCH_LABEL_SWITCH_ID + pid);
-  if (container) mod.SetUIWidgetVisible(container, visible);
-  if (rdybutton) mod.SetUIWidgetVisible(rdybutton, visible);
-  if (switchbutton) mod.SetUIWidgetVisible(switchbutton, visible);
-  if (txtready) mod.SetUIWidgetVisible(txtready, visible);
-  if (txtswitch) mod.SetUIWidgetVisible(txtswitch, visible);
-  // If you hide the UI, you generally want to turn off UI input mode too.
-  if (!visible) mod.EnableUIInputMode(false, player);
-}
-
-function SetPrematchButtonsVisibleForAllPlayers(visible: boolean): void {
   const allPlayers = mod.AllPlayers();
   for (let i = 0; i < mod.CountOf(allPlayers); i++) {
-    const p = mod.ValueInArray(allPlayers, i) as mod.Player;
-    if (p && mod.IsPlayerValid(p)) SetPrematchButtonsVisibleForPlayer(p, visible);
+    const player = mod.ValueInArray(allPlayers, i) as mod.Player;
+    deletePrematchButtonWidgetsForPlayer(player);
   }
+
+  serverPlayers.forEach((playerInfo) => {
+    if (!playerInfo) return;
+    deletePrematchButtonWidgetsForPlayer(playerInfo.player);
+  });
 }
 // Prematch roster UI lists centered player names with a light separator line under each row.
 
@@ -10974,14 +12558,89 @@ function resetPrematchRosterBuildState(): void {
   prematchPanelLayoutKey = "";
 }
 
+function setStaticPrematchPanelWidgetsVisible(visible: boolean): void {
+  const staticNames = [
+    "Text_Cipher_Esports",
+    "Text_Mode_Domination",
+    "Text_Current_Map",
+    "Container_NRDAA",
+    "Text_Team_1",
+    "Text_Team_2",
+    "PreMatchTeam1",
+    "PreMatchTeam2",
+  ];
+
+  for (let i = 0; i < staticNames.length; i++) {
+    SafeSetWidgetVisibleByName(staticNames[i], visible);
+  }
+}
+
+function HidePrematchUiForTransition(): void {
+  SafeSetWidgetVisibleByName("PreMatchContainer", false);
+  SafeSetWidgetVisibleByName(PREMATCH_PANEL_WIDGET_NAME, false);
+  setStaticPrematchPanelWidgetsVisible(false);
+
+  for (let i = 0; i < MAX_ROSTER_LINES; i++) {
+    SafeSetWidgetVisibleHandle(prematchRosterTeam1[i], false);
+    SafeSetWidgetVisibleHandle(prematchRosterTeam2[i], false);
+    SafeSetWidgetVisibleHandle(prematchRosterTeam1Lines[i], false);
+    SafeSetWidgetVisibleHandle(prematchRosterTeam2Lines[i], false);
+    SafeSetWidgetVisibleByName("PreMatchRosterT1_" + i, false);
+    SafeSetWidgetVisibleByName("PreMatchRosterT2_" + i, false);
+    SafeSetWidgetVisibleByName("PreMatchRosterT1Line_" + i, false);
+    SafeSetWidgetVisibleByName("PreMatchRosterT2Line_" + i, false);
+  }
+
+  for (const playerIdText in readyTextWidgetByPlayerId) {
+    const playerId = Number(playerIdText);
+    if (!Number.isFinite(playerId)) continue;
+    SafeSetWidgetVisibleHandle(readyTextWidgetByPlayerId[playerId], false);
+    SafeSetWidgetVisibleByName("ReadyText" + playerId, false);
+  }
+
+  serverPlayers.forEach((p) => {
+    SafeSetWidgetVisibleByName("ReadyText" + p.id, false);
+  });
+
+  DeletePrematchButtonWidgetsForAllPlayers();
+}
+
+function ShowPrematchUi(): void {
+  if (gameStatus !== 0) return;
+
+  DeletePrematchButtonWidgetsForAllPlayers();
+
+  SafeSetWidgetVisibleByName("PreMatchContainer", true);
+  SafeSetWidgetVisibleByName(PREMATCH_PANEL_WIDGET_NAME, true);
+  setStaticPrematchPanelWidgetsVisible(true);
+
+  serverPlayers.forEach((p) => {
+    if (!p || !mod.IsPlayerValid(p.player)) return;
+    const readyText = resolvePrematchReadyTextWidgetForPlayer(p.id);
+    if (readyText) {
+      SafeSetWidgetVisibleHandle(readyText, true);
+    } else {
+      replacePrematchReadyText(p.id, p.player);
+    }
+    try {
+      mod.EnableUIInputMode(false, p.player);
+    } catch (_errInputMode) {}
+  });
+
+  BuildPrematchRosterUI();
+  UpdatePrematchRosterUI();
+  DeletePrematchButtonWidgetsForAllPlayers();
+}
+
 function BuildPrematchRosterUI(): void {
+    if (gameStatus !== 0) return;
     if (prematchRosterBuilt) return;
 
-    const parent = SafeFindWidget("PreMatchContainer");
+    const parent = SafeFindWidget(PREMATCH_PANEL_WIDGET_NAME);
     if (!parent) {
       warnPrematchUiGuardOnce(
         "prematch_roster_parent_missing",
-        mod.Message("[PREMATCH ROSTER] missing parent widget {}", "PreMatchContainer")
+        mod.Message("[PREMATCH ROSTER] missing parent widget {}", PREMATCH_PANEL_WIDGET_NAME)
       );
       return;
     }
@@ -11093,6 +12752,7 @@ function BuildPrematchRosterUI(): void {
 }
 
 function UpdatePrematchRosterUI(): void {
+    if (gameStatus !== 0) return;
     if (!prematchRosterBuilt) {
       BuildPrematchRosterUI();
       if (!prematchRosterBuilt) return;
@@ -11208,13 +12868,13 @@ function replacePrematchReadyText(playerId: number, receiver: mod.Player): void 
   const readyTextName = "ReadyText" + playerId;
   safeDeleteWidgetByName(readyTextName);
 
-  const parent = SafeFindWidget("PreMatchContainer");
+  const parent = SafeFindWidget(PREMATCH_PANEL_WIDGET_NAME);
   if (!parent) {
     readyTextBuiltByPlayerId[playerId] = false;
     delete readyTextWidgetByPlayerId[playerId];
     warnPrematchUiGuardOnce(
       "prematch_readytext_parent_missing",
-      mod.Message("[PREMATCH READY TEXT] missing parent widget {}", "PreMatchContainer")
+      mod.Message("[PREMATCH READY TEXT] missing parent widget {}", PREMATCH_PANEL_WIDGET_NAME)
     );
     return;
   }
@@ -11320,6 +12980,7 @@ function deletePlayerLiveHudWidgets(playerId: number): void {
   safeDeleteWidgetByName("Text_BombNotice" + playerId);
   safeDeleteWidgetByName(BOMB_NOTICE_CONTAINER_WIDGET_NAME_PREFIX + playerId);
   safeDeleteWidgetByName("Text_BombDroppedDeath" + playerId);
+  safeDeleteWidgetByName(getPlayerLiveHudRootWidgetName(playerId));
   safeDeleteWidgetByName("ObjectiveHoldFillArming" + playerId);
   safeDeleteWidgetByName("ObjectiveHoldFillDisarming" + playerId);
   safeDeleteWidgetByName("ObjectiveHoldTextArming" + playerId);
@@ -11342,11 +13003,22 @@ function deletePlayerLiveHudWidgets(playerId: number): void {
 
 }
 
-const LIVE_HUD_FRIENDLY_SCORE_POS = mod.CreateVector(56.33, 698.56, 0);
-const LIVE_HUD_ENEMY_SCORE_POS = mod.CreateVector(203.91, 698.56, 0);
+const PLAYER_LIVE_HUD_ROOT_WIDGET_NAME_PREFIX = "PlayerLiveHudRoot";
+const LIVE_HUD_FRIENDLY_SCORE_POS = safeContentVectorFromTopLeft(
+  56.33 + LIVE_BOTTOM_HUD_OFFSET_X,
+  698.56,
+  100,
+  50
+);
+const LIVE_HUD_ENEMY_SCORE_POS = safeContentVectorFromTopLeft(
+  203.91 + LIVE_BOTTOM_HUD_OFFSET_X,
+  698.56,
+  100,
+  50
+);
 const LIVE_HUD_SCORE_SIZE = mod.CreateVector(100, 50, 0);
 const BOMB_CARRIER_WIDGET_NAME_PREFIX = "Text_BombCarrier";
-const BOMB_CARRIER_WIDGET_POS = mod.CreateVector(0, 876.98, 0);
+const BOMB_CARRIER_WIDGET_POS = safeRootVectorFromTopCenter(0, 876.98, 243, 50);
 const BOMB_CARRIER_WIDGET_SIZE = mod.CreateVector(243, 50, 0);
 const BOMB_CARRIER_WIDGET_BG_COLOR = mod.CreateVector(0.0314, 0.0431, 0.0431);
 const BOMB_CARRIER_WIDGET_TEXT_COLOR = mod.CreateVector(1, 1, 1);
@@ -11369,8 +13041,8 @@ const OBJECTIVE_HOLD_PROGRESS_BG_ALPHA = 0.4;
 const OBJECTIVE_HOLD_PROGRESS_FILL_ALPHA = 0.8;
 const OBJECTIVE_HOLD_BG_COLOR = mod.CreateVector(0.0314, 0.0431, 0.0431);
 const OBJECTIVE_HOLD_FILL_COLOR = mod.CreateVector(0.3294, 0.3686, 0.3882);
-const DEPLOY_OBJECTIVE_TIMER_ROOT_WIDTH = 1920;
-const DEPLOY_OBJECTIVE_TIMER_ROOT_HEIGHT = 1080;
+const DEPLOY_OBJECTIVE_TIMER_ROOT_WIDTH = SAFE_UI_ROOT_WIDTH;
+const DEPLOY_OBJECTIVE_TIMER_ROOT_HEIGHT = SAFE_UI_ROOT_HEIGHT;
 const DEPLOY_OBJECTIVE_TIMER_ROOT_POS_X = 0;
 const DEPLOY_OBJECTIVE_TIMER_ROOT_POS_Y = 0;
 const DEPLOY_OBJECTIVE_TIMER_PANEL_WIDTH = 720;
@@ -11393,6 +13065,10 @@ const DEPLOY_OBJECTIVE_TIMER_VALUE_HEIGHT = 48;
 const DEPLOY_OBJECTIVE_TIMER_TITLE_TEXT_SIZE = 22;
 const DEPLOY_OBJECTIVE_TIMER_VALUE_TEXT_SIZE = 42;
 const DEPLOY_OBJECTIVE_TIMER_LANE_TEXT_SIZE = 42;
+
+function getPlayerLiveHudRootWidgetName(playerId: number): string {
+  return PLAYER_LIVE_HUD_ROOT_WIDGET_NAME_PREFIX + playerId;
+}
 
 function bindPlayerTopScoreWidgetRefs(p: Player): void {
   p.friendlyScoreWidget = mod.FindUIWidgetWithName("TeamFriendlyScore" + p.id);
@@ -11435,20 +13111,21 @@ function bindObjectiveHoldWidgetRefs(p: Player): void {
 
 function bindDeployObjectiveTimerWidgetRefs(p: Player): void {
   const playerId = p.id;
-  p.deployObjectiveTimerRootWidget = findRootParentWidgetByName(getDeployObjectiveTimerRootWidgetName(playerId)) ?? null as any;
-  p.deployObjectiveTimerPanelWidget = findRootParentWidgetByName(getDeployObjectiveTimerPanelWidgetName(playerId)) ?? null as any;
-  p.deployObjectiveTimerLaneFillWidget = findRootParentWidgetByName(getDeployObjectiveTimerLaneFillWidgetName(playerId)) ?? null as any;
-  p.deployObjectiveTimerLaneTextWidget = findRootParentWidgetByName(getDeployObjectiveTimerLaneTextWidgetName(playerId)) ?? null as any;
-  p.deployObjectiveTimerLaneOutlineTopWidget = findRootParentWidgetByName(getDeployObjectiveTimerLaneOutlineTopWidgetName(playerId)) ?? null as any;
-  p.deployObjectiveTimerLaneOutlineBottomWidget = findRootParentWidgetByName(getDeployObjectiveTimerLaneOutlineBottomWidgetName(playerId)) ?? null as any;
-  p.deployObjectiveTimerLaneOutlineLeftWidget = findRootParentWidgetByName(getDeployObjectiveTimerLaneOutlineLeftWidgetName(playerId)) ?? null as any;
-  p.deployObjectiveTimerLaneOutlineRightWidget = findRootParentWidgetByName(getDeployObjectiveTimerLaneOutlineRightWidgetName(playerId)) ?? null as any;
-  p.deployObjectiveTimerTitleWidget = findRootParentWidgetByName(getDeployObjectiveTimerTitleWidgetName(playerId)) ?? null as any;
-  p.deployObjectiveTimerValueWidget = findRootParentWidgetByName(getDeployObjectiveTimerValueWidgetName(playerId)) ?? null as any;
+  p.deployObjectiveTimerRootWidget = mod.FindUIWidgetWithName(getDeployObjectiveTimerRootWidgetName(playerId)) ?? null as any;
+  p.deployObjectiveTimerPanelWidget = mod.FindUIWidgetWithName(getDeployObjectiveTimerPanelWidgetName(playerId)) ?? null as any;
+  p.deployObjectiveTimerLaneFillWidget = mod.FindUIWidgetWithName(getDeployObjectiveTimerLaneFillWidgetName(playerId)) ?? null as any;
+  p.deployObjectiveTimerLaneTextWidget = mod.FindUIWidgetWithName(getDeployObjectiveTimerLaneTextWidgetName(playerId)) ?? null as any;
+  p.deployObjectiveTimerLaneOutlineTopWidget = mod.FindUIWidgetWithName(getDeployObjectiveTimerLaneOutlineTopWidgetName(playerId)) ?? null as any;
+  p.deployObjectiveTimerLaneOutlineBottomWidget = mod.FindUIWidgetWithName(getDeployObjectiveTimerLaneOutlineBottomWidgetName(playerId)) ?? null as any;
+  p.deployObjectiveTimerLaneOutlineLeftWidget = mod.FindUIWidgetWithName(getDeployObjectiveTimerLaneOutlineLeftWidgetName(playerId)) ?? null as any;
+  p.deployObjectiveTimerLaneOutlineRightWidget = mod.FindUIWidgetWithName(getDeployObjectiveTimerLaneOutlineRightWidgetName(playerId)) ?? null as any;
+  p.deployObjectiveTimerTitleWidget = mod.FindUIWidgetWithName(getDeployObjectiveTimerTitleWidgetName(playerId)) ?? null as any;
+  p.deployObjectiveTimerValueWidget = mod.FindUIWidgetWithName(getDeployObjectiveTimerValueWidgetName(playerId)) ?? null as any;
 }
 
 function setTopScoreWidgetDepthForPlayer(playerId: number): void {
   const names = [
+    getPlayerLiveHudRootWidgetName(playerId),
     "TeamFriendlyScore" + playerId,
     "TeamOpponentScore" + playerId,
     "FriendlyScorePulse" + playerId,
@@ -11485,6 +13162,7 @@ function isWidgetParentRoot(widget: mod.UIWidget | undefined): boolean {
 }
 
 function hasValidRootTopScoreWidgets(playerId: number): boolean {
+  const liveHudRoot = mod.FindUIWidgetWithName(getPlayerLiveHudRootWidgetName(playerId));
   const friendlyScore = mod.FindUIWidgetWithName("TeamFriendlyScore" + playerId);
   const enemyScore = mod.FindUIWidgetWithName("TeamOpponentScore" + playerId);
   const friendlyPulse = mod.FindUIWidgetWithName("FriendlyScorePulse" + playerId);
@@ -11494,6 +13172,7 @@ function hasValidRootTopScoreWidgets(playerId: number): boolean {
   const bombNotice = mod.FindUIWidgetWithName(BOMB_NOTICE_WIDGET_NAME_PREFIX + playerId);
 
   if (
+    !liveHudRoot ||
     !friendlyScore ||
     !enemyScore ||
     !friendlyPulse ||
@@ -11505,15 +13184,7 @@ function hasValidRootTopScoreWidgets(playerId: number): boolean {
     return false;
   }
 
-  return (
-    isWidgetParentRoot(friendlyScore) &&
-    isWidgetParentRoot(enemyScore) &&
-    isWidgetParentRoot(friendlyPulse) &&
-    isWidgetParentRoot(enemyPulse) &&
-    isWidgetParentRoot(bombCarrier) &&
-    isWidgetParentRoot(bombNoticeContainer) &&
-    isWidgetParentRoot(bombNotice)
-  );
+  return true;
 }
 
 function rebuildPlayerTopScoreWidgets(p: Player): boolean {
@@ -11533,9 +13204,27 @@ function rebuildPlayerTopScoreWidgets(p: Player): boolean {
   safeDeleteWidgetByName(BOMB_NOTICE_WIDGET_NAME_PREFIX + playerId);
   safeDeleteWidgetByName(BOMB_NOTICE_CONTAINER_WIDGET_NAME_PREFIX + playerId);
   safeDeleteWidgetByName("Text_BombDroppedDeath" + playerId);
+  safeDeleteWidgetByName(getPlayerLiveHudRootWidgetName(playerId));
 
   const uiRoot = mod.GetUIRoot();
   if (!uiRoot) return false;
+
+  mod.AddUIContainer(
+    getPlayerLiveHudRootWidgetName(playerId),
+    mod.CreateVector(0, 0, 0),
+    SAFE_UI_ROOT_SIZE,
+    mod.UIAnchor.Center,
+    uiRoot,
+    true,
+    0,
+    mod.CreateVector(0, 0, 0),
+    0,
+    mod.UIBgFill.None,
+    p.player
+  );
+
+  const liveHudRoot = mod.FindUIWidgetWithName(getPlayerLiveHudRootWidgetName(playerId));
+  if (!liveHudRoot) return false;
 
   const team = mod.GetTeam(p.player);
   const friendly = getFriendlyScore(team);
@@ -11545,8 +13234,8 @@ function rebuildPlayerTopScoreWidgets(p: Player): boolean {
     "TeamFriendlyScore" + playerId,
     LIVE_HUD_FRIENDLY_SCORE_POS,
     LIVE_HUD_SCORE_SIZE,
-    mod.UIAnchor.TopLeft,
-    uiRoot,
+    mod.UIAnchor.Center,
+    liveHudRoot,
     true,
     0,
     mod.CreateVector(0, 0, 0),
@@ -11564,8 +13253,8 @@ function rebuildPlayerTopScoreWidgets(p: Player): boolean {
     "TeamOpponentScore" + playerId,
     LIVE_HUD_ENEMY_SCORE_POS,
     LIVE_HUD_SCORE_SIZE,
-    mod.UIAnchor.TopLeft,
-    uiRoot,
+    mod.UIAnchor.Center,
+    liveHudRoot,
     true,
     0,
     mod.CreateVector(0, 0, 0),
@@ -11583,8 +13272,8 @@ function rebuildPlayerTopScoreWidgets(p: Player): boolean {
     "FriendlyScorePulse" + playerId,
     LIVE_HUD_FRIENDLY_SCORE_POS,
     LIVE_HUD_SCORE_SIZE,
-    mod.UIAnchor.TopLeft,
-    uiRoot,
+    mod.UIAnchor.Center,
+    liveHudRoot,
     true,
     0,
     mod.CreateVector(0.2314, 0.4196, 0.6745),
@@ -11597,8 +13286,8 @@ function rebuildPlayerTopScoreWidgets(p: Player): boolean {
     "EnemyScorePulse" + playerId,
     LIVE_HUD_ENEMY_SCORE_POS,
     LIVE_HUD_SCORE_SIZE,
-    mod.UIAnchor.TopLeft,
-    uiRoot,
+    mod.UIAnchor.Center,
+    liveHudRoot,
     true,
     0,
     mod.CreateVector(0.698, 0.1882, 0.1882),
@@ -11611,8 +13300,8 @@ function rebuildPlayerTopScoreWidgets(p: Player): boolean {
     BOMB_CARRIER_WIDGET_NAME_PREFIX + playerId,
     BOMB_CARRIER_WIDGET_POS,
     BOMB_CARRIER_WIDGET_SIZE,
-    mod.UIAnchor.TopCenter,
-    uiRoot,
+    mod.UIAnchor.Center,
+    liveHudRoot,
     false,
     0,
     BOMB_CARRIER_WIDGET_BG_COLOR,
@@ -11631,7 +13320,7 @@ function rebuildPlayerTopScoreWidgets(p: Player): boolean {
     BOMB_NOTICE_WIDGET_POS,
     BOMB_NOTICE_CONTAINER_SIZE,
     mod.UIAnchor.Center,
-    uiRoot,
+    liveHudRoot,
     false,
     0,
     BOMB_NOTICE_WIDGET_BG_COLOR,
@@ -11645,7 +13334,7 @@ function rebuildPlayerTopScoreWidgets(p: Player): boolean {
     BOMB_NOTICE_WIDGET_POS,
     BOMB_NOTICE_WIDGET_SIZE,
     mod.UIAnchor.Center,
-    uiRoot,
+    liveHudRoot,
     false,
     0,
     mod.CreateVector(0, 0, 0),
@@ -11754,6 +13443,24 @@ function getStringMessageWithFallback(key: any, fallbackText: string): any {
     } catch (_err) {}
   }
   return mod.Message(fallbackText);
+}
+
+function getStringMessageWithFallback1(key: any, fallbackText: string, arg0: any): any {
+  if (key !== undefined && key !== null) {
+    try {
+      return mod.Message(key, arg0);
+    } catch (_err) {}
+  }
+  return mod.Message(fallbackText, arg0);
+}
+
+function getStringMessageWithFallback2(key: any, fallbackText: string, arg0: any, arg1: any): any {
+  if (key !== undefined && key !== null) {
+    try {
+      return mod.Message(key, arg0, arg1);
+    } catch (_err) {}
+  }
+  return mod.Message(fallbackText, arg0, arg1);
 }
 
 function getCounterMessageWithFallback(value: number): any {
@@ -11999,7 +13706,7 @@ function rebuildObjectiveHoldProgressUiWidgetsForPlayer(p: Player): void {
   mod.AddUIContainer(
     getObjectiveHoldRootWidgetName(playerId),
     mod.CreateVector(0, 0, 0),
-    mod.CreateVector(1920, 1080, 0),
+    SAFE_UI_ROOT_SIZE,
     mod.UIAnchor.Center,
     mod.GetUIRoot(),
     true,
@@ -12240,12 +13947,15 @@ function rebuildDeployObjectiveTimerUiWidgetsForPlayer(p: Player): void {
     p.player
   );
 
+  const timerRoot = mod.FindUIWidgetWithName(getDeployObjectiveTimerRootWidgetName(playerId));
+  if (!timerRoot) return;
+
   mod.AddUIContainer(
     getDeployObjectiveTimerPanelWidgetName(playerId),
     panelCenterPos,
     mod.CreateVector(DEPLOY_OBJECTIVE_TIMER_PANEL_WIDTH, DEPLOY_OBJECTIVE_TIMER_PANEL_HEIGHT, 0),
     mod.UIAnchor.Center,
-    uiRoot,
+    timerRoot,
     false,
     0,
     BOMB_NOTICE_WIDGET_BG_COLOR,
@@ -12259,7 +13969,7 @@ function rebuildDeployObjectiveTimerUiWidgetsForPlayer(p: Player): void {
     mod.CreateVector(DEPLOY_OBJECTIVE_TIMER_PANEL_POS_X + DEPLOY_OBJECTIVE_TIMER_LANE_POS_X, DEPLOY_OBJECTIVE_TIMER_PANEL_POS_Y + DEPLOY_OBJECTIVE_TIMER_LANE_POS_Y, 0),
     mod.CreateVector(DEPLOY_OBJECTIVE_TIMER_LANE_SIZE, DEPLOY_OBJECTIVE_TIMER_LANE_SIZE, 0),
     mod.UIAnchor.Center,
-    uiRoot,
+    timerRoot,
     false,
     0,
     COLOR_NEUTRAL,
@@ -12277,7 +13987,7 @@ function rebuildDeployObjectiveTimerUiWidgetsForPlayer(p: Player): void {
     ),
     mod.CreateVector(DEPLOY_OBJECTIVE_TIMER_LANE_SIZE, DEPLOY_OBJECTIVE_TIMER_LANE_OUTLINE_THICKNESS, 0),
     mod.UIAnchor.Center,
-    uiRoot,
+    timerRoot,
     false,
     0,
     COLOR_NEUTRAL,
@@ -12295,7 +14005,7 @@ function rebuildDeployObjectiveTimerUiWidgetsForPlayer(p: Player): void {
     ),
     mod.CreateVector(DEPLOY_OBJECTIVE_TIMER_LANE_SIZE, DEPLOY_OBJECTIVE_TIMER_LANE_OUTLINE_THICKNESS, 0),
     mod.UIAnchor.Center,
-    uiRoot,
+    timerRoot,
     false,
     0,
     COLOR_NEUTRAL,
@@ -12313,7 +14023,7 @@ function rebuildDeployObjectiveTimerUiWidgetsForPlayer(p: Player): void {
     ),
     mod.CreateVector(DEPLOY_OBJECTIVE_TIMER_LANE_OUTLINE_THICKNESS, DEPLOY_OBJECTIVE_TIMER_LANE_SIZE, 0),
     mod.UIAnchor.Center,
-    uiRoot,
+    timerRoot,
     false,
     0,
     COLOR_NEUTRAL,
@@ -12331,7 +14041,7 @@ function rebuildDeployObjectiveTimerUiWidgetsForPlayer(p: Player): void {
     ),
     mod.CreateVector(DEPLOY_OBJECTIVE_TIMER_LANE_OUTLINE_THICKNESS, DEPLOY_OBJECTIVE_TIMER_LANE_SIZE, 0),
     mod.UIAnchor.Center,
-    uiRoot,
+    timerRoot,
     false,
     0,
     COLOR_NEUTRAL,
@@ -12349,7 +14059,7 @@ function rebuildDeployObjectiveTimerUiWidgetsForPlayer(p: Player): void {
     ),
     mod.CreateVector(DEPLOY_OBJECTIVE_TIMER_LANE_SIZE, DEPLOY_OBJECTIVE_TIMER_LANE_SIZE, 0),
     mod.UIAnchor.Center,
-    uiRoot,
+    timerRoot,
     false,
     0,
     mod.CreateVector(0, 0, 0),
@@ -12372,13 +14082,13 @@ function rebuildDeployObjectiveTimerUiWidgetsForPlayer(p: Player): void {
     ),
     mod.CreateVector(DEPLOY_OBJECTIVE_TIMER_TITLE_WIDTH, DEPLOY_OBJECTIVE_TIMER_TITLE_HEIGHT, 0),
     mod.UIAnchor.Center,
-    uiRoot,
+    timerRoot,
     false,
     0,
     mod.CreateVector(0, 0, 0),
     0,
     mod.UIBgFill.None,
-    getStringMessageWithFallback((mod.stringkeys as any).Text_ObjectiveDestroyTimer, "TIME LEFT UNTIL DESTROYED"),
+    getStringMessageWithFallback((mod.stringkeys as any).Text_ObjectiveDestroyTimer, "NODE REBOOTING"),
     DEPLOY_OBJECTIVE_TIMER_TITLE_TEXT_SIZE,
     BOMB_NOTICE_WIDGET_TEXT_COLOR,
     1,
@@ -12395,7 +14105,7 @@ function rebuildDeployObjectiveTimerUiWidgetsForPlayer(p: Player): void {
     ),
     mod.CreateVector(DEPLOY_OBJECTIVE_TIMER_VALUE_WIDTH, DEPLOY_OBJECTIVE_TIMER_VALUE_HEIGHT, 0),
     mod.UIAnchor.Center,
-    uiRoot,
+    timerRoot,
     false,
     0,
     mod.CreateVector(0, 0, 0),
@@ -12514,25 +14224,25 @@ function getHighestPriorityArmedObjectiveCpId(): number | undefined {
 function hideDeployObjectiveTimerUiForPlayer(playerId: number): void {
   const p = serverPlayers.get(playerId);
   const root =
-    p?.deployObjectiveTimerRootWidget ?? findRootParentWidgetByName(getDeployObjectiveTimerRootWidgetName(playerId));
+    p?.deployObjectiveTimerRootWidget ?? mod.FindUIWidgetWithName(getDeployObjectiveTimerRootWidgetName(playerId));
   const panel =
-    p?.deployObjectiveTimerPanelWidget ?? findRootParentWidgetByName(getDeployObjectiveTimerPanelWidgetName(playerId));
+    p?.deployObjectiveTimerPanelWidget ?? mod.FindUIWidgetWithName(getDeployObjectiveTimerPanelWidgetName(playerId));
   const laneFill =
-    p?.deployObjectiveTimerLaneFillWidget ?? findRootParentWidgetByName(getDeployObjectiveTimerLaneFillWidgetName(playerId));
+    p?.deployObjectiveTimerLaneFillWidget ?? mod.FindUIWidgetWithName(getDeployObjectiveTimerLaneFillWidgetName(playerId));
   const laneText =
-    p?.deployObjectiveTimerLaneTextWidget ?? findRootParentWidgetByName(getDeployObjectiveTimerLaneTextWidgetName(playerId));
+    p?.deployObjectiveTimerLaneTextWidget ?? mod.FindUIWidgetWithName(getDeployObjectiveTimerLaneTextWidgetName(playerId));
   const outlineTop =
-    p?.deployObjectiveTimerLaneOutlineTopWidget ?? findRootParentWidgetByName(getDeployObjectiveTimerLaneOutlineTopWidgetName(playerId));
+    p?.deployObjectiveTimerLaneOutlineTopWidget ?? mod.FindUIWidgetWithName(getDeployObjectiveTimerLaneOutlineTopWidgetName(playerId));
   const outlineBottom =
-    p?.deployObjectiveTimerLaneOutlineBottomWidget ?? findRootParentWidgetByName(getDeployObjectiveTimerLaneOutlineBottomWidgetName(playerId));
+    p?.deployObjectiveTimerLaneOutlineBottomWidget ?? mod.FindUIWidgetWithName(getDeployObjectiveTimerLaneOutlineBottomWidgetName(playerId));
   const outlineLeft =
-    p?.deployObjectiveTimerLaneOutlineLeftWidget ?? findRootParentWidgetByName(getDeployObjectiveTimerLaneOutlineLeftWidgetName(playerId));
+    p?.deployObjectiveTimerLaneOutlineLeftWidget ?? mod.FindUIWidgetWithName(getDeployObjectiveTimerLaneOutlineLeftWidgetName(playerId));
   const outlineRight =
-    p?.deployObjectiveTimerLaneOutlineRightWidget ?? findRootParentWidgetByName(getDeployObjectiveTimerLaneOutlineRightWidgetName(playerId));
+    p?.deployObjectiveTimerLaneOutlineRightWidget ?? mod.FindUIWidgetWithName(getDeployObjectiveTimerLaneOutlineRightWidgetName(playerId));
   const title =
-    p?.deployObjectiveTimerTitleWidget ?? findRootParentWidgetByName(getDeployObjectiveTimerTitleWidgetName(playerId));
+    p?.deployObjectiveTimerTitleWidget ?? mod.FindUIWidgetWithName(getDeployObjectiveTimerTitleWidgetName(playerId));
   const value =
-    p?.deployObjectiveTimerValueWidget ?? findRootParentWidgetByName(getDeployObjectiveTimerValueWidgetName(playerId));
+    p?.deployObjectiveTimerValueWidget ?? mod.FindUIWidgetWithName(getDeployObjectiveTimerValueWidgetName(playerId));
 
   SafeSetWidgetVisibleHandle(root, false);
   SafeSetWidgetVisibleHandle(panel, false);
@@ -13639,6 +15349,7 @@ function beginOvertimeClock(nowSec?: number): void {
 function resetCipherSuddenDeathState(): void {
   cipherSuddenDeathEliminatedByPlayerId = {};
   cipherSuddenDeathUndeployIgnoreUntilSec = 0;
+  hideCipherSuddenDeathAliveHudForAllPlayers();
 }
 
 function resetCipherObjectivesForCurrentStage(context: string): void {
@@ -13673,7 +15384,7 @@ const CIPHER_TRANSITION_TITLE_WIDGET_NAME_PREFIX = "CipherTransitionTitle";
 const CIPHER_TRANSITION_SUBTITLE_WIDGET_NAME_PREFIX = "CipherTransitionSubtitle";
 const CIPHER_TRANSITION_PROGRESS_WIDGET_NAME_PREFIX = "CipherTransitionProgress";
 const CIPHER_TRANSITION_TIMER_WIDGET_NAME_PREFIX = "CipherTransitionTimer";
-const CIPHER_TRANSITION_ROOT_SIZE = mod.CreateVector(1920, 1080, 0);
+const CIPHER_TRANSITION_ROOT_SIZE = SAFE_UI_ROOT_SIZE;
 const CIPHER_TRANSITION_PANEL_POS = mod.CreateVector(0, -78, 0);
 const CIPHER_TRANSITION_PANEL_SIZE = mod.CreateVector(650, 178, 0);
 const CIPHER_TRANSITION_TITLE_POS = mod.CreateVector(0, -54, 0);
@@ -13961,27 +15672,41 @@ function setCipherTransitionCountdownSeconds(secondsRemaining: number): void {
 function refreshCipherTransitionHudForCurrentState(): void {
   if (!isCipherLiveTransitionActive()) return;
   const countdownStage = cipherSecondHalfTransitionStage === "countdown";
+  const intermissionStage = cipherSecondHalfTransitionStage === "intermission";
   showCipherTransitionHudForAllPlayers(
     countdownStage ? cipherTransitionStartsTitleKey : cipherTransitionDeployTitleKey,
     countdownStage ? cipherTransitionStartsTitleFallback : cipherTransitionDeployTitleFallback,
+    cipherTransitionSubtitleKey,
     cipherTransitionSubtitleFallback,
-    countdownStage ? "STARTS IN" : "FORCE DEPLOY IN",
-    cipherTransitionCountdownSeconds
+    countdownStage || intermissionStage
+      ? (mod.stringkeys as any).CipherStartsIn
+      : (mod.stringkeys as any).CipherForceDeployIn,
+    countdownStage || intermissionStage ? "STARTS IN {}" : "FORCE DEPLOY IN {}",
+    cipherTransitionCountdownSeconds,
+    !intermissionStage
   );
 }
 
 function showCipherTransitionHudForAllPlayers(
   titleKey: any,
   titleFallback: string,
+  subtitleKey: any,
   subtitleFallback: string,
-  timerPrefix: string,
-  secondsRemaining: number
+  timerKey: any,
+  timerFallback: string,
+  secondsRemaining: number,
+  showDeployProgress: boolean = true
 ): void {
   const title = getStringMessageWithFallback(titleKey, titleFallback);
   const counts = getCipherDeployCounts();
-  const progressLabel = mod.Message("DEPLOYED {}/{}", counts.ready, counts.required);
-  const timerLabel = mod.Message("{} {}", timerPrefix, secondsRemaining);
-  const subtitleLabel = mod.Message(subtitleFallback);
+  const progressLabel = getStringMessageWithFallback2(
+    (mod.stringkeys as any).CipherDeployProgress,
+    "DEPLOYED {}/{}",
+    counts.ready,
+    counts.required
+  );
+  const timerLabel = getStringMessageWithFallback1(timerKey, timerFallback, secondsRemaining);
+  const subtitleLabel = getStringMessageWithFallback(subtitleKey, subtitleFallback);
 
   serverPlayers.forEach((p) => {
     if (!p || !mod.IsPlayerValid(p.player)) return;
@@ -13991,6 +15716,7 @@ function showCipherTransitionHudForAllPlayers(
     SafeSetTextLabelHandle(p.cipherTransitionProgressWidget, progressLabel);
     SafeSetTextLabelHandle(p.cipherTransitionTimerWidget, timerLabel);
     setCipherTransitionHudVisibleForPlayer(p, true);
+    SafeSetWidgetVisibleHandle(p.cipherTransitionProgressWidget, showDeployProgress);
   });
 }
 
@@ -14002,6 +15728,416 @@ function hideCipherTransitionHudForAllPlayers(): void {
     }
     if (!p.cipherTransitionRootWidget) return;
     setCipherTransitionHudVisibleForPlayer(p, false);
+  });
+}
+
+const CIPHER_SD_ALIVE_ROOT_WIDGET_NAME_PREFIX = "CipherSuddenDeathAliveRoot";
+const CIPHER_SD_ALIVE_PANEL_WIDGET_NAME_PREFIX = "CipherSuddenDeathAlivePanel";
+const CIPHER_SD_ALIVE_TITLE_WIDGET_NAME_PREFIX = "CipherSuddenDeathAliveTitle";
+const CIPHER_SD_ALIVE_FRIENDLY_WIDGET_NAME_PREFIX = "CipherSuddenDeathFriendlyAlive";
+const CIPHER_SD_ALIVE_ENEMY_WIDGET_NAME_PREFIX = "CipherSuddenDeathEnemyAlive";
+const CIPHER_SD_ALIVE_FRIENDLY_SLOT_WIDGET_NAME_PREFIX = "CipherSuddenDeathFriendlyAliveSlot";
+const CIPHER_SD_ALIVE_ENEMY_SLOT_WIDGET_NAME_PREFIX = "CipherSuddenDeathEnemyAliveSlot";
+const CIPHER_SD_ALIVE_ROOT_SIZE = SAFE_UI_ROOT_SIZE;
+const CIPHER_SD_ALIVE_PANEL_POS = safeContentVectorFromTopLeft(38.03 + LIVE_BOTTOM_HUD_OFFSET_X, 566.56, 288.02, 88);
+const CIPHER_SD_ALIVE_PANEL_SIZE = mod.CreateVector(288.02, 88, 0);
+const CIPHER_SD_ALIVE_TEXT_SHIFT_X = -24;
+const CIPHER_SD_ALIVE_TITLE_POS = mod.CreateVector(CIPHER_SD_ALIVE_TEXT_SHIFT_X, -30, 0);
+const CIPHER_SD_ALIVE_FRIENDLY_POS = mod.CreateVector(-112 + CIPHER_SD_ALIVE_TEXT_SHIFT_X, -6, 0);
+const CIPHER_SD_ALIVE_ENEMY_POS = mod.CreateVector(-112 + CIPHER_SD_ALIVE_TEXT_SHIFT_X, 24, 0);
+const CIPHER_SD_ALIVE_SLOT_START_X = -68 + CIPHER_SD_ALIVE_TEXT_SHIFT_X;
+const CIPHER_SD_ALIVE_SLOT_SPACING_X = 22;
+const CIPHER_SD_ALIVE_TITLE_SIZE = mod.CreateVector(260, 20, 0);
+const CIPHER_SD_ALIVE_LABEL_SIZE = mod.CreateVector(54, 22, 0);
+const CIPHER_SD_ALIVE_SLOT_SIZE = mod.CreateVector(20, 24, 0);
+const CIPHER_SD_ALIVE_TITLE_TEXT_SIZE = 16;
+const CIPHER_SD_ALIVE_LABEL_TEXT_SIZE = 13;
+const CIPHER_SD_ALIVE_SLOT_TEXT_SIZE = 18;
+const CIPHER_SD_ALIVE_DOT_TEXT_SIZE = 22;
+const CIPHER_SD_ALIVE_MAX_SLOTS_PER_TEAM = 8;
+
+function getCipherSuddenDeathAliveRootWidgetName(playerId: number): string {
+  return CIPHER_SD_ALIVE_ROOT_WIDGET_NAME_PREFIX + playerId;
+}
+
+function getCipherSuddenDeathAlivePanelWidgetName(playerId: number): string {
+  return CIPHER_SD_ALIVE_PANEL_WIDGET_NAME_PREFIX + playerId;
+}
+
+function getCipherSuddenDeathAliveTitleWidgetName(playerId: number): string {
+  return CIPHER_SD_ALIVE_TITLE_WIDGET_NAME_PREFIX + playerId;
+}
+
+function getCipherSuddenDeathFriendlyAliveWidgetName(playerId: number): string {
+  return CIPHER_SD_ALIVE_FRIENDLY_WIDGET_NAME_PREFIX + playerId;
+}
+
+function getCipherSuddenDeathEnemyAliveWidgetName(playerId: number): string {
+  return CIPHER_SD_ALIVE_ENEMY_WIDGET_NAME_PREFIX + playerId;
+}
+
+function getCipherSuddenDeathFriendlyAliveSlotWidgetName(playerId: number, slotIndex: number): string {
+  return CIPHER_SD_ALIVE_FRIENDLY_SLOT_WIDGET_NAME_PREFIX + playerId + "_" + slotIndex;
+}
+
+function getCipherSuddenDeathEnemyAliveSlotWidgetName(playerId: number, slotIndex: number): string {
+  return CIPHER_SD_ALIVE_ENEMY_SLOT_WIDGET_NAME_PREFIX + playerId + "_" + slotIndex;
+}
+
+function resetCipherSuddenDeathAliveHudRefsForPlayer(p: Player): void {
+  p.cipherSuddenDeathAliveRootWidget = null as any;
+  p.cipherSuddenDeathAlivePanelWidget = null as any;
+  p.cipherSuddenDeathAliveTitleWidget = null as any;
+  p.cipherSuddenDeathFriendlyAliveWidget = null as any;
+  p.cipherSuddenDeathEnemyAliveWidget = null as any;
+  p.cipherSuddenDeathFriendlyAliveSlotWidgets = [];
+  p.cipherSuddenDeathEnemyAliveSlotWidgets = [];
+}
+
+function deleteCipherSuddenDeathAliveHudForPlayer(playerId: number): void {
+  for (let i = 0; i < CIPHER_SD_ALIVE_MAX_SLOTS_PER_TEAM; i++) {
+    safeDeleteAllWidgetsByName(getCipherSuddenDeathEnemyAliveSlotWidgetName(playerId, i));
+    safeDeleteAllWidgetsByName(getCipherSuddenDeathFriendlyAliveSlotWidgetName(playerId, i));
+  }
+  safeDeleteAllWidgetsByName(getCipherSuddenDeathEnemyAliveWidgetName(playerId));
+  safeDeleteAllWidgetsByName(getCipherSuddenDeathFriendlyAliveWidgetName(playerId));
+  safeDeleteAllWidgetsByName(getCipherSuddenDeathAliveTitleWidgetName(playerId));
+  safeDeleteAllWidgetsByName(getCipherSuddenDeathAlivePanelWidgetName(playerId));
+  safeDeleteAllWidgetsByName(getCipherSuddenDeathAliveRootWidgetName(playerId));
+}
+
+function bindCipherSuddenDeathAliveHudRefsForPlayer(p: Player): void {
+  const playerId = p.id;
+  p.cipherSuddenDeathAliveRootWidget = mod.FindUIWidgetWithName(getCipherSuddenDeathAliveRootWidgetName(playerId));
+  p.cipherSuddenDeathAlivePanelWidget = mod.FindUIWidgetWithName(getCipherSuddenDeathAlivePanelWidgetName(playerId));
+  p.cipherSuddenDeathAliveTitleWidget = mod.FindUIWidgetWithName(getCipherSuddenDeathAliveTitleWidgetName(playerId));
+  p.cipherSuddenDeathFriendlyAliveWidget = mod.FindUIWidgetWithName(getCipherSuddenDeathFriendlyAliveWidgetName(playerId));
+  p.cipherSuddenDeathEnemyAliveWidget = mod.FindUIWidgetWithName(getCipherSuddenDeathEnemyAliveWidgetName(playerId));
+  p.cipherSuddenDeathFriendlyAliveSlotWidgets = [];
+  p.cipherSuddenDeathEnemyAliveSlotWidgets = [];
+  for (let i = 0; i < CIPHER_SD_ALIVE_MAX_SLOTS_PER_TEAM; i++) {
+    p.cipherSuddenDeathFriendlyAliveSlotWidgets.push(
+      mod.FindUIWidgetWithName(getCipherSuddenDeathFriendlyAliveSlotWidgetName(playerId, i))
+    );
+    p.cipherSuddenDeathEnemyAliveSlotWidgets.push(
+      mod.FindUIWidgetWithName(getCipherSuddenDeathEnemyAliveSlotWidgetName(playerId, i))
+    );
+  }
+}
+
+function setCipherSuddenDeathAliveHudDepthForPlayer(p: Player): void {
+  const widgets = [
+    p.cipherSuddenDeathAliveRootWidget,
+    p.cipherSuddenDeathAlivePanelWidget,
+    p.cipherSuddenDeathAliveTitleWidget,
+    p.cipherSuddenDeathFriendlyAliveWidget,
+    p.cipherSuddenDeathEnemyAliveWidget,
+  ];
+  for (let i = 0; i < CIPHER_SD_ALIVE_MAX_SLOTS_PER_TEAM; i++) {
+    widgets.push(p.cipherSuddenDeathFriendlyAliveSlotWidgets[i]);
+    widgets.push(p.cipherSuddenDeathEnemyAliveSlotWidgets[i]);
+  }
+  for (let i = 0; i < widgets.length; i++) {
+    if (widgets[i]) mod.SetUIWidgetDepth(widgets[i], mod.UIDepth.AboveGameUI);
+  }
+}
+
+function rebuildCipherSuddenDeathAliveHudForPlayer(p: Player): void {
+  const playerId = p.id;
+  deleteCipherSuddenDeathAliveHudForPlayer(playerId);
+  resetCipherSuddenDeathAliveHudRefsForPlayer(p);
+
+  const uiRoot = mod.GetUIRoot();
+  if (!uiRoot) return;
+
+  mod.AddUIContainer(
+    getCipherSuddenDeathAliveRootWidgetName(playerId),
+    mod.CreateVector(0, 0, 0),
+    CIPHER_SD_ALIVE_ROOT_SIZE,
+    mod.UIAnchor.Center,
+    uiRoot,
+    false,
+    0,
+    mod.CreateVector(0, 0, 0),
+    0,
+    mod.UIBgFill.None,
+    p.player
+  );
+
+  const root = mod.FindUIWidgetWithName(getCipherSuddenDeathAliveRootWidgetName(playerId));
+  if (!root) return;
+
+  mod.AddUIContainer(
+    getCipherSuddenDeathAlivePanelWidgetName(playerId),
+    CIPHER_SD_ALIVE_PANEL_POS,
+    CIPHER_SD_ALIVE_PANEL_SIZE,
+    mod.UIAnchor.Center,
+    root,
+    true,
+    0,
+    mod.CreateVector(0.0314, 0.0431, 0.0431),
+    0.5,
+    mod.UIBgFill.Solid,
+    p.player
+  );
+
+  const panel = mod.FindUIWidgetWithName(getCipherSuddenDeathAlivePanelWidgetName(playerId));
+  if (!panel) return;
+
+  mod.AddUIText(
+    getCipherSuddenDeathAliveTitleWidgetName(playerId),
+    CIPHER_SD_ALIVE_TITLE_POS,
+    CIPHER_SD_ALIVE_TITLE_SIZE,
+    mod.UIAnchor.Center,
+    panel,
+    true,
+    0,
+    mod.CreateVector(0, 0, 0),
+    0,
+    mod.UIBgFill.None,
+    mod.Message(mod.stringkeys.EmptyText),
+    CIPHER_SD_ALIVE_TITLE_TEXT_SIZE,
+    CIPHER_TRANSITION_ACCENT_COLOR,
+    1,
+    mod.UIAnchor.Center,
+    p.player
+  );
+
+  mod.AddUIText(
+    getCipherSuddenDeathFriendlyAliveWidgetName(playerId),
+    CIPHER_SD_ALIVE_FRIENDLY_POS,
+    CIPHER_SD_ALIVE_LABEL_SIZE,
+    mod.UIAnchor.Center,
+    panel,
+    true,
+    0,
+    mod.CreateVector(0, 0, 0),
+    0,
+    mod.UIBgFill.None,
+    mod.Message(mod.stringkeys.EmptyText),
+    CIPHER_SD_ALIVE_LABEL_TEXT_SIZE,
+    COLOR_FRIENDLY,
+    1,
+    mod.UIAnchor.Center,
+    p.player
+  );
+
+  mod.AddUIText(
+    getCipherSuddenDeathEnemyAliveWidgetName(playerId),
+    CIPHER_SD_ALIVE_ENEMY_POS,
+    CIPHER_SD_ALIVE_LABEL_SIZE,
+    mod.UIAnchor.Center,
+    panel,
+    true,
+    0,
+    mod.CreateVector(0, 0, 0),
+    0,
+    mod.UIBgFill.None,
+    mod.Message(mod.stringkeys.EmptyText),
+    CIPHER_SD_ALIVE_LABEL_TEXT_SIZE,
+    COLOR_ENEMY,
+    1,
+    mod.UIAnchor.Center,
+    p.player
+  );
+
+  for (let i = 0; i < CIPHER_SD_ALIVE_MAX_SLOTS_PER_TEAM; i++) {
+    const slotX = CIPHER_SD_ALIVE_SLOT_START_X + (i * CIPHER_SD_ALIVE_SLOT_SPACING_X);
+    mod.AddUIText(
+      getCipherSuddenDeathFriendlyAliveSlotWidgetName(playerId, i),
+      mod.CreateVector(slotX, -6, 0),
+      CIPHER_SD_ALIVE_SLOT_SIZE,
+      mod.UIAnchor.Center,
+      panel,
+      false,
+      0,
+      mod.CreateVector(0, 0, 0),
+      0,
+      mod.UIBgFill.None,
+      mod.Message(mod.stringkeys.EmptyText),
+      CIPHER_SD_ALIVE_SLOT_TEXT_SIZE,
+      COLOR_FRIENDLY,
+      1,
+      mod.UIAnchor.Center,
+      p.player
+    );
+
+    mod.AddUIText(
+      getCipherSuddenDeathEnemyAliveSlotWidgetName(playerId, i),
+      mod.CreateVector(slotX, 24, 0),
+      CIPHER_SD_ALIVE_SLOT_SIZE,
+      mod.UIAnchor.Center,
+      panel,
+      false,
+      0,
+      mod.CreateVector(0, 0, 0),
+      0,
+      mod.UIBgFill.None,
+      mod.Message(mod.stringkeys.EmptyText),
+      CIPHER_SD_ALIVE_SLOT_TEXT_SIZE,
+      COLOR_ENEMY,
+      1,
+      mod.UIAnchor.Center,
+      p.player
+    );
+  }
+
+  bindCipherSuddenDeathAliveHudRefsForPlayer(p);
+  setCipherSuddenDeathAliveHudDepthForPlayer(p);
+}
+
+function ensureCipherSuddenDeathAliveHudForPlayer(p: Player): boolean {
+  if (
+    p.cipherSuddenDeathAliveRootWidget &&
+    p.cipherSuddenDeathAlivePanelWidget &&
+    p.cipherSuddenDeathAliveTitleWidget &&
+    p.cipherSuddenDeathFriendlyAliveWidget &&
+    p.cipherSuddenDeathEnemyAliveWidget &&
+    hasCipherSuddenDeathAliveSlotRefsForPlayer(p)
+  ) {
+    setCipherSuddenDeathAliveHudDepthForPlayer(p);
+    return true;
+  }
+
+  rebuildCipherSuddenDeathAliveHudForPlayer(p);
+  return !!(
+    p.cipherSuddenDeathAliveRootWidget &&
+    p.cipherSuddenDeathAlivePanelWidget &&
+    p.cipherSuddenDeathAliveTitleWidget &&
+    p.cipherSuddenDeathFriendlyAliveWidget &&
+    p.cipherSuddenDeathEnemyAliveWidget &&
+    hasCipherSuddenDeathAliveSlotRefsForPlayer(p)
+  );
+}
+
+function hasCipherSuddenDeathAliveSlotRefsForPlayer(p: Player): boolean {
+  if (!p.cipherSuddenDeathFriendlyAliveSlotWidgets || !p.cipherSuddenDeathEnemyAliveSlotWidgets) return false;
+  if (p.cipherSuddenDeathFriendlyAliveSlotWidgets.length < CIPHER_SD_ALIVE_MAX_SLOTS_PER_TEAM) return false;
+  if (p.cipherSuddenDeathEnemyAliveSlotWidgets.length < CIPHER_SD_ALIVE_MAX_SLOTS_PER_TEAM) return false;
+
+  for (let i = 0; i < CIPHER_SD_ALIVE_MAX_SLOTS_PER_TEAM; i++) {
+    if (!p.cipherSuddenDeathFriendlyAliveSlotWidgets[i]) return false;
+    if (!p.cipherSuddenDeathEnemyAliveSlotWidgets[i]) return false;
+  }
+  return true;
+}
+
+function setCipherSuddenDeathAliveHudVisibleForPlayer(p: Player, visible: boolean): void {
+  if (!ensureCipherSuddenDeathAliveHudForPlayer(p)) return;
+  SafeSetWidgetVisibleHandle(p.cipherSuddenDeathAliveRootWidget, visible);
+  SafeSetWidgetVisibleHandle(p.cipherSuddenDeathAlivePanelWidget, visible);
+  SafeSetWidgetVisibleHandle(p.cipherSuddenDeathAliveTitleWidget, visible);
+  SafeSetWidgetVisibleHandle(p.cipherSuddenDeathFriendlyAliveWidget, visible);
+  SafeSetWidgetVisibleHandle(p.cipherSuddenDeathEnemyAliveWidget, visible);
+  if (!visible) {
+    for (let i = 0; i < CIPHER_SD_ALIVE_MAX_SLOTS_PER_TEAM; i++) {
+      SafeSetWidgetVisibleHandle(p.cipherSuddenDeathFriendlyAliveSlotWidgets[i], false);
+      SafeSetWidgetVisibleHandle(p.cipherSuddenDeathEnemyAliveSlotWidgets[i], false);
+    }
+  }
+}
+
+function countCipherSuddenDeathTeamSlots(team: mod.Team): number {
+  let count = 0;
+  serverPlayers.forEach((sp) => {
+    if (!sp || !mod.IsPlayerValid(sp.player)) return;
+    if (!mod.Equals(mod.GetTeam(sp.player), team)) return;
+    count += 1;
+  });
+  return count;
+}
+
+function updateCipherSuddenDeathAliveSlotWidgets(
+  widgets: mod.UIWidget[],
+  aliveCount: number,
+  slotCount: number,
+  aliveColor: mod.Vector,
+  aliveDotLabel: any,
+  deadMarkerLabel: any
+): void {
+  const visibleSlotCount = Math.min(CIPHER_SD_ALIVE_MAX_SLOTS_PER_TEAM, Math.max(aliveCount, slotCount));
+
+  for (let i = 0; i < CIPHER_SD_ALIVE_MAX_SLOTS_PER_TEAM; i++) {
+    const widget = widgets[i];
+    const visible = i < visibleSlotCount;
+    SafeSetWidgetVisibleHandle(widget, visible);
+    if (!visible) continue;
+
+    const alive = i < aliveCount;
+    SafeSetTextLabelHandle(widget, alive ? aliveDotLabel : deadMarkerLabel);
+    SafeSetTextColorHandle(widget, alive ? aliveColor : COLOR_NEUTRAL);
+    SafeSetTextSizeHandle(widget, alive ? CIPHER_SD_ALIVE_DOT_TEXT_SIZE : CIPHER_SD_ALIVE_SLOT_TEXT_SIZE);
+  }
+}
+
+function updateCipherSuddenDeathAliveHudForPlayer(p: Player): void {
+  if (!p || !mod.IsPlayerValid(p.player)) return;
+  if (!isCipherSuddenDeathActive() || cipherSuddenDeathTransitionActive || cipherSecondHalfTransitionStage !== "none") {
+    if (p.cipherSuddenDeathAliveRootWidget) setCipherSuddenDeathAliveHudVisibleForPlayer(p, false);
+    return;
+  }
+
+  const team = mod.GetTeam(p.player);
+  if (!mod.Equals(team, team1) && !mod.Equals(team, team2)) {
+    setCipherSuddenDeathAliveHudVisibleForPlayer(p, false);
+    return;
+  }
+
+  const enemyTeam = mod.Equals(team, team1) ? team2 : team1;
+  const friendlyAlive = countCipherSuddenDeathLivesRemaining(team);
+  const enemyAlive = countCipherSuddenDeathLivesRemaining(enemyTeam);
+  const friendlySlots = countCipherSuddenDeathTeamSlots(team);
+  const enemySlots = countCipherSuddenDeathTeamSlots(enemyTeam);
+
+  if (!ensureCipherSuddenDeathAliveHudForPlayer(p)) return;
+  const aliveDotLabel = getStringMessageWithFallback((mod.stringkeys as any).CipherSuddenDeathAliveDot, "●");
+  const deadMarkerLabel = getStringMessageWithFallback((mod.stringkeys as any).CipherSuddenDeathDeadMarker, "X");
+
+  SafeSetTextLabelHandle(
+    p.cipherSuddenDeathAliveTitleWidget,
+    getStringMessageWithFallback((mod.stringkeys as any).CipherSuddenDeathAliveTitle, "SUDDEN DEATH")
+  );
+  SafeSetTextLabelHandle(
+    p.cipherSuddenDeathFriendlyAliveWidget,
+    getStringMessageWithFallback((mod.stringkeys as any).CipherSuddenDeathFriendlyLabel, "ALLY")
+  );
+  SafeSetTextLabelHandle(
+    p.cipherSuddenDeathEnemyAliveWidget,
+    getStringMessageWithFallback((mod.stringkeys as any).CipherSuddenDeathEnemyLabel, "ENEMY")
+  );
+  SafeSetTextColorHandle(p.cipherSuddenDeathFriendlyAliveWidget, COLOR_FRIENDLY);
+  SafeSetTextColorHandle(p.cipherSuddenDeathEnemyAliveWidget, COLOR_ENEMY);
+  updateCipherSuddenDeathAliveSlotWidgets(
+    p.cipherSuddenDeathFriendlyAliveSlotWidgets,
+    friendlyAlive,
+    friendlySlots,
+    COLOR_FRIENDLY,
+    aliveDotLabel,
+    deadMarkerLabel
+  );
+  updateCipherSuddenDeathAliveSlotWidgets(
+    p.cipherSuddenDeathEnemyAliveSlotWidgets,
+    enemyAlive,
+    enemySlots,
+    COLOR_ENEMY,
+    aliveDotLabel,
+    deadMarkerLabel
+  );
+  setCipherSuddenDeathAliveHudVisibleForPlayer(p, true);
+}
+
+function updateCipherSuddenDeathAliveHudForAllPlayers(): void {
+  serverPlayers.forEach((p) => updateCipherSuddenDeathAliveHudForPlayer(p));
+}
+
+function hideCipherSuddenDeathAliveHudForAllPlayers(): void {
+  serverPlayers.forEach((p) => {
+    if (!p || !mod.IsPlayerValid(p.player)) return;
+    if (!p.cipherSuddenDeathAliveRootWidget) {
+      bindCipherSuddenDeathAliveHudRefsForPlayer(p);
+    }
+    if (!p.cipherSuddenDeathAliveRootWidget) return;
+    setCipherSuddenDeathAliveHudVisibleForPlayer(p, false);
   });
 }
 
@@ -14026,7 +16162,7 @@ async function runCipherPhaseCountdown(
   processCipherSpawnJobs(source);
 }
 
-const CIPHER_SECOND_HALF_FREEZE_INPUTS: mod.RestrictedInputs[] = [
+const CIPHER_TRANSITION_LIVE_INPUT_CLEAR_INPUTS: mod.RestrictedInputs[] = [
   mod.RestrictedInputs.CameraPitch,
   mod.RestrictedInputs.CameraYaw,
   mod.RestrictedInputs.Crouch,
@@ -14035,6 +16171,47 @@ const CIPHER_SECOND_HALF_FREEZE_INPUTS: mod.RestrictedInputs[] = [
   mod.RestrictedInputs.FireWeapon,
   mod.RestrictedInputs.Interact,
   mod.RestrictedInputs.Jump,
+  mod.RestrictedInputs.MoveForwardBack,
+  mod.RestrictedInputs.MoveLeftRight,
+  mod.RestrictedInputs.Prone,
+  mod.RestrictedInputs.Reload,
+  mod.RestrictedInputs.SelectCharacterGadget,
+  mod.RestrictedInputs.SelectMelee,
+  mod.RestrictedInputs.SelectOpenGadget,
+  mod.RestrictedInputs.SelectPrimary,
+  mod.RestrictedInputs.SelectSecondary,
+  mod.RestrictedInputs.SelectThrowable,
+  mod.RestrictedInputs.Sprint,
+  mod.RestrictedInputs.Zoom,
+];
+
+const CIPHER_INTERMISSION_FREEZE_INPUTS: mod.RestrictedInputs[] = [
+  mod.RestrictedInputs.Crouch,
+  mod.RestrictedInputs.CycleFire,
+  mod.RestrictedInputs.CyclePrimary,
+  mod.RestrictedInputs.FireWeapon,
+  mod.RestrictedInputs.Interact,
+  mod.RestrictedInputs.Jump,
+  mod.RestrictedInputs.MoveForwardBack,
+  mod.RestrictedInputs.MoveLeftRight,
+  mod.RestrictedInputs.Prone,
+  mod.RestrictedInputs.Reload,
+  mod.RestrictedInputs.SelectCharacterGadget,
+  mod.RestrictedInputs.SelectMelee,
+  mod.RestrictedInputs.SelectOpenGadget,
+  mod.RestrictedInputs.SelectPrimary,
+  mod.RestrictedInputs.SelectSecondary,
+  mod.RestrictedInputs.SelectThrowable,
+  mod.RestrictedInputs.Sprint,
+  mod.RestrictedInputs.Zoom,
+];
+
+const CIPHER_DEPLOY_READY_FREEZE_INPUTS: mod.RestrictedInputs[] = [
+  mod.RestrictedInputs.Crouch,
+  mod.RestrictedInputs.CycleFire,
+  mod.RestrictedInputs.CyclePrimary,
+  mod.RestrictedInputs.FireWeapon,
+  mod.RestrictedInputs.Interact,
   mod.RestrictedInputs.MoveForwardBack,
   mod.RestrictedInputs.MoveLeftRight,
   mod.RestrictedInputs.Prone,
@@ -14066,7 +16243,17 @@ function resetCipherSecondHalfDeployTracking(): void {
   cipherTransitionDeployTitleFallback = "";
   cipherTransitionStartsTitleKey = undefined;
   cipherTransitionStartsTitleFallback = "";
+  cipherTransitionSubtitleKey = undefined;
   cipherTransitionSubtitleFallback = "";
+}
+
+function clearCipherLiveInputRestrictionsForPlayer(player: mod.Player): void {
+  if (!mod.IsPlayerValid(player)) return;
+  mod.SetPlayerMovementSpeedMultiplier(player, 1);
+  mod.EnableAllInputRestrictions(player, false);
+  for (let i = 0; i < CIPHER_TRANSITION_LIVE_INPUT_CLEAR_INPUTS.length; i++) {
+    mod.EnableInputRestriction(player, CIPHER_TRANSITION_LIVE_INPUT_CLEAR_INPUTS[i], false);
+  }
 }
 
 function setCipherSecondHalfDeployFreezeForPlayer(
@@ -14079,15 +16266,19 @@ function setCipherSecondHalfDeployFreezeForPlayer(
 
   if (!frozen) {
     delete cipherSecondHalfFrozenByPlayerId[playerId];
-    mod.SetPlayerMovementSpeedMultiplier(player, 1);
-    mod.EnableAllInputRestrictions(player, false);
+    clearCipherLiveInputRestrictionsForPlayer(player);
     return;
   }
 
   cipherSecondHalfFrozenByPlayerId[playerId] = true;
+  clearCipherLiveInputRestrictionsForPlayer(player);
   mod.SetPlayerMovementSpeedMultiplier(player, 0);
-  for (let i = 0; i < CIPHER_SECOND_HALF_FREEZE_INPUTS.length; i++) {
-    mod.EnableInputRestriction(player, CIPHER_SECOND_HALF_FREEZE_INPUTS[i], true);
+  const inputs =
+    cipherSecondHalfTransitionStage === "intermission"
+      ? CIPHER_INTERMISSION_FREEZE_INPUTS
+      : CIPHER_DEPLOY_READY_FREEZE_INPUTS;
+  for (let i = 0; i < inputs.length; i++) {
+    mod.EnableInputRestriction(player, inputs[i], true);
   }
 }
 
@@ -14106,6 +16297,49 @@ function applyCipherSecondHalfDeployFreezeForReadyPlayers(source: string): void 
     if (cipherSecondHalfDeployReadyByPlayerId[p.id] !== true && cipherSecondHalfTransitionStage !== "countdown") return;
     setCipherSecondHalfDeployFreezeForPlayer(p.player, true, source);
   });
+}
+
+function applyCipherIntermissionFreezeForDeployedPlayers(source: string): void {
+  if (cipherSecondHalfTransitionStage !== "intermission") return;
+  serverPlayers.forEach((p) => {
+    if (!p || !p.isDeployed || !mod.IsPlayerValid(p.player)) return;
+    setCipherSecondHalfDeployFreezeForPlayer(p.player, true, source);
+  });
+}
+
+function applyCipherTransitionInputLocksForPlayers(source: string): void {
+  if (cipherSecondHalfTransitionStage === "intermission") {
+    applyCipherIntermissionFreezeForDeployedPlayers(source);
+    return;
+  }
+  applyCipherSecondHalfDeployFreezeForReadyPlayers(source);
+}
+
+function hardUnlockCipherLiveInputsForAllPlayers(_source: string): void {
+  cipherSecondHalfFrozenByPlayerId = {};
+  serverPlayers.forEach((p) => {
+    if (!p || !mod.IsPlayerValid(p.player)) return;
+    clearCipherLiveInputRestrictionsForPlayer(p.player);
+  });
+}
+
+async function reassertCipherLiveInputUnlocksForStage(
+  expectedStage: CipherMatchStage,
+  source: string
+): Promise<void> {
+  const waits = [0, 0.25, 0.75, 1.0];
+  for (let i = 0; i < waits.length; i++) {
+    if (waits[i] > 0) await mod.Wait(waits[i]);
+    if (gameStatus !== 3) return;
+    if (cipherMatchStage !== expectedStage) return;
+    if (cipherSecondHalfTransitionStage !== "none") return;
+    hardUnlockCipherLiveInputsForAllPlayers(source);
+  }
+}
+
+function startCipherPostTransitionLiveInputUnlock(expectedStage: CipherMatchStage, source: string): void {
+  hardUnlockCipherLiveInputsForAllPlayers(source);
+  void reassertCipherLiveInputUnlocksForStage(expectedStage, source);
 }
 
 function markCipherSecondHalfDeployRequiredPlayers(): void {
@@ -14207,6 +16441,7 @@ async function runCipherTransitionDeployWindow(
   deployTitleFallback: string,
   startsTitleKey: any,
   startsTitleFallback: string,
+  subtitleKey: any,
   subtitleFallback: string
 ): Promise<void> {
   markCipherSecondHalfDeployRequiredPlayers();
@@ -14214,6 +16449,7 @@ async function runCipherTransitionDeployWindow(
   cipherTransitionDeployTitleFallback = deployTitleFallback;
   cipherTransitionStartsTitleKey = startsTitleKey;
   cipherTransitionStartsTitleFallback = startsTitleFallback;
+  cipherTransitionSubtitleKey = subtitleKey;
   cipherTransitionSubtitleFallback = subtitleFallback;
   SetCountdownOverlayVisible(false);
 
@@ -14231,9 +16467,12 @@ async function runCipherTransitionDeployWindow(
     showCipherTransitionHudForAllPlayers(
       deployTitleKey,
       deployTitleFallback,
+      subtitleKey,
       subtitleFallback,
-      "FORCE DEPLOY IN",
-      remaining
+      (mod.stringkeys as any).CipherForceDeployIn,
+      "FORCE DEPLOY IN {}",
+      remaining,
+      true
     );
     processTransitionSpawnQueue(source);
     processCipherSpawnJobs(source);
@@ -14269,9 +16508,12 @@ async function runCipherTransitionDeployWindow(
     showCipherTransitionHudForAllPlayers(
       startsTitleKey,
       startsTitleFallback,
+      subtitleKey,
       subtitleFallback,
-      "STARTS IN",
-      remaining
+      (mod.stringkeys as any).CipherStartsIn,
+      "STARTS IN {}",
+      remaining,
+      true
     );
     playCountdownHeartbeatToAll(remaining <= 3 ? 0.85 : 0.6);
     await mod.Wait(1);
@@ -14312,6 +16554,49 @@ function beginCipherHalf(half: CipherHalfIndex, nowSec?: number): void {
   startCipherHalfClockAndKey(half, nowSec);
 }
 
+function getFirstHalfResultTitleKey(): any {
+  if (cipherHalfScores[0] > cipherHalfScores[1]) return (mod.stringkeys as any).CipherFirstHalfTeam1Won;
+  if (cipherHalfScores[1] > cipherHalfScores[0]) return (mod.stringkeys as any).CipherFirstHalfTeam2Won;
+  return (mod.stringkeys as any).CipherFirstHalfTied;
+}
+
+function getFirstHalfResultTitleFallback(): string {
+  if (cipherHalfScores[0] > cipherHalfScores[1]) return "TEAM 1 WON FIRST HALF";
+  if (cipherHalfScores[1] > cipherHalfScores[0]) return "TEAM 2 WON FIRST HALF";
+  return "FIRST HALF TIED";
+}
+
+async function runCipherHalftimeIntermission(reasonKey: any, reasonFallback: string): Promise<void> {
+  cipherSecondHalfTransitionStage = "intermission";
+  cipherTransitionDeployTitleKey = getFirstHalfResultTitleKey();
+  cipherTransitionDeployTitleFallback = getFirstHalfResultTitleFallback();
+  cipherTransitionSubtitleKey = (mod.stringkeys as any).CipherSwitchingSides;
+  cipherTransitionSubtitleFallback = "SWITCHING SIDES";
+  cipherTransitionStartsTitleKey = (mod.stringkeys as any).CipherSecondHalfStarts;
+  cipherTransitionStartsTitleFallback = "SECOND HALF STARTS IN";
+  SetCountdownOverlayVisible(false);
+  showCipherPhaseNoticeForAllPlayers(reasonKey, reasonFallback, 3);
+
+  for (let remaining = CIPHER_HALFTIME_INTERMISSION_SECONDS; remaining > 0; remaining--) {
+    if (gameStatus !== 3 || !cipherSecondHalfTransitionActive || cipherSecondHalfTransitionStage !== "intermission") {
+      return;
+    }
+    setCipherTransitionCountdownSeconds(remaining);
+    showCipherTransitionHudForAllPlayers(
+      cipherTransitionDeployTitleKey,
+      cipherTransitionDeployTitleFallback,
+      cipherTransitionSubtitleKey,
+      cipherTransitionSubtitleFallback,
+      (mod.stringkeys as any).CipherStartsIn,
+      "STARTS IN {}",
+      remaining,
+      false
+    );
+    applyCipherIntermissionFreezeForDeployedPlayers("second_half_intermission");
+    await mod.Wait(1);
+  }
+}
+
 async function runCipherSecondHalfTransition(reason: CipherHalfTransitionReason): Promise<void> {
   const reasonKey =
     reason === "timeExpired"
@@ -14320,22 +16605,37 @@ async function runCipherSecondHalfTransition(reason: CipherHalfTransitionReason)
   const reasonFallback = reason === "timeExpired" ? "HALFTIME - TIME EXPIRED" : "HALFTIME - OBJECTIVE CAP REACHED";
 
   cipherSecondHalfTransitionActive = true;
-  cipherSecondHalfTransitionStage = "deploy";
+  cipherSecondHalfTransitionStage = "intermission";
   liveClockStarted = false;
   liveClockTimeoutHoldActive = false;
   resetTransitionSpawnQueueState(false);
   HideAllObjectiveHoldProgressUi();
   HideAllDeployObjectiveTimerUi();
   clearBombNoticeState();
-  showCipherPhaseNoticeForAllPlayers(reasonKey, reasonFallback, 4);
-
-  prepareCipherHalfForLive(2, "runCipherSecondHalfTransition", 0);
   cipherPhaseTransitionUndeployIgnoreUntilSec =
     getCurrentSchedulerNowSeconds() +
+    CIPHER_HALFTIME_INTERMISSION_SECONDS +
     CIPHER_SECOND_HALF_DEPLOY_PHASE_SECONDS +
     CIPHER_SECOND_HALF_FINAL_COUNTDOWN_SECONDS +
     CIPHER_SECOND_HALF_FORCE_DEPLOY_SETTLE_SECONDS +
     2;
+
+  await runCipherHalftimeIntermission(reasonKey, reasonFallback);
+
+  if (gameStatus !== 3 || !cipherSecondHalfTransitionActive) {
+    clearCipherSecondHalfDeployFreezeForAllPlayers();
+    hideCipherTransitionHudForAllPlayers();
+    cipherSecondHalfTransitionActive = false;
+    cipherSecondHalfTransitionStage = "none";
+    cipherPhaseTransitionUndeployIgnoreUntilSec = 0;
+    resetCipherSecondHalfDeployTracking();
+    return;
+  }
+
+  clearCipherSecondHalfDeployFreezeForAllPlayers();
+  cipherSecondHalfTransitionStage = "deploy";
+
+  prepareCipherHalfForLive(2, "runCipherSecondHalfTransition", 0);
   mod.SetSpawnMode(mod.SpawnModes.Deploy);
   serverPlayers.forEach((p) => {
     mod.SetRedeployTime(p.player, 0);
@@ -14350,6 +16650,7 @@ async function runCipherSecondHalfTransition(reason: CipherHalfTransitionReason)
     "SWITCHING SIDES",
     (mod.stringkeys as any).CipherSecondHalfStarts,
     "SECOND HALF STARTS IN",
+    (mod.stringkeys as any).CipherDeployNextHalf,
     "DEPLOY TO START NEXT HALF"
   );
 
@@ -14373,6 +16674,7 @@ async function runCipherSecondHalfTransition(reason: CipherHalfTransitionReason)
     mod.SetRedeployTime(p.player, REDEPLOY_TIME);
     setReadyPhaseProtectionForPlayer(p.player, false);
   });
+  startCipherPostTransitionLiveInputUnlock("half2", "second_half_live_start");
   showCipherPhaseNoticeForAllPlayers((mod.stringkeys as any).CipherSecondHalfLive, "SECOND HALF", 3);
   startCipherHalfClockAndKey(2, getCurrentSchedulerNowSeconds());
 }
@@ -14430,6 +16732,7 @@ async function runCipherSuddenDeathTransition(): Promise<void> {
     "SUDDEN DEATH",
     (mod.stringkeys as any).CipherSuddenDeathStarts,
     "SUDDEN DEATH STARTS IN",
+    (mod.stringkeys as any).CipherNoRespawns,
     "NO RESPAWNS"
   );
 
@@ -14455,8 +16758,10 @@ async function runCipherSuddenDeathTransition(): Promise<void> {
     mod.SetRedeployTime(p.player, 0);
     setReadyPhaseProtectionForPlayer(p.player, false);
   });
+  startCipherPostTransitionLiveInputUnlock("suddenDeath", "sudden_death_live_start");
   beginOvertimeClock(getCurrentSchedulerNowSeconds());
   spawnBombPickupObjectAtLiveStart();
+  updateCipherSuddenDeathAliveHudForAllPlayers();
 }
 
 function beginCipherSuddenDeath(_nowSec?: number): void {
@@ -14480,14 +16785,17 @@ function resolveSecondHalfTimeoutWinner(): mod.Team {
 
 function enterPostmatchFromLive(forcedWinner?: mod.Team): void {
   if (gameStatus === 4) return;
+  clearRuntimeBotState(true);
   cipherPendingScoreTransitionTeam = teamNeutral;
   postmatchWinnerTeam = forcedWinner !== undefined ? forcedWinner : resolveWinningTeamFromScores();
   gameStatus = 4;
+  mod.SetSpawnMode(mod.SpawnModes.AutoSpawn);
   liveTimerIntroActive = false;
   liveTimerIntroEndsAtSec = 0;
   liveClockTimeoutHoldActive = false;
   HideAllObjectiveHoldProgressUi();
   HideAllDeployObjectiveTimerUi();
+  hideCipherSuddenDeathAliveHudForAllPlayers();
   resetLiveTimerWidgetPresentation();
   const live = mod.FindUIWidgetWithName("LiveContainer");
   if (live) mod.SetUIWidgetVisible(live, false);
@@ -14512,20 +16820,11 @@ function evaluateCipherMatchProgressAfterScore(scoringTeam: mod.Team): void {
 
   const scoreIndex = getCipherTeamScoreIndex(scoringTeam);
   if (scoreIndex < 0) return;
+  if (cipherMatchStage !== "half1") return;
 
   if (cipherHalfScores[scoreIndex] >= HALF_SCORE_CAP) {
     finalizePendingObjectiveAwardsForImmediateTransition("half_score_cap");
-    if (cipherMatchStage === "half1") {
-      beginCipherSecondHalf(getCurrentSchedulerNowSeconds(), "scoreCap");
-      return;
-    }
-
-    const winner = resolveWinningTeamFromScores();
-    if (mod.Equals(winner, teamNeutral)) {
-      beginCipherSuddenDeath(getCurrentSchedulerNowSeconds());
-      return;
-    }
-    enterPostmatchFromLive(winner);
+    beginCipherSecondHalf(getCurrentSchedulerNowSeconds(), "scoreCap");
   }
 }
 
@@ -14573,6 +16872,7 @@ function consumeCipherSuddenDeathLife(playerId: number): void {
 
   cipherSuddenDeathEliminatedByPlayerId[playerId] = true;
   mod.SetRedeployTime(sp.player, 9999);
+  updateCipherSuddenDeathAliveHudForAllPlayers();
 
   const winner = resolveCipherSuddenDeathEliminationWinner();
   if (!mod.Equals(winner, teamNeutral)) {
@@ -15083,7 +17383,7 @@ function buildRestrictedAreaUiForPlayer(p: Player): void {
     name: rootName,
     type: "Container",
     position: [0, 0],
-    size: [1920, 1080],
+    size: [SAFE_UI_ROOT_WIDTH, SAFE_UI_ROOT_HEIGHT],
     anchor: mod.UIAnchor.Center,
     visible: false, // hidden by default
     padding: 0,
@@ -15096,7 +17396,7 @@ function buildRestrictedAreaUiForPlayer(p: Player): void {
         name: `Restricted_Area_Faded_${playerId}`,
         type: "Container",
         position: [0, 0],
-        size: [2000, 1500],
+        size: [SAFE_UI_ROOT_WIDTH, SAFE_UI_ROOT_HEIGHT],
         anchor: mod.UIAnchor.Center,
         visible: true,
         padding: 0,
@@ -15343,6 +17643,13 @@ class Player {
   public cipherTransitionSubtitleWidget: mod.UIWidget;
   public cipherTransitionProgressWidget: mod.UIWidget;
   public cipherTransitionTimerWidget: mod.UIWidget;
+  public cipherSuddenDeathAliveRootWidget: mod.UIWidget;
+  public cipherSuddenDeathAlivePanelWidget: mod.UIWidget;
+  public cipherSuddenDeathAliveTitleWidget: mod.UIWidget;
+  public cipherSuddenDeathFriendlyAliveWidget: mod.UIWidget;
+  public cipherSuddenDeathEnemyAliveWidget: mod.UIWidget;
+  public cipherSuddenDeathFriendlyAliveSlotWidgets: mod.UIWidget[];
+  public cipherSuddenDeathEnemyAliveSlotWidgets: mod.UIWidget[];
 
   public flagWidget: { [key: string]: mod.UIWidget };
 
@@ -15408,6 +17715,13 @@ class Player {
     this.cipherTransitionSubtitleWidget = null as any;
     this.cipherTransitionProgressWidget = null as any;
     this.cipherTransitionTimerWidget = null as any;
+    this.cipherSuddenDeathAliveRootWidget = null as any;
+    this.cipherSuddenDeathAlivePanelWidget = null as any;
+    this.cipherSuddenDeathAliveTitleWidget = null as any;
+    this.cipherSuddenDeathFriendlyAliveWidget = null as any;
+    this.cipherSuddenDeathEnemyAliveWidget = null as any;
+    this.cipherSuddenDeathFriendlyAliveSlotWidgets = [];
+    this.cipherSuddenDeathEnemyAliveSlotWidgets = [];
 
     this.flagWidget = {} as any;
 
@@ -15522,6 +17836,7 @@ class Player {
     this.updateUIProgress();
     UpdateObjectiveHoldProgressUiForPlayer(this);
     UpdateDeployObjectiveTimerUiForPlayer(this);
+    updateCipherSuddenDeathAliveHudForPlayer(this);
   }
   getScoreboardSnapshot(): number[] {
     // [score, kills, deaths, armed, destroyed]
@@ -15824,6 +18139,7 @@ function applyPhaseInputRestrictionsForPlayer(player: mod.Player): void {
   const isLive = gameStatus >= 3;
 
   if (isLive) {
+    if (isCipherLiveTransitionActive()) return;
     mod.EnableAllInputRestrictions(player, false);
     return;
   }
@@ -16519,6 +18835,11 @@ function ResetRoutingAndSafeSpawnStateForNewRound(): void {
   safeSpawnForcedRedeploys = {};
   safeSpawnPendingCheck = {};
   safeSpawnForcedUndeploy = {};
+  safeSpawnGenerationByPlayerId = {};
+  safeSpawnCheckQueuedGenerationByPlayerId = {};
+  safeSpawnForcedQueuedGenerationByPlayerId = {};
+  safeSpawnCheckQueue = [];
+  safeSpawnForcedQueue = [];
   lastLiveHqSpawnPointObjIdByPlayerId = {};
   lastForcedSafeSpawnHqObjIdByPlayerId = {};
 
@@ -16541,8 +18862,7 @@ function ResetRoundGameplayState(): void {
   cipherCurrentHalf = 1;
   cipherMatchStage = "half1";
   cipherHalfScores = [0, 0];
-  cipherObjectiveKeyCountByCpId = {};
-  cipherCounterWorldIconLastShownByCpId = {};
+  resetCipherNodeStates("ResetRoundGameplayState");
   resetCipherSuddenDeathState();
   clearCipherSecondHalfDeployFreezeForAllPlayers();
   resetCipherSecondHalfDeployTracking();
@@ -16593,6 +18913,7 @@ function ResetAllPlayersReadyState(): void {
 }
 
 function resetLifecycleStateForFreshMatchStart(): void {
+  clearRuntimeBotState(true);
   initialization[0] = false;
   initialization[1] = false;
   initialization[2] = false;
@@ -16619,8 +18940,7 @@ function resetLifecycleStateForFreshMatchStart(): void {
   cipherCurrentHalf = 1;
   cipherMatchStage = "half1";
   cipherHalfScores = [0, 0];
-  cipherObjectiveKeyCountByCpId = {};
-  cipherCounterWorldIconLastShownByCpId = {};
+  resetCipherNodeStates("resetLifecycleStateForFreshMatchStart");
   resetCipherSuddenDeathState();
   clearCipherSecondHalfDeployFreezeForAllPlayers();
   resetCipherSecondHalfDeployTracking();
@@ -16660,17 +18980,18 @@ function resetLifecycleStateForFreshMatchStart(): void {
   perfTelemetryBombPickupScanMaxCandidates = 0;
   clearVoModuleState();
   resetMatchStartBannerState(true);
+  clearPostmatchShowcaseState();
 }
 
 
 function ReturnToPreMatchState(): void {
+  clearRuntimeBotState(true);
   // --- Core prematch recovery variables ---
   serverScores = [INITIAL_TICKETS, INITIAL_TICKETS];
   cipherCurrentHalf = 1;
   cipherMatchStage = "half1";
   cipherHalfScores = [0, 0];
-  cipherObjectiveKeyCountByCpId = {};
-  cipherCounterWorldIconLastShownByCpId = {};
+  resetCipherNodeStates("ReturnToPreMatchState");
   resetCipherSuddenDeathState();
   cipherPhaseTransitionUndeployIgnoreUntilSec = 0;
   phaseTickCount = 0;
@@ -16702,6 +19023,7 @@ function ReturnToPreMatchState(): void {
   prematchHealthInside889ByPlayerId = {};
   prematchHealthAppliedMaxByPlayerId = {};
   resetMatchStartBannerState(true);
+  clearPostmatchShowcaseState();
   stopDamageZonePulseTimer();
   playerInDamageZone = {};
 
@@ -16712,14 +19034,13 @@ function ReturnToPreMatchState(): void {
   initialization[3] = false;
   initialization[4] = false;
 
+  gameStatus = 0;
+
   // --- UI visibility ---
-  SafeSetWidgetVisibleByName("PreMatchContainer", true);
   SetCountdownOverlayVisible(false);
   hideCipherTransitionHudForAllPlayers();
   SafeSetWidgetVisibleByName("LiveContainer", false);
   SafeSetWidgetVisibleByName("PostMatchContainer", false);
-
-  gameStatus = 0;
 
   // --- Reset READY state so we do NOT auto-start the next prematch-to-live transition ---
   serverPlayers.forEach((p) => {
@@ -16763,6 +19084,7 @@ function ReturnToPreMatchState(): void {
 
   // --- Make sure prematch roster UI reflects the new prematch state immediately ---
   refreshPrematchReadyStateUi();
+  ShowPrematchUi();
   applyPrematch889HealthForAllPlayers();
 
   // --- Put everyone back into the world in prematch ---
@@ -16778,6 +19100,7 @@ function InitializePreMatch(): void {
   clearPhaseCountdownDeadline();
   resetEngineSchedulerCadenceState();
   stopDamageZonePulseTimer();
+  clearPostmatchShowcaseState();
   setLiveScorePanelVisible(false);
   setObjectiveNativeMcomObjectivesEnabled(false, "InitializePreMatch");
   disableAllObjectiveCapturePointObjectives("InitializePreMatch");
@@ -16826,7 +19149,7 @@ function InitializePreMatch(): void {
   mod.SetGameModeTimeLimit(60000);
 
   // Prematch UI visibility
-  SafeSetWidgetVisibleByName("PreMatchContainer", true);
+  ShowPrematchUi();
   SetCountdownOverlayVisible(false);
   hideCipherTransitionHudForAllPlayers();
   SafeSetWidgetVisibleByName("LiveContainer", false);
@@ -16849,6 +19172,7 @@ function InitializeCountDown(): void {
     liveTransitionCheckpointSeenByKey = {};
     emitLiveTransitionCheckpoint("countdown_init_enter");
     stopDamageZonePulseTimer();
+    clearPostmatchShowcaseState();
     phaseTickCount = 0;
     countDown = COUNT_DOWN_TIME;
     clearPhaseCountdownDeadline();
@@ -16872,7 +19196,7 @@ function InitializeCountDown(): void {
     // Players stay deployed while this 5-second Redeploying countdown is visible,
     // then they are undeployed only after it completes.
     mod.SetSpawnMode(mod.SpawnModes.Deploy);
-    SafeSetWidgetVisibleByName("PreMatchContainer", false);
+    HidePrematchUiForTransition();
 
     for (let i = 0; i < 4; i++) {
       SafeEnableWorldIconById(WORLDICON_T1_SWITCH + i, false, false);
@@ -16917,6 +19241,7 @@ function InitializePreLive(): void {
     liveTransitionCheckpointSeenByKey = {};
     emitLiveTransitionCheckpoint("prelive_init_enter");
     stopDamageZonePulseTimer();
+    clearPostmatchShowcaseState();
     phaseTickCount = 0;
     countDown = PRELIVE_TIME;
     clearPhaseCountdownDeadline();
@@ -16958,7 +19283,7 @@ function InitializePreLive(): void {
     SafeSetTextLabelByName("CountDownText", mod.Message(countDown));
 
     // Hide prematch UI.
-    SafeSetWidgetVisibleByName("PreMatchContainer", false);
+    HidePrematchUiForTransition();
     SetCountdownOverlayVisible(true);
     hideCipherTransitionHudForAllPlayers();
     SetCountdownOverlayDepthAboveGameUI();
@@ -17012,6 +19337,7 @@ function InitializeLive(): void {
   try {
     emitLiveTransitionCheckpoint("live_init_enter");
     stopDamageZonePulseTimer();
+    clearPostmatchShowcaseState();
     resetLiveClockState();
     emitLiveTransitionCheckpoint("live_init_clock_reset");
     liveGameModeLimitAtSec = mod.GetMatchTimeElapsed() + LIVE_ENGINE_TIME_LIMIT_SAFETY_SECONDS;
@@ -17085,7 +19411,7 @@ function InitializeLive(): void {
     emitLiveTransitionCheckpoint("live_init_hqs");
 
     // Hide prematch UI once players are deploying/playing.
-    SafeSetWidgetVisibleByName("PreMatchContainer", false);
+    HidePrematchUiForTransition();
     SetCountdownOverlayVisible(false);
     hideCipherTransitionHudForAllPlayers();
     SafeSetWidgetVisibleByName("LiveContainer", true);
@@ -17102,14 +19428,14 @@ function InitializeLive(): void {
     serverPlayers.forEach((p) => {
       p.setTeam();
       mod.SetRedeployTime(p.player, REDEPLOY_TIME);
-      mod.EnableAllInputRestrictions(p.player, false);
-      mod.EnableInputRestriction(p.player, mod.RestrictedInputs.FireWeapon, false);
+      clearCipherLiveInputRestrictionsForPlayer(p.player);
       if (p.isDeployed) p.isFirstDeploy();
     });
     refreshCipherKeyPlayerSnapshots("InitializeLive");
     repairCipherKeyHudCachesForAllPlayers(true);
     UpdateBombCarrierUiForAllPlayers(undefined, true);
     refreshBombNoticeUiForAllPlayers(undefined, true);
+    requestLiveBotSpawnsForAllBots("InitializeLive");
     emitLiveTransitionCheckpoint("live_init_players_unlocked");
 
     mod.SetScoreboardColumnNames(
@@ -17165,6 +19491,702 @@ function getWinningTeam(): mod.Team {
   return resolveWinningTeamFromScores();
 }
 
+function normalizePostmatchQuaternion(q: PostmatchQuaternion): PostmatchQuaternion {
+  const norm = Math.sqrt(q.w * q.w + q.x * q.x + q.y * q.y + q.z * q.z);
+  if (norm <= 0) return { w: 1, x: 0, y: 0, z: 0 };
+  return {
+    w: q.w / norm,
+    x: q.x / norm,
+    y: q.y / norm,
+    z: q.z / norm,
+  };
+}
+
+function postmatchQuaternionProduct(q1: PostmatchQuaternion, q2: PostmatchQuaternion): PostmatchQuaternion {
+  return normalizePostmatchQuaternion({
+    w: q1.w * q2.w - q1.x * q2.x - q1.y * q2.y - q1.z * q2.z,
+    x: q1.w * q2.x + q1.x * q2.w + q1.y * q2.z - q1.z * q2.y,
+    y: q1.w * q2.y - q1.x * q2.z + q1.y * q2.w + q1.z * q2.x,
+    z: q1.w * q2.z + q1.x * q2.y - q1.y * q2.x + q1.z * q2.w,
+  });
+}
+
+function postmatchQuaternionFromEuler(euler: mod.Vector): PostmatchQuaternion {
+  const eulerX = mod.XComponentOf(euler);
+  const eulerY = mod.YComponentOf(euler);
+  const eulerZ = mod.ZComponentOf(euler);
+
+  const cx = Math.cos(eulerX / 2);
+  const cy = Math.cos(eulerY / 2);
+  const cz = Math.cos(eulerZ / 2);
+  const sx = Math.sin(eulerX / 2);
+  const sy = Math.sin(eulerY / 2);
+  const sz = Math.sin(eulerZ / 2);
+
+  return normalizePostmatchQuaternion({
+    w: cx * cy * cz + sx * sy * sz,
+    x: sx * cy * cz - cx * sy * sz,
+    y: cx * sy * cz + sx * cy * sz,
+    z: cx * cy * sz - sx * sy * cz,
+  });
+}
+
+function postmatchQuaternionToEuler(q: PostmatchQuaternion): mod.Vector {
+  const n = normalizePostmatchQuaternion(q);
+  const x = Math.atan2(
+    2 * (n.y * n.z + n.w * n.x),
+    n.w * n.w - n.x * n.x - n.y * n.y + n.z * n.z
+  );
+  const y = Math.asin(Math.max(-1, Math.min(1, 2 * (n.w * n.y - n.x * n.z))));
+  const z = Math.atan2(
+    2 * (n.x * n.y + n.w * n.z),
+    n.w * n.w + n.x * n.x - n.y * n.y - n.z * n.z
+  );
+
+  return mod.CreateVector(x, y, z);
+}
+
+function rotatePostmatchVectorByQuaternion(vector: mod.Vector, q: PostmatchQuaternion): mod.Vector {
+  const vecX = mod.XComponentOf(vector);
+  const vecY = mod.YComponentOf(vector);
+  const vecZ = mod.ZComponentOf(vector);
+
+  const x =
+    (q.w * q.w + q.x * q.x - q.y * q.y - q.z * q.z) * vecX +
+    2 * (q.x * q.y - q.w * q.z) * vecY +
+    2 * (q.x * q.z + q.w * q.y) * vecZ;
+
+  const y =
+    2 * (q.x * q.y + q.w * q.z) * vecX +
+    (q.w * q.w - q.x * q.x + q.y * q.y - q.z * q.z) * vecY +
+    2 * (q.y * q.z - q.w * q.x) * vecZ;
+
+  const z =
+    2 * (q.x * q.z - q.w * q.y) * vecX +
+    2 * (q.y * q.z + q.w * q.x) * vecY +
+    (q.w * q.w - q.x * q.x - q.y * q.y + q.z * q.z) * vecZ;
+
+  return mod.CreateVector(x, y, z);
+}
+
+function getOrCreatePostmatchShowcaseObjectCache(
+  config: PostmatchShowcaseRuntimeObjectConfig
+): PostmatchShowcaseRuntimeObjectCache {
+  const existing = postmatchShowcaseRuntimeObjectCacheByKey[config.key];
+  if (existing) return existing;
+
+  const created: PostmatchShowcaseRuntimeObjectCache = {
+    key: config.key,
+    runtimeSpawned: false,
+  };
+
+  postmatchShowcaseRuntimeObjectCacheByKey[config.key] = created;
+  return created;
+}
+
+function getPostmatchShowcaseParentTransform(): { position: mod.Vector; rotation: PostmatchQuaternion } | undefined {
+  try {
+    const parent = mod.GetSpatialObject(POSTMATCH_SHOWCASE_PARENT_ID) as unknown as mod.Object;
+    return {
+      position: mod.GetObjectPosition(parent),
+      rotation: postmatchQuaternionFromEuler(mod.GetObjectRotation(parent)),
+    };
+  } catch (_err) {
+    return undefined;
+  }
+}
+
+function resolvePostmatchShowcaseRuntimeTransform(
+  config: PostmatchShowcaseRuntimeObjectConfig
+): { position: mod.Vector; rotation: mod.Vector } | undefined {
+  const parent = getPostmatchShowcaseParentTransform();
+  if (!parent) return undefined;
+
+  const worldOffset = rotatePostmatchVectorByQuaternion(config.localOffset, parent.rotation);
+  const localRotation = postmatchQuaternionFromEuler(config.localRotation);
+  const worldRotation = postmatchQuaternionProduct(parent.rotation, localRotation);
+
+  return {
+    position: mod.Add(parent.position, worldOffset),
+    rotation: postmatchQuaternionToEuler(worldRotation),
+  };
+}
+
+function getPostmatchShowcaseAnchorConfig(anchorId: number): PostmatchShowcaseRuntimeObjectConfig | undefined {
+  for (let i = 0; i < POSTMATCH_SHOWCASE_RUNTIME_OBJECT_CONFIGS.length; i++) {
+    const config = POSTMATCH_SHOWCASE_RUNTIME_OBJECT_CONFIGS[i];
+    if (config.anchorId === anchorId) return config;
+  }
+  return undefined;
+}
+
+function getPostmatchShowcaseAnchorPosition(anchorId: number): mod.Vector | undefined {
+  const cached = postmatchShowcaseAnchorPositionById[anchorId];
+  if (cached) return cached;
+
+  const config = getPostmatchShowcaseAnchorConfig(anchorId);
+  if (!config) return undefined;
+
+  const transform = resolvePostmatchShowcaseRuntimeTransform(config);
+  if (!transform) return undefined;
+
+  postmatchShowcaseAnchorPositionById[anchorId] = transform.position;
+  return transform.position;
+}
+
+function getPostmatchSpatialObjectPosition(objId: number): mod.Vector | undefined {
+  if (objId === POSTMATCH_CAMERA_ID || objId === POSTMATCH_SHOWCASE_PARENT_ID) {
+    try {
+      return mod.GetObjectPosition(mod.GetSpatialObject(objId) as unknown as mod.Object);
+    } catch (_err) {
+      return undefined;
+    }
+  }
+
+  return getPostmatchShowcaseAnchorPosition(objId);
+}
+
+function spawnPostmatchShowcaseRuntimeSpatialObjects(): void {
+  for (let i = 0; i < POSTMATCH_SHOWCASE_RUNTIME_OBJECT_CONFIGS.length; i++) {
+    const config = POSTMATCH_SHOWCASE_RUNTIME_OBJECT_CONFIGS[i];
+    const cache = getOrCreatePostmatchShowcaseObjectCache(config);
+    const transform = resolvePostmatchShowcaseRuntimeTransform(config);
+    if (!transform) continue;
+
+    cache.position = transform.position;
+    cache.rotation = transform.rotation;
+    if (config.anchorId !== undefined) {
+      postmatchShowcaseAnchorPositionById[config.anchorId] = transform.position;
+    }
+
+    if (cache.runtimeSpawned && cache.runtimeObject) continue;
+
+    const spawned = spawnRuntimeCommonObjectSafe(
+      config.asset,
+      transform.position,
+      transform.rotation,
+      "postmatch_showcase_runtime_" + config.key,
+      config.scale
+    );
+
+    if (!spawned.object) continue;
+
+    cache.runtimeObject = spawned.object;
+    cache.runtimeSpawned = true;
+  }
+}
+
+function unspawnPostmatchShowcaseRuntimeSpatialObjects(): void {
+  for (const key in postmatchShowcaseRuntimeObjectCacheByKey) {
+    const cache = postmatchShowcaseRuntimeObjectCacheByKey[key];
+    if (!cache || !cache.runtimeObject) continue;
+
+    unspawnObjectSafe(cache.runtimeObject, "postmatch_showcase_runtime_" + key, false);
+    cache.runtimeObject = undefined;
+    cache.runtimeSpawned = false;
+  }
+  postmatchShowcaseAnchorPositionById = {};
+}
+
+function hidePostmatchShowcaseSpatialObjectsForPrematch(): void {
+  unspawnPostmatchShowcaseRuntimeSpatialObjects();
+}
+
+function showPostmatchShowcaseSpatialObjectsForPostmatch(): void {
+  spawnPostmatchShowcaseRuntimeSpatialObjects();
+}
+
+function getPostmatchShowcaseStatValue(p: Player, statKind: PostmatchShowcaseStatKind): number {
+  const snapshot = p.getScoreboardSnapshot();
+  if (statKind === "eliminations") return snapshot[1];
+  if (statKind === "keys") return snapshot[3];
+  if (statKind === "destroyed") return snapshot[4];
+  return snapshot[0];
+}
+
+function getPostmatchShowcaseStatLabelKey(statKind: PostmatchShowcaseStatKind): any {
+  if (statKind === "eliminations") return (mod.stringkeys as any).PostMatchTopEliminations;
+  if (statKind === "keys") return (mod.stringkeys as any).PostMatchMostKeysDelivered;
+  if (statKind === "destroyed") return (mod.stringkeys as any).PostMatchMostObjectivesDestroyed;
+  return (mod.stringkeys as any).PostMatchMoralSupport;
+}
+
+function isBetterPostmatchShowcaseCandidate(
+  candidate: Player,
+  currentBest: Player | undefined,
+  statKind: PostmatchShowcaseStatKind
+): boolean {
+  if (!currentBest) return true;
+
+  const candidateScore = candidate.getScoreboardSnapshot()[0];
+  const bestScore = currentBest.getScoreboardSnapshot()[0];
+
+  if (statKind === "moralSupport") {
+    if (candidateScore !== bestScore) return candidateScore < bestScore;
+    return candidate.id < currentBest.id;
+  }
+
+  const candidateStat = getPostmatchShowcaseStatValue(candidate, statKind);
+  const bestStat = getPostmatchShowcaseStatValue(currentBest, statKind);
+  if (candidateStat !== bestStat) return candidateStat > bestStat;
+  if (candidateScore !== bestScore) return candidateScore > bestScore;
+  return candidate.id < currentBest.id;
+}
+
+function isPostmatchShowcaseStatSelectable(p: Player, statKind: PostmatchShowcaseStatKind): boolean {
+  if (statKind === "moralSupport") return true;
+  return getPostmatchShowcaseStatValue(p, statKind) > 0;
+}
+
+function hasPostmatchShowcaseSelectablePlayer(
+  candidates: Player[],
+  usedPlayerIds: { [playerId: number]: boolean },
+  statKind: PostmatchShowcaseStatKind
+): boolean {
+  for (let i = 0; i < candidates.length; i++) {
+    const candidate = candidates[i];
+    if (usedPlayerIds[candidate.id] === true) continue;
+    if (isPostmatchShowcaseStatSelectable(candidate, statKind)) return true;
+  }
+  return false;
+}
+
+function selectPostmatchShowcasePlayer(
+  candidates: Player[],
+  usedPlayerIds: { [playerId: number]: boolean },
+  statKind: PostmatchShowcaseStatKind
+): Player | undefined {
+  let best: Player | undefined = undefined;
+  for (let i = 0; i < candidates.length; i++) {
+    const candidate = candidates[i];
+    if (usedPlayerIds[candidate.id] === true) continue;
+    if (!isPostmatchShowcaseStatSelectable(candidate, statKind)) continue;
+    if (isBetterPostmatchShowcaseCandidate(candidate, best, statKind)) best = candidate;
+  }
+  if (best) usedPlayerIds[best.id] = true;
+  return best;
+}
+
+function selectNextPostmatchShowcaseStatKind(
+  candidates: Player[],
+  usedPlayerIds: { [playerId: number]: boolean },
+  startIndex: number
+): { statKind: PostmatchShowcaseStatKind; nextIndex: number } | undefined {
+  for (let i = startIndex; i < POSTMATCH_SHOWCASE_STAT_PRIORITY.length; i++) {
+    const statKind = POSTMATCH_SHOWCASE_STAT_PRIORITY[i];
+    if (!hasPostmatchShowcaseSelectablePlayer(candidates, usedPlayerIds, statKind)) continue;
+    return {
+      statKind,
+      nextIndex: i + 1,
+    };
+  }
+  return undefined;
+}
+
+function buildPostmatchShowcaseSlots(): PostmatchShowcaseSlot[] {
+  const winner = getWinningTeam();
+  if (mod.Equals(winner, teamNeutral)) return [];
+
+  const candidates: Player[] = [];
+  serverPlayers.forEach((p) => {
+    if (!p || !mod.IsPlayerValid(p.player)) return;
+    if (!mod.Equals(mod.GetTeam(p.player), winner)) return;
+    candidates.push(p);
+  });
+
+  const usedPlayerIds: { [playerId: number]: boolean } = {};
+  const slots: PostmatchShowcaseSlot[] = [];
+  let statPriorityIndex = 0;
+  for (let i = 0; i < POSTMATCH_SHOWCASE_SLOT_CONFIGS.length; i++) {
+    const config = POSTMATCH_SHOWCASE_SLOT_CONFIGS[i];
+    const selectedStat = selectNextPostmatchShowcaseStatKind(candidates, usedPlayerIds, statPriorityIndex);
+    if (!selectedStat) break;
+
+    statPriorityIndex = selectedStat.nextIndex;
+    const player = selectPostmatchShowcasePlayer(candidates, usedPlayerIds, selectedStat.statKind);
+    if (!player) continue;
+    slots.push({
+      anchorId: config.anchorId,
+      statKind: selectedStat.statKind,
+      player,
+      statValue: getPostmatchShowcaseStatValue(player, selectedStat.statKind),
+    });
+  }
+  return slots;
+}
+
+const POSTMATCH_LOSING_TEAM_RESTRICTED_INPUTS: mod.RestrictedInputs[] = [
+  mod.RestrictedInputs.FireWeapon,
+  mod.RestrictedInputs.MoveForwardBack,
+  mod.RestrictedInputs.MoveLeftRight,
+];
+
+function isPostmatchWinnerTeam(team: mod.Team): boolean {
+  const winner = getWinningTeam();
+  if (!mod.Equals(winner, team1) && !mod.Equals(winner, team2)) return false;
+  return mod.Equals(team, winner);
+}
+
+function findPostmatchShowcaseSlotForPlayerId(playerId: number): PostmatchShowcaseSlot | undefined {
+  for (let i = 0; i < postmatchShowcaseSlots.length; i++) {
+    const slot = postmatchShowcaseSlots[i];
+    if (slot && slot.player && slot.player.id === playerId) return slot;
+  }
+  return undefined;
+}
+
+function setPostmatchRestrictedInputsForPlayer(
+  player: mod.Player,
+  inputs: mod.RestrictedInputs[],
+  restricted: boolean
+): void {
+  if (!mod.IsPlayerValid(player)) return;
+  for (let i = 0; i < inputs.length; i++) {
+    mod.EnableInputRestriction(player, inputs[i], restricted);
+  }
+}
+
+function applyPostmatchShowcaseMovementLockForPlayer(player: mod.Player): void {
+  if (!mod.IsPlayerValid(player)) return;
+  clearCipherLiveInputRestrictionsForPlayer(player);
+  mod.EnableInputRestriction(player, mod.RestrictedInputs.MoveForwardBack, true);
+  mod.EnableInputRestriction(player, mod.RestrictedInputs.MoveLeftRight, true);
+}
+
+function applyPostmatchLosingInputLockForPlayer(player: mod.Player): void {
+  if (!mod.IsPlayerValid(player)) return;
+  clearCipherLiveInputRestrictionsForPlayer(player);
+  setPostmatchRestrictedInputsForPlayer(player, POSTMATCH_LOSING_TEAM_RESTRICTED_INPUTS, true);
+}
+
+function applyPostmatchInputStateForPlayer(player: mod.Player): void {
+  if (!mod.IsPlayerValid(player)) return;
+  if (gameStatus !== 4) return;
+
+  const team = mod.GetTeam(player);
+  if (isPostmatchWinnerTeam(team)) {
+    applyPostmatchShowcaseMovementLockForPlayer(player);
+  } else {
+    applyPostmatchLosingInputLockForPlayer(player);
+  }
+}
+
+function clearPostmatchShowcaseMovementLockForPlayer(player: mod.Player): void {
+  if (!mod.IsPlayerValid(player)) return;
+  try {
+    mod.EnableInputRestriction(player, mod.RestrictedInputs.MoveForwardBack, false);
+    mod.EnableInputRestriction(player, mod.RestrictedInputs.MoveLeftRight, false);
+    mod.EnableInputRestriction(player, mod.RestrictedInputs.FireWeapon, false);
+  } catch (_err) {}
+}
+
+function setPostmatchShowcaseCameraForPlayer(player: mod.Player, enabled: boolean): void {
+  if (!mod.IsPlayerValid(player)) return;
+  const playerId = modlib.getPlayerId(player);
+  try {
+    if (enabled) {
+      if (gameStatus !== 4) return;
+      mod.SetCameraTypeForPlayer(player, mod.Cameras.Fixed, POSTMATCH_CAMERA_ID);
+      postmatchShowcaseCameraAppliedByPlayerId[playerId] = true;
+    } else {
+      if (postmatchShowcaseCameraAppliedByPlayerId[playerId] !== true) return;
+      mod.SetCameraTypeForPlayer(player, mod.Cameras.FirstPerson);
+      delete postmatchShowcaseCameraAppliedByPlayerId[playerId];
+    }
+  } catch (_err) {}
+}
+
+function applyPostmatchShowcaseCameraAndInputForAllPlayers(): void {
+  serverPlayers.forEach((p) => {
+    if (!p || !mod.IsPlayerValid(p.player)) return;
+    applyPostmatchInputStateForPlayer(p.player);
+    setPostmatchShowcaseCameraForPlayer(p.player, true);
+  });
+}
+
+function clearPostmatchShowcaseCameraAndInputForAllPlayers(): void {
+  serverPlayers.forEach((p) => {
+    if (!p || !mod.IsPlayerValid(p.player)) return;
+    clearPostmatchShowcaseMovementLockForPlayer(p.player);
+    setPostmatchShowcaseCameraForPlayer(p.player, false);
+  });
+}
+
+function tryMakePostmatchShowcasePlayerAlive(p: Player): boolean {
+  if (!p || !mod.IsPlayerValid(p.player)) return false;
+  if (isPlayerAliveSafe(p.player)) return true;
+
+  try {
+    mod.ForceRevive(p.player);
+  } catch (_errRevive) {}
+  if (isPlayerAliveSafe(p.player)) return true;
+
+  const spawnerObjId = getInitialSpawnPointObjIdForTeam(mod.GetTeam(p.player));
+  if (spawnerObjId > 0) {
+    try {
+      mod.SetRedeployTime(p.player, 0);
+      trySpawnPlayerFromSpawnPointSafe(p.player, spawnerObjId, "postmatch_showcase");
+    } catch (_errSpawn) {}
+  }
+
+  return isPlayerAliveSafe(p.player);
+}
+
+function createOffsetPosition(base: mod.Vector, yOffset: number): mod.Vector {
+  return mod.Add(base, mod.CreateVector(0, yOffset, 0));
+}
+
+function configurePostmatchShowcaseWorldIcon(
+  handle: mod.WorldIcon,
+  pos: mod.Vector,
+  label: any,
+  color: mod.Vector
+): void {
+  mod.SetWorldIconPosition(handle, pos);
+  mod.SetWorldIconText(handle, label);
+  mod.SetWorldIconColor(handle, color);
+  mod.EnableWorldIconImage(handle, false);
+  mod.EnableWorldIconText(handle, true);
+}
+
+function spawnPostmatchShowcaseWorldIcon(
+  pos: mod.Vector,
+  label: any,
+  color: mod.Vector,
+  context: string
+): { object?: mod.Object; handle?: mod.WorldIcon } {
+  const spawned = spawnRuntimeCommonObjectSafe(mod.RuntimeSpawn_Common.WorldIcon, pos, BOMB_DROP_ROTATION, context);
+  if (!spawned.object) return {};
+
+  const handle = resolveRuntimeWorldIconHandle(spawned.object as unknown);
+  if (!handle) {
+    unspawnObjectSafe(spawned.object, context + "_unresolved", false);
+    return {};
+  }
+
+  try {
+    configurePostmatchShowcaseWorldIcon(handle, pos, label, color);
+  } catch (_errConfigure) {
+    unspawnObjectSafe(spawned.object, context + "_configure_failed", false);
+    return {};
+  }
+
+  return { object: spawned.object, handle };
+}
+
+function getPostmatchShowcaseIconObject(
+  slot: PostmatchShowcaseSlot,
+  iconKind: PostmatchShowcaseIconKind
+): mod.Object | undefined {
+  return iconKind === "head" ? slot.headIconObject : slot.feetIconObject;
+}
+
+function getPostmatchShowcaseIconHandle(
+  slot: PostmatchShowcaseSlot,
+  iconKind: PostmatchShowcaseIconKind
+): mod.WorldIcon | undefined {
+  return iconKind === "head" ? slot.headIconHandle : slot.feetIconHandle;
+}
+
+function setPostmatchShowcaseIconRefs(
+  slot: PostmatchShowcaseSlot,
+  iconKind: PostmatchShowcaseIconKind,
+  object: mod.Object | undefined,
+  handle: mod.WorldIcon | undefined
+): void {
+  if (iconKind === "head") {
+    slot.headIconObject = object;
+    slot.headIconHandle = handle;
+    return;
+  }
+
+  slot.feetIconObject = object;
+  slot.feetIconHandle = handle;
+}
+
+function clearPostmatchShowcaseWorldIconForSlot(
+  slot: PostmatchShowcaseSlot,
+  iconKind: PostmatchShowcaseIconKind,
+  context: string
+): void {
+  const object = getPostmatchShowcaseIconObject(slot, iconKind);
+  const handle = getPostmatchShowcaseIconHandle(slot, iconKind);
+
+  if (object) unspawnObjectSafe(object, context + " object", false);
+  else if (handle) unspawnObjectSafe(handle as unknown, context + " handle", false);
+
+  setPostmatchShowcaseIconRefs(slot, iconKind, undefined, undefined);
+}
+
+function resolvePostmatchShowcaseWorldIconForSlot(
+  slot: PostmatchShowcaseSlot,
+  iconKind: PostmatchShowcaseIconKind
+): mod.WorldIcon | undefined {
+  const existingHandle = getPostmatchShowcaseIconHandle(slot, iconKind);
+  if (existingHandle) return existingHandle;
+
+  const object = getPostmatchShowcaseIconObject(slot, iconKind);
+  if (!object) return undefined;
+
+  const resolvedHandle = resolveRuntimeWorldIconHandle(object as unknown);
+  if (!resolvedHandle) return undefined;
+
+  setPostmatchShowcaseIconRefs(slot, iconKind, object, resolvedHandle);
+  return resolvedHandle;
+}
+
+function ensurePostmatchShowcaseWorldIconForSlot(
+  slot: PostmatchShowcaseSlot,
+  iconKind: PostmatchShowcaseIconKind,
+  pos: mod.Vector,
+  label: any,
+  color: mod.Vector,
+  context: string
+): void {
+  let object = getPostmatchShowcaseIconObject(slot, iconKind);
+  let handle = resolvePostmatchShowcaseWorldIconForSlot(slot, iconKind);
+
+  if (object && !handle) {
+    clearPostmatchShowcaseWorldIconForSlot(slot, iconKind, context + "_stale");
+    object = undefined;
+  }
+
+  if (handle) {
+    try {
+      configurePostmatchShowcaseWorldIcon(handle, pos, label, color);
+      if (object) moveObjectToAbsolutePositionSafe(object, pos, context + "_move");
+      return;
+    } catch (_errConfigure) {
+      clearPostmatchShowcaseWorldIconForSlot(slot, iconKind, context + "_configure_failed");
+      object = undefined;
+      handle = undefined;
+    }
+  }
+
+  const spawned = spawnPostmatchShowcaseWorldIcon(pos, label, color, context);
+  setPostmatchShowcaseIconRefs(slot, iconKind, spawned.object, spawned.handle);
+}
+
+function clearPostmatchShowcaseRuntimeWorldIcons(): void {
+  for (let i = 0; i < postmatchShowcaseSlots.length; i++) {
+    const slot = postmatchShowcaseSlots[i];
+    clearPostmatchShowcaseWorldIconForSlot(slot, "head", "postmatch head icon");
+    clearPostmatchShowcaseWorldIconForSlot(slot, "feet", "postmatch feet icon");
+  }
+}
+
+function getPostmatchShowcaseBasePosition(slot: PostmatchShowcaseSlot): mod.Vector | undefined {
+  if (mod.IsPlayerValid(slot.player.player) && isPlayerAliveSafe(slot.player.player)) {
+    const playerPos = tryGetPlayerPositionSafe(slot.player.player);
+    if (playerPos) return playerPos;
+  }
+  return getPostmatchSpatialObjectPosition(slot.anchorId);
+}
+
+function updatePostmatchShowcaseWorldIconPositions(): void {
+  if (gameStatus !== 4) return;
+  for (let i = 0; i < postmatchShowcaseSlots.length; i++) {
+    const slot = postmatchShowcaseSlots[i];
+    const basePos = getPostmatchShowcaseBasePosition(slot);
+    if (!basePos) continue;
+    ensurePostmatchShowcaseWorldIconForSlot(
+      slot,
+      "head",
+      createOffsetPosition(basePos, POSTMATCH_SHOWCASE_HEAD_TEXT_Y_OFFSET_METERS),
+      mod.Message(mod.stringkeys.PostMatchPlayerName, slot.player.player),
+      COLOR_NEUTRAL,
+      "postmatch_head_worldicon_" + String(slot.anchorId)
+    );
+    ensurePostmatchShowcaseWorldIconForSlot(
+      slot,
+      "feet",
+      createOffsetPosition(basePos, POSTMATCH_SHOWCASE_FEET_TEXT_Y_OFFSET_METERS),
+      mod.Message(getPostmatchShowcaseStatLabelKey(slot.statKind), mod.Ceiling(slot.statValue)),
+      COLOR_FRIENDLY,
+      "postmatch_feet_worldicon_" + String(slot.anchorId)
+    );
+  }
+}
+
+function teleportPostmatchShowcaseSlotPlayer(slot: PostmatchShowcaseSlot, context: string): boolean {
+  const player = slot.player.player;
+  if (!mod.IsPlayerValid(player)) return false;
+  if (!isPlayerAliveSafe(player)) return false;
+
+  const anchorPos = getPostmatchSpatialObjectPosition(slot.anchorId);
+  if (!anchorPos) return false;
+
+  const cameraPos = getPostmatchSpatialObjectPosition(POSTMATCH_CAMERA_ID);
+  const yawRadians = getCipherTeleportYawRadians(anchorPos, cameraPos);
+  try {
+    mod.Teleport(player, anchorPos, yawRadians);
+    return true;
+  } catch (err) {
+    LogRuntimeError(
+      "PostmatchShowcaseTeleport/" + context + "/" + String(slot.player.id) + "/" + String(slot.anchorId),
+      err
+    );
+    return false;
+  }
+}
+
+function applyPostmatchShowcaseSlot(slot: PostmatchShowcaseSlot): void {
+  const player = slot.player.player;
+  if (!mod.IsPlayerValid(player)) return;
+
+  applyPostmatchInputStateForPlayer(player);
+  setPostmatchShowcaseCameraForPlayer(player, true);
+
+  if (!tryMakePostmatchShowcasePlayerAlive(slot.player)) return;
+  teleportPostmatchShowcaseSlotPlayer(slot, "apply");
+}
+
+function applyPostmatchShowcaseSlots(): void {
+  for (let i = 0; i < postmatchShowcaseSlots.length; i++) {
+    applyPostmatchShowcaseSlot(postmatchShowcaseSlots[i]);
+  }
+  updatePostmatchShowcaseWorldIconPositions();
+}
+
+async function reassertPostmatchShowcaseAfterDelay(): Promise<void> {
+  const waits = [0.1, 0.35, 0.75, 1.25];
+  let previousWait = 0;
+  for (let i = 0; i < waits.length; i++) {
+    const waitSeconds = waits[i] - previousWait;
+    previousWait = waits[i];
+    await mod.Wait(waitSeconds);
+    if (gameStatus !== 4 || initialization[4] !== true) return;
+    applyPostmatchShowcaseCameraAndInputForAllPlayers();
+    applyPostmatchShowcaseSlots();
+  }
+}
+
+function showPostmatchStatsMapHint(): void {
+  const message = mod.Message((mod.stringkeys as any).PostMatchStatsMapHint);
+  modlib.ShowHighlightedGameModeMessage(message, team1);
+  modlib.ShowHighlightedGameModeMessage(message, team2);
+}
+
+function beginPostmatchShowcase(): void {
+  clearPostmatchShowcaseRuntimeWorldIcons();
+  postmatchShowcaseSlots = buildPostmatchShowcaseSlots();
+
+  showPostmatchShowcaseSpatialObjectsForPostmatch();
+
+  applyPostmatchShowcaseCameraAndInputForAllPlayers();
+  applyPostmatchShowcaseSlots();
+  void reassertPostmatchShowcaseAfterDelay();
+}
+
+function clearPostmatchShowcaseState(): void {
+  clearPostmatchShowcaseRuntimeWorldIcons();
+  postmatchShowcaseSlots = [];
+
+  hidePostmatchShowcaseSpatialObjectsForPrematch();
+
+  clearPostmatchShowcaseCameraAndInputForAllPlayers();
+}
+
 function deletePostMatchReportUI(): void {
   for (let i = 0; i < postMatchWidgetsToDelete.length; i++) {
     safeDeleteWidgetByName(postMatchWidgetsToDelete[i]);
@@ -17181,14 +20203,15 @@ function addPostMatchText(
   size: number,
   color: mod.Vector,
   alpha: number,
-  receiver: mod.Team | mod.Player
+  receiver: mod.Team | mod.Player,
+  anchor: mod.UIAnchor = mod.UIAnchor.TopCenter
 ): void {
   const parent = mod.FindUIWidgetWithName("PostMatchContainer");
   mod.AddUIText(
     name,
     mod.CreateVector(posX, posY, 0),
     mod.CreateVector(w, h, 0),
-    mod.UIAnchor.TopCenter,
+    anchor,
     parent,
     true,
     0,
@@ -17217,143 +20240,106 @@ function BuildPostMatchReportUI(): void {
   const parent = mod.FindUIWidgetWithName("PostMatchContainer");
   if (!parent) return;
 
-  mod.SetUIWidgetBgFill(parent, mod.UIBgFill.Solid);
-  mod.SetUIWidgetBgAlpha(parent, 0.75);
+  mod.SetUIWidgetBgFill(parent, mod.UIBgFill.None);
+  mod.SetUIWidgetBgAlpha(parent, 0);
   mod.SetUIWidgetBgColor(parent, mod.CreateVector(0, 0, 0));
   mod.SetUIWidgetDepth(parent, mod.UIDepth.AboveGameUI);
+  SafeSetWidgetSizeHandle(parent, SAFE_UI_ROOT_SIZE);
 
   const winner = getWinningTeam();
 
-  // Build connected player lists (serverPlayers only contains connected players)
-  const t1List: Player[] = [];
-  const t2List: Player[] = [];
-
-  serverPlayers.forEach((p) => {
-    const t = mod.GetTeam(p.player);
-    if (mod.Equals(t, team1)) t1List.push(p);
-    else if (mod.Equals(t, team2)) t2List.push(p);
-  });
-
-  t1List.sort((a, b) => b.getScoreboardSnapshot()[0] - a.getScoreboardSnapshot()[0]);
-  t2List.sort((a, b) => b.getScoreboardSnapshot()[0] - a.getScoreboardSnapshot()[0]);
-
-  // Layout
-  const headerY = 220;
-  const rowStartY = 260;
-  const rowH = 22;
-
-  // Portal-safe centered layout
-const TABLE_WIDTH = 620; // safe on 16:9
-const TABLE_GAP = 60;    // space between teams
-
-// Left and right table centers
-const leftX  = -(TABLE_GAP / 2 + TABLE_WIDTH / 2);
-const rightX = +(TABLE_GAP / 2 + TABLE_WIDTH / 2);
-
-  // Utility: clamp line count without mod.Min
-  function clampLines(n: number): number {
-    let out = n;
-    if (out > POSTMATCH_MAX_LINES) out = POSTMATCH_MAX_LINES;
-    if (out < 0) out = 0;
-    return out;
-  }
-
-  // Build a full view for a specific receiver team:
-  // left side = friendly team data, right side = enemy team data.
   function buildForReceiver(
     receiver: mod.Team,
-    friendlyList: Player[],
-    enemyList: Player[],
-    friendlyTicketsA: number,
-    friendlyTicketsB: number,
+    friendlyScore: number,
+    enemyScore: number,
     resultKey: any
   ): void {
-    // Result text (color depends on result)
     const resultColor =
       resultKey === mod.stringkeys.PostMatchVictory ? COLOR_FRIENDLY :
       resultKey === mod.stringkeys.PostMatchDefeat ? COLOR_ENEMY :
       COLOR_NEUTRAL;
 
-    addPostMatchText("PM_Result_" + modlib.getTeamId(receiver), 0, 80, 800, 80, 64, resultColor, 1, receiver);
-    setPostMatchText("PM_Result_" + modlib.getTeamId(receiver), mod.Message(resultKey));
+    const teamSuffix = String(modlib.getTeamId(receiver));
+    addPostMatchText(
+      "PM_Result_" + teamSuffix,
+      0,
+      POSTMATCH_RESULT_TEXT_Y,
+      POSTMATCH_RESULT_TEXT_WIDTH,
+      POSTMATCH_RESULT_TEXT_HEIGHT,
+      60,
+      resultColor,
+      1,
+      receiver,
+      mod.UIAnchor.Center
+    );
+    setPostMatchText("PM_Result_" + teamSuffix, mod.Message(resultKey));
 
-    // Final tickets line (friendly-enemy from viewer perspective)
-    addPostMatchText("PM_Tickets_" + modlib.getTeamId(receiver), 0, 150, 900, 40, 28, COLOR_NEUTRAL, 1, receiver);
+    addPostMatchText(
+      "PM_FriendlyScore_" + teamSuffix,
+      -110,
+      POSTMATCH_SCORE_TEXT_Y,
+      POSTMATCH_SCORE_TEXT_WIDTH,
+      POSTMATCH_SCORE_TEXT_HEIGHT,
+      40,
+      COLOR_FRIENDLY,
+      1,
+      receiver,
+      mod.UIAnchor.Center
+    );
     setPostMatchText(
-      "PM_Tickets_" + modlib.getTeamId(receiver),
-      mod.Message(mod.stringkeys.PostMatchFinalTickets, mod.Ceiling(friendlyTicketsA), mod.Ceiling(friendlyTicketsB))
+      "PM_FriendlyScore_" + teamSuffix,
+      mod.Message((mod.stringkeys as any).PostMatchScoreValue, mod.Ceiling(friendlyScore))
     );
 
-    // Headers (left = friendly, right = enemy)
-    function addHeaders(side: "L" | "R", x: number, color: mod.Vector): void {
-      const suffix = side + "_" + modlib.getTeamId(receiver);
+    addPostMatchText(
+      "PM_ScoreSeparator_" + teamSuffix,
+      0,
+      POSTMATCH_SCORE_TEXT_Y,
+      80,
+      POSTMATCH_SCORE_TEXT_HEIGHT,
+      38,
+      COLOR_NEUTRAL,
+      1,
+      receiver,
+      mod.UIAnchor.Center
+    );
+    setPostMatchText("PM_ScoreSeparator_" + teamSuffix, mod.Message(mod.stringkeys.Dash));
 
-      addPostMatchText("H_Name_" + suffix, x - 220, headerY, 280, 24, 18, color, 1, receiver);
-      addPostMatchText("H_Score_" + suffix, x + 120, headerY, 90, 24, 18, color, 1, receiver);
-      addPostMatchText("H_K_" + suffix, x + 200, headerY, 40, 24, 18, color, 1, receiver);
-      addPostMatchText("H_D_" + suffix, x + 245, headerY, 40, 24, 18, color, 1, receiver);
-      addPostMatchText("H_A_" + suffix, x + 290, headerY, 40, 24, 18, color, 1, receiver);
-      addPostMatchText("H_C_" + suffix, x + 345, headerY, 60, 24, 18, color, 1, receiver);
+    addPostMatchText(
+      "PM_EnemyScore_" + teamSuffix,
+      110,
+      POSTMATCH_SCORE_TEXT_Y,
+      POSTMATCH_SCORE_TEXT_WIDTH,
+      POSTMATCH_SCORE_TEXT_HEIGHT,
+      40,
+      COLOR_ENEMY,
+      1,
+      receiver,
+      mod.UIAnchor.Center
+    );
+        setPostMatchText(
+      "PM_EnemyScore_" + teamSuffix,
+      mod.Message((mod.stringkeys as any).PostMatchScoreValue, mod.Ceiling(enemyScore))
+    );
 
-      setPostMatchText("H_Name_" + suffix, mod.Message(mod.stringkeys.PostMatchHeaderName));
-      setPostMatchText("H_Score_" + suffix, mod.Message(mod.stringkeys.PostMatchHeaderScore));
-      setPostMatchText("H_K_" + suffix, mod.Message(mod.stringkeys.PostMatchHeaderKills));
-      setPostMatchText("H_D_" + suffix, mod.Message(mod.stringkeys.PostMatchHeaderDeaths));
-      setPostMatchText("H_A_" + suffix, mod.Message(mod.stringkeys.PostMatchHeaderAssists));
-      setPostMatchText("H_C_" + suffix, mod.Message(mod.stringkeys.PostMatchHeaderCaptures));
-    }
-
-    addHeaders("L", leftX, COLOR_FRIENDLY);
-    addHeaders("R", rightX, COLOR_ENEMY);
-
-    // Friendly rows (left)
-    const friendlyLines = clampLines(friendlyList.length);
-    for (let i = 0; i < friendlyLines; i++) {
-      const y = rowStartY + i * rowH;
-      const p = friendlyList[i];
-      const s = p.getScoreboardSnapshot();
-      const suf = "L_" + modlib.getTeamId(receiver) + "_" + i;
-
-      addPostMatchText("N_" + suf, leftX - 220, y, 280, 22, 16, COLOR_FRIENDLY, 1, receiver);
-      addPostMatchText("S_" + suf, leftX + 120, y, 90, 22, 16, COLOR_NEUTRAL, 1, receiver);
-      addPostMatchText("K_" + suf, leftX + 200, y, 40, 22, 16, COLOR_NEUTRAL, 1, receiver);
-      addPostMatchText("D_" + suf, leftX + 245, y, 40, 22, 16, COLOR_NEUTRAL, 1, receiver);
-      addPostMatchText("A_" + suf, leftX + 290, y, 40, 22, 16, COLOR_NEUTRAL, 1, receiver);
-      addPostMatchText("C_" + suf, leftX + 345, y, 60, 22, 16, COLOR_NEUTRAL, 1, receiver);
-
-      setPostMatchText("N_" + suf, mod.Message(mod.stringkeys.PostMatchPlayerName, p.player));
-      setPostMatchText("S_" + suf, mod.Message(s[0]));
-      setPostMatchText("K_" + suf, mod.Message(s[1]));
-      setPostMatchText("D_" + suf, mod.Message(s[2]));
-      setPostMatchText("A_" + suf, mod.Message(s[3]));
-      setPostMatchText("C_" + suf, mod.Message(s[4]));
-    }
-
-    // Enemy rows (right) in COLOR_ENEMY for the name column
-    const enemyLines = clampLines(enemyList.length);
-    for (let i = 0; i < enemyLines; i++) {
-      const y = rowStartY + i * rowH;
-      const p = enemyList[i];
-      const s = p.getScoreboardSnapshot();
-      const suf = "R_" + modlib.getTeamId(receiver) + "_" + i;
-
-      addPostMatchText("N_" + suf, rightX - 220, y, 280, 22, 16, COLOR_ENEMY, 1, receiver);
-      addPostMatchText("S_" + suf, rightX + 120, y, 90, 22, 16, COLOR_NEUTRAL, 1, receiver);
-      addPostMatchText("K_" + suf, rightX + 200, y, 40, 22, 16, COLOR_NEUTRAL, 1, receiver);
-      addPostMatchText("D_" + suf, rightX + 245, y, 40, 22, 16, COLOR_NEUTRAL, 1, receiver);
-      addPostMatchText("A_" + suf, rightX + 290, y, 40, 22, 16, COLOR_NEUTRAL, 1, receiver);
-      addPostMatchText("C_" + suf, rightX + 345, y, 60, 22, 16, COLOR_NEUTRAL, 1, receiver);
-
-      setPostMatchText("N_" + suf, mod.Message(mod.stringkeys.PostMatchPlayerName, p.player));
-      setPostMatchText("S_" + suf, mod.Message(s[0]));
-      setPostMatchText("K_" + suf, mod.Message(s[1]));
-      setPostMatchText("D_" + suf, mod.Message(s[2]));
-      setPostMatchText("A_" + suf, mod.Message(s[3]));
-      setPostMatchText("C_" + suf, mod.Message(s[4]));
-    }
+    addPostMatchText(
+      "PM_MapHint_" + teamSuffix,
+      0,
+      POSTMATCH_HINT_TEXT_Y,
+      POSTMATCH_HINT_TEXT_WIDTH,
+      POSTMATCH_HINT_TEXT_HEIGHT,
+      POSTMATCH_HINT_TEXT_SIZE,
+      COLOR_NEUTRAL,
+      1,
+      receiver,
+      mod.UIAnchor.Center
+    );
+    setPostMatchText(
+      "PM_MapHint_" + teamSuffix,
+      mod.Message((mod.stringkeys as any).PostMatchStatsMapHint)
+    );
   }
 
-  // Determine result per receiver team
   const t1ResultKey =
     mod.Equals(winner, team1) ? mod.stringkeys.PostMatchVictory :
     mod.Equals(winner, team2) ? mod.stringkeys.PostMatchDefeat :
@@ -17364,11 +20350,8 @@ const rightX = +(TABLE_GAP / 2 + TABLE_WIDTH / 2);
     mod.Equals(winner, team1) ? mod.stringkeys.PostMatchDefeat :
     mod.stringkeys.PostMatchDraw;
 
-  // Team 1 viewers: left = team1 (friendly), right = team2 (enemy)
-  buildForReceiver(team1, t1List, t2List, serverScores[0], serverScores[1], t1ResultKey);
-
-  // Team 2 viewers: left = team2 (friendly), right = team1 (enemy)
-  buildForReceiver(team2, t2List, t1List, serverScores[1], serverScores[0], t2ResultKey);
+  buildForReceiver(team1, serverScores[0], serverScores[1], t1ResultKey);
+  buildForReceiver(team2, serverScores[1], serverScores[0], t2ResultKey);
 }
 
 function InitializePostmatch(): void {
@@ -17380,6 +20363,7 @@ function InitializePostmatch(): void {
     postmatchEndStep = 0;
     postmatchEndStepTick = 0;
     postmatchEndStepAtSec = 0;
+    mod.SetSpawnMode(mod.SpawnModes.AutoSpawn);
     setPhaseCountdownDeadlineFromNow(POSTMATCH_TIME);
     resetEngineSchedulerCadenceState();
     setLiveScorePanelVisible(false);
@@ -17389,37 +20373,33 @@ function InitializePostmatch(): void {
     syncDisabledBombAnchorObjectives();
     StopAllObjectiveMcomSfx();
     hideAllObjectiveArmedWorldIcons();
+    resetCipherNodeStates("InitializePostmatch");
     resetBombCarrierRuntimeState(true);
     enforceReadyupHqsDisabledOutsidePrematch("InitializePostmatch");
 
     SafeSetWidgetVisibleByName("LiveContainer", false);
     SetCountdownOverlayVisible(false);
     hideCipherTransitionHudForAllPlayers();
-    SafeSetWidgetVisibleByName("PreMatchContainer", false);
+    hideCipherSuddenDeathAliveHudForAllPlayers();
+    HidePrematchUiForTransition();
     StopAllCaptureTickLoops();
     StopAllEndgameLoops();
-
-
+    applyPostmatchShowcaseCameraAndInputForAllPlayers();
 
     const post = mod.FindUIWidgetWithName("PostMatchContainer");
     if (post) {
       SafeSetWidgetVisibleHandle(post, true);
       mod.SetUIWidgetDepth(post, mod.UIDepth.AboveGameUI);
-      SafeSetWidgetSizeHandle(post, mod.CreateVector(6000, 5000, 0));
+      SafeSetWidgetSizeHandle(post, SAFE_UI_ROOT_SIZE);
     }
-
-    // Unlock players but keep them from interacting/shooting.
-    serverPlayers.forEach((p) => {
-      mod.EnableAllInputRestrictions(p.player, true);
-      mod.EnableInputRestriction(p.player, mod.RestrictedInputs.CameraPitch, false);
-      mod.EnableInputRestriction(p.player, mod.RestrictedInputs.CameraYaw, false);
-    });
 
     // Clamp scores for display.
     if (serverScores[0] < 0) serverScores[0] = 0;
     if (serverScores[1] < 0) serverScores[1] = 0;
 
     BuildPostMatchReportUI();
+    showPostmatchStatsMapHint();
+    beginPostmatchShowcase();
     playPostMatchResultSfxOnce();
     initOk = true;
   } catch (err) {
@@ -17841,7 +20821,7 @@ function forceReturnToPrematchFromTransitionFailure(source: string, err?: any): 
 }
 
 
-const MAIN_LOOP_INTERVAL_MS = 1;
+const MAIN_LOOP_INTERVAL_MS = 33;
 let mainLoopIntervalHandle: number | undefined = undefined;
 let damageZonePulseIntervalHandle: number | undefined = undefined;
 
@@ -17876,7 +20856,7 @@ function startMainLoopTimer(): void {
   stopMainLoopTimer();
   mainLoopIntervalHandle = Timers.setInterval(() => {
     OngoingGlobal_Inner();
-  }, MAIN_LOOP_INTERVAL_MS, true);
+  }, MAIN_LOOP_INTERVAL_MS);
 }
 
 function Mode_OnGameModeStarted(): void {
@@ -17884,6 +20864,7 @@ function Mode_OnGameModeStarted(): void {
   startMainLoopTimer();
   resetLifecycleStateForFreshMatchStart();
   SetDepthAboveGameUI("PreMatchContainer");
+  SetDepthAboveGameUI(PREMATCH_PANEL_WIDGET_NAME);
   SetCountdownOverlayVisible(false);
 
   refreshObjectiveResolvedMcomAliases("Mode_OnGameModeStarted");
@@ -17911,78 +20892,24 @@ function Mode_OnGameModeStarted(): void {
   for (let i = 0; i < fireVfx.length; i++) {
     mod.EnableVFX(fireVfx[i], true);
   }
-  SafeSetWidgetVisibleByName("PreMatchContainer", true);
+  ShowPrematchUi();
   refreshPrematchReadyStateUi();
 }
 function Mode_OnGameModeEnding(): void {
   stopMainLoopTimer();
   stopDamageZonePulseTimer();
+  clearRuntimeBotState(true);
   stopAllObjectiveAwardBursts();
   StopAllObjectiveMcomSfx();
   hideAllObjectiveArmedWorldIcons();
+  resetCipherNodeStates("Mode_OnGameModeEnding");
   resetBombCarrierRuntimeState(true);
   clearVoModuleState();
 }
 
 function Mode_OngoingGlobal(): void {
-  try {
-    runCipherHotLaneFromOngoingGlobal();
-  } catch (err) {
-    LogRuntimeError("Mode_OngoingGlobal", err);
-  }
-}
-
-function getHotLaneNowSeconds(): number {
-  const engineNowSec = tryGetEngineMatchTimeElapsedSeconds();
-  const useEngineSchedulerFrame = shouldUseEngineScheduler(engineNowSec);
-  currentFrameHasEngineNowSec = useEngineSchedulerFrame;
-  currentFrameNowSec = useEngineSchedulerFrame ? (engineNowSec as number) : serverTickCount / TICK_RATE;
-  return currentFrameNowSec;
-}
-
-function warnCipherHotLaneFallbackOnce(nowSec: number): void {
-  if (!shouldEmitStringKeyDebugWorldLogs()) return;
-  if (cipherHotLaneFallbackWarned) return;
-  cipherHotLaneFallbackWarned = true;
-  emitStringKeyDebugWorldLog(
-    mod.Message("[CIPHER HOTLANE] OngoingGlobal fallback active at {}", mod.Ceiling(nowSec))
-  );
-}
-
-function runCipherCarrierHotLaneFrame(sampleNowSec: number, source: string): void {
-  if (!gameModeStarted) return;
-  if (gameStatus !== 3 || initialization[3] !== true) return;
-  if (bombCarrierPlayerId === undefined) return;
-
-  EvaluateBombCarrierManualSlotSwitchAndLock();
-  if (bombCarrierPlayerId !== undefined) {
-    syncCipherCarrierVisualsNow(sampleNowSec, source);
-  }
-  UpdateBombCarrierUiForAllPlayers(sampleNowSec);
-}
-
-function runCipherHotLaneFromOngoingGlobal(): void {
-  if (!gameModeStarted) return;
-  if (gameStatus !== 3 || initialization[3] !== true) return;
-  if (bombCarrierPlayerId === undefined) return;
-
-  const hotLaneNowSec = getHotLaneNowSeconds();
-  const visualNowSec = ENABLE_CARRIER_SUBTICK ? getVisualSubtickNowSec() : hotLaneNowSec;
-  lastCipherHotLaneRunAtSec = hotLaneNowSec;
-  runCipherCarrierHotLaneFrame(visualNowSec, "ongoing_global_hot_lane");
-}
-
-function runCipherHotLaneFallbackIfNeeded(nowSec: number): void {
-  if (!gameModeStarted) return;
-  if (gameStatus !== 3 || initialization[3] !== true) return;
-  if (bombCarrierPlayerId === undefined) return;
-  if (lastCipherHotLaneRunAtSec > 0 && nowSec - lastCipherHotLaneRunAtSec <= CIPHER_HOT_LANE_FALLBACK_AFTER_SECONDS) {
-    return;
-  }
-
-  warnCipherHotLaneFallbackOnce(nowSec);
-  lastCipherHotLaneRunAtSec = nowSec;
-  runCipherCarrierHotLaneFrame(nowSec, "heavy_loop_hot_lane_fallback");
+  // Intentionally lightweight. Main loop logic runs through Timers.
+  return;
 }
 
 function OngoingGlobal_Inner(): void {
@@ -18081,15 +21008,14 @@ function OngoingGlobal_Inner(): void {
       return;
     }
 
-    runCipherHotLaneFallbackIfNeeded(nowSec);
-
     if (cipherSecondHalfTransitionActive || cipherSuddenDeathTransitionActive) {
       processTransitionSpawnQueue("cipher_live_phase_transition");
       processCipherSpawnJobs("cipher_live_phase_transition");
-      applyCipherSecondHalfDeployFreezeForReadyPlayers("cipher_live_phase_transition");
-      updateCipherCounterWorldIcons();
+      applyCipherTransitionInputLocksForPlayers("cipher_live_phase_transition");
       return;
     }
+
+    processLiveSafeSpawnQueues();
 
     const visualNowSec = ENABLE_CARRIER_SUBTICK ? getVisualSubtickNowSec() : nowSec;
 
@@ -18100,7 +21026,8 @@ function OngoingGlobal_Inner(): void {
     }
 
     updateDroppedBombWorldIconCountdown();
-   EvaluateResponsiveBombPickupRadiusScans();
+    EvaluateResponsiveBombPickupRadiusScans();
+    evaluateBotObjectiveController(nowSec);
     SetUITime(nowSec);
     UpdateObjectiveCaptureInteractionState();
     EvaluateObjectiveCaptureHoldAttempts();
@@ -18110,7 +21037,6 @@ function OngoingGlobal_Inner(): void {
       return;
     }
     UpdateObjectiveArmAlarmSfxState();
-    updateCipherCounterWorldIcons();
     UpdateObjectiveHoldProgressUiForAllPlayers(visualNowSec);
     UpdateDeployObjectiveTimerUiForAllPlayers();
     repairDirtyCipherKeyHudCaches(2);
@@ -18219,6 +21145,8 @@ function OngoingGlobal_Inner(): void {
       SetUIScores();
       UpdateScoreboard();
       UpdateCaptureTickLoopsGlobal();
+      updateCipherCounterWorldIcons(false);
+      updateCipherSuddenDeathAliveHudForAllPlayers();
       if (DEBUG_PERF_TELEMETRY) perfTelemetrySlowLaneRuns += 1;
     }
 
@@ -18231,61 +21159,9 @@ function OngoingGlobal_Inner(): void {
       InitializePostmatch();
       if (!initialization[4]) return;
     }
-    // --- Sequenced end flow (tick-based, deterministic order) ---
+    updatePostmatchShowcaseWorldIconPositions();
     if (postmatchEndStep !== 0) {
-      if (useEngineSchedulerFrame) {
-        // Step 1: Undeploy everyone on a new frame before ending the mode.
-        if (postmatchEndStep === 1) {
-          if (nowSec - postmatchEndStepAtSec >= POSTMATCH_END_STEP_ADVANCE_SECONDS) {
-            mod.UndeployAllPlayers();
-            postmatchEndStep = 2;
-            postmatchEndStepTick = serverTickCount;
-            postmatchEndStepAtSec = nowSec;
-          }
-          return;
-        }
-
-        // Step 2: End the gamemode after the undeploy frame has settled.
-        if (postmatchEndStep === 2) {
-          if (nowSec - postmatchEndStepAtSec >= POSTMATCH_END_STEP_ADVANCE_SECONDS) {
-            mod.EndGameMode(postmatchWinnerTeam);
-            postmatchEndStep = 3;
-            postmatchEndStepTick = serverTickCount;
-            postmatchEndStepAtSec = nowSec;
-          }
-          return;
-        }
-
-        if (postmatchEndStep === 3) {
-          return;
-        }
-      } else {
-        // Step 1: Undeploy everyone on a new tick before ending the mode.
-        if (postmatchEndStep === 1) {
-          if (serverTickCount - postmatchEndStepTick >= POSTMATCH_END_STEP_ADVANCE_TICKS) {
-            mod.UndeployAllPlayers();
-            postmatchEndStep = 2;
-            postmatchEndStepTick = serverTickCount;
-            postmatchEndStepAtSec = nowSec;
-          }
-          return;
-        }
-
-        // Step 2: End the gamemode after the undeploy tick has settled.
-        if (postmatchEndStep === 2) {
-          if (serverTickCount - postmatchEndStepTick >= POSTMATCH_END_STEP_ADVANCE_TICKS) {
-            mod.EndGameMode(postmatchWinnerTeam);
-            postmatchEndStep = 3;
-            postmatchEndStepTick = serverTickCount;
-            postmatchEndStepAtSec = nowSec;
-          }
-          return;
-        }
-
-        if (postmatchEndStep === 3) {
-          return;
-        }
-      }
+      return;
     }
 
     let postmatchSecondDue = false;
@@ -18304,12 +21180,8 @@ function OngoingGlobal_Inner(): void {
     }
 
     if (postmatchSecondDue && countDown === 0) {
-      // Hide postmatch overlay
-      const post = mod.FindUIWidgetWithName("PostMatchContainer");
-      if (post) mod.SetUIWidgetVisible(post, false);
-
-      // Start the sequenced end flow (next ticks)
-      postmatchEndStep = 1;
+      mod.EndGameMode(postmatchWinnerTeam);
+      postmatchEndStep = 3;
       postmatchEndStepTick = serverTickCount;
       postmatchEndStepAtSec = nowSec;
       return;
@@ -18337,6 +21209,7 @@ function Mode_OnPlayerJoinGame(eventPlayer: mod.Player): void {
     let player: Player | undefined;
 
     const joiningId = modlib.getPlayerId(eventPlayer);
+    void isBotBackfillPlayerSafe(eventPlayer);
 
     // IMPORTANT:
     // This event can be triggered multiple times for the same player (deploy/respawn/ongoing player rule).
@@ -18395,7 +21268,7 @@ function Mode_OnPlayerJoinGame(eventPlayer: mod.Player): void {
       if (player) replacePrematchReadyText(player.id, eventPlayer);
       refreshPrematchReadyStateUi();
     } else if (gameStatus === 3) {
-      SafeSetWidgetVisibleByName("PreMatchContainer", false);
+      HidePrematchUiForTransition();
       SafeSetWidgetVisibleByName("LiveContainer", true);
 
       // Keep shared fills hidden for join-in-progress players as well.
@@ -18413,8 +21286,17 @@ function Mode_OnPlayerJoinGame(eventPlayer: mod.Player): void {
           requestTransitionSpawn(player.id, "join_live_phase_transition");
         }
       }
+      runtimeBotNextReconcileAtSec = 0;
     } else if (gameStatus === 2 && player) {
       requestTransitionSpawn(player.id, "join_prelive");
+    } else if (gameStatus === 4) {
+      SafeSetWidgetVisibleByName("PostMatchContainer", true);
+      applyPostmatchInputStateForPlayer(eventPlayer);
+      setPostmatchShowcaseCameraForPlayer(eventPlayer, true);
+      if (player) {
+        const slot = findPostmatchShowcaseSlotForPlayerId(player.id);
+        if (slot) applyPostmatchShowcaseSlot(slot);
+      }
     }
     refreshCipherKeyPlayerSnapshots("OnPlayerJoinGame");
   } catch (err) {
@@ -18430,13 +21312,17 @@ function Mode_OnPlayerLeaveGame(eventNumber: number): void {
     if (!leaving) leaving = serverPlayers.get(eventNumber);
 
     if (!leaving) return;
+    const leavingRuntimeSlot = getRuntimeBotSlotForPlayerId(leaving.id);
+    const leavingIsRuntimeBot = leavingRuntimeSlot !== undefined || runtimeBotReleasedPlayerId[leaving.id] === true;
     cleanupRestrictedAreaUiForPlayer(leaving.id);
+    deleteCipherSuddenDeathAliveHudForPlayer(leaving.id);
+    resetCipherSuddenDeathAliveHudRefsForPlayer(leaving);
     // Ensure HUD can be rebuilt cleanly if the engine destroys UI widgets on disconnect.
     liveHudBuiltByPlayerId[leaving.id] = false;
 
-
-
-    mod.DisplayHighlightedWorldLogMessage(mod.Message(mod.stringkeys.PlayerDisconnected, leaving.id));
+    if (!leavingIsRuntimeBot) {
+      mod.DisplayHighlightedWorldLogMessage(mod.Message(mod.stringkeys.PlayerDisconnected, leaving.id));
+    }
     if (gameStatus === 3 && bombCarrierPlayerId === leaving.id) {
       const leavePos = tryGetPlayerPositionSafe(leaving.player);
       if (leavePos) lastKnownLivePositionByPlayerId[leaving.id] = leavePos;
@@ -18445,8 +21331,20 @@ function Mode_OnPlayerLeaveGame(eventNumber: number): void {
 
     cancelObjectiveCaptureAttemptsForPlayer(leaving.id);
 
-    disconnectedPlayers.push(leaving);
+    if (!leavingIsRuntimeBot) disconnectedPlayers.push(leaving);
     serverPlayers.delete(leaving.id);
+
+    if (gameStatus === 4 && postmatchEndStep === 0) {
+      beginPostmatchShowcase();
+    }
+
+    if (isCipherSuddenDeathActive()) {
+      updateCipherSuddenDeathAliveHudForAllPlayers();
+      const winner = resolveCipherSuddenDeathEliminationWinner();
+      if (!mod.Equals(winner, teamNeutral)) {
+        enterPostmatchFromLive(winner);
+      }
+    }
 
     if (gameStatus === 3 && initialization[3] === true) {
       syncLiveHybridObjectiveSurfaceState("Mode_OnPlayerLeaveGame");
@@ -18454,7 +21352,13 @@ function Mode_OnPlayerLeaveGame(eventNumber: number): void {
 
     clearBombCarrierDeployRestoreCacheForPlayer(leaving.id);
     delete lastKnownLivePositionByPlayerId[leaving.id];
+    clearQueuedSafeSpawnStateForPlayer(leaving.id);
+    delete safeSpawnGenerationByPlayerId[leaving.id];
+    delete safeSpawnUnsafePending[leaving.id];
+    delete safeSpawnUnsafeSpawnerObjId[leaving.id];
     delete safeSpawnUnsafeHqObjIdByPlayerId[leaving.id];
+    delete safeSpawnForcedRedeploys[leaving.id];
+    delete safeSpawnForcedUndeploy[leaving.id];
     delete lastLiveHqSpawnPointObjIdByPlayerId[leaving.id];
     delete lastForcedSafeSpawnHqObjIdByPlayerId[leaving.id];
     delete transitionSpawnRequestedByPlayerId[leaving.id];
@@ -18464,10 +21368,19 @@ function Mode_OnPlayerLeaveGame(eventNumber: number): void {
     delete cipherSecondHalfDeployReadyByPlayerId[leaving.id];
     delete cipherTransitionTeleportedByPlayerId[leaving.id];
     delete cipherSecondHalfFrozenByPlayerId[leaving.id];
+    delete postmatchShowcaseCameraAppliedByPlayerId[leaving.id];
     delete bombNoticeMessageKeyByPlayerId[leaving.id];
     delete bombNoticeFallbackTextByPlayerId[leaving.id];
     delete bombNoticeVisibleUntilSecByPlayerId[leaving.id];
     delete bombNoticeTokenByPlayerId[leaving.id];
+    delete botBackfillKnownByPlayerId[leaving.id];
+    delete runtimeBotReleasedPlayerId[leaving.id];
+    if (leavingRuntimeSlot && !leavingRuntimeSlot.retired) {
+      clearRuntimeBotPlayerBinding(leavingRuntimeSlot, false);
+      leavingRuntimeSlot.nextSpawnAtSec = getCurrentSchedulerNowSeconds() + CIPHER_RUNTIME_BOT_RESPAWN_DELAY_SECONDS;
+      runtimeBotNextReconcileAtSec = 0;
+    }
+    clearBotObjectiveStateForPlayer(leaving.id);
     clearCipherKeyHudCacheForPlayer(leaving.id);
     delete prematchSwitchLastHandledTickByPlayerId[leaving.id];
     delete prematchSwitchDebounceWarnedByPlayerId[leaving.id];
@@ -18478,7 +21391,7 @@ function Mode_OnPlayerLeaveGame(eventNumber: number): void {
     clearAllObjectiveAreaTriggerStateForPlayer(leaving.id);
     clearCipherPresenceForPlayer(leaving.id);
 
-    if (gameStatus === 3) {
+    if (gameStatus === 3 && !leavingIsRuntimeBot) {
       leaving.addDeath();
 
       const cp = leaving.getCapturePoint();
@@ -18501,6 +21414,10 @@ async function Mode_OnPlayerDeployed(eventPlayer: mod.Player): Promise<void> {
   try {
     const playerId = modlib.getPlayerId(eventPlayer);
     const team = mod.GetTeam(eventPlayer);
+    const deployedRuntimeBotSlot = getRuntimeBotSlotForPlayerId(playerId);
+    const deployedIsBot = deployedRuntimeBotSlot !== undefined;
+    delete botLiveSpawnRequestedByPlayerId[playerId];
+    delete botLiveSpawnNextAttemptAtSecByPlayerId[playerId];
     cancelPendingRestrictedLethalConfirmForPlayer(playerId);
     clearRestrictedAreaFeedbackSuppressionForPlayer(playerId);
     hideDeployObjectiveTimerUiForPlayer(playerId);
@@ -18542,7 +21459,6 @@ async function Mode_OnPlayerDeployed(eventPlayer: mod.Player): Promise<void> {
         pPre.isDeployed = true;
       }
       applyPrematch889HealthForPlayer(playerId);
-      void cacheBombCarrierDeployRestoreEquipmentForPlayer(playerId, eventPlayer);
       requestCipherSpawnAnchorForPlayer(playerId, true);
       requestCipherSpawnTeleportForPlayer(playerId, true);
       processCipherSpawnJobs("OnPlayerDeployed_Prelive");
@@ -18550,6 +21466,19 @@ async function Mode_OnPlayerDeployed(eventPlayer: mod.Player): Promise<void> {
       if (bombCarrierPlayerId === playerId) {
         syncCipherCarrierVisualsNow(getCurrentSchedulerNowSeconds(), "OnPlayerDeployed_Prelive");
       }
+      return;
+    }
+
+    if (gameStatus === 4) {
+      const pPost = serverPlayers.get(playerId);
+      if (pPost) {
+        pPost.team = team;
+        pPost.isDeployed = true;
+      }
+      applyPostmatchInputStateForPlayer(eventPlayer);
+      setPostmatchShowcaseCameraForPlayer(eventPlayer, true);
+      const slot = findPostmatchShowcaseSlotForPlayerId(playerId);
+      if (slot) applyPostmatchShowcaseSlot(slot);
       return;
     }
 
@@ -18561,6 +21490,7 @@ async function Mode_OnPlayerDeployed(eventPlayer: mod.Player): Promise<void> {
     p.team = team;
     p.isDeployed = true;
     repairCipherKeyHudCacheForPlayer(p, true);
+    updateCipherSuddenDeathAliveHudForPlayer(p);
     if (isCipherSuddenDeathActive() && cipherSuddenDeathEliminatedByPlayerId[playerId] === true) {
       mod.SetRedeployTime(eventPlayer, 9999);
       mod.UndeployPlayer(eventPlayer);
@@ -18568,20 +21498,55 @@ async function Mode_OnPlayerDeployed(eventPlayer: mod.Player): Promise<void> {
     }
 
     if (isCipherLiveTransitionActive()) {
-      void cacheBombCarrierDeployRestoreEquipmentForPlayer(playerId, eventPlayer);
       handleCipherTransitionDeployedPlayer(playerId, eventPlayer, "OnPlayerDeployed_Transition");
       return;
     }
 
-    void cacheBombCarrierDeployRestoreEquipmentForPlayer(playerId, eventPlayer);
-    applyPrematch889HealthForPlayer(playerId);
-    recordLastLiveHqSpawnSourceFromDeploy(eventPlayer, playerId);
-    applyPhaseInputRestrictionsForPlayer(eventPlayer);
-  // If we spawned near ANY friendly player (<= 8m), do not allow safe-spawn recycling.
-    if (isSpawnNearFriendlyPlayer(eventPlayer, playerId, FRIENDLY_SPAWN_BYPASS_RADIUS_METERS)) {
+    if (deployedIsBot) {
+      if (deployedRuntimeBotSlot) {
+        mod.SetTeam(eventPlayer, deployedRuntimeBotSlot.desiredTeam);
+        p.team = deployedRuntimeBotSlot.desiredTeam;
+      }
+      configureRuntimeBotCombat(eventPlayer);
+      applyPrematch889HealthForPlayer(playerId);
+      applyPhaseInputRestrictionsForPlayer(eventPlayer);
+      mod.SetRedeployTime(eventPlayer, REDEPLOY_TIME);
       safeSpawnForcedRedeploys[playerId] = 0;
       safeSpawnForcedUndeploy[playerId] = false;
       safeSpawnUnsafePending[playerId] = false;
+      safeSpawnPendingCheck[playerId] = false;
+      bumpSafeSpawnGeneration(playerId);
+      clearQueuedSafeSpawnStateForPlayer(playerId);
+      hqDesyncForcedRedeploys[playerId] = 0;
+      p.isFirstDeploy();
+      requestCipherSpawnAnchorForPlayer(playerId, true);
+      processCipherSpawnJobs("OnPlayerDeployed_LiveBotAnchor");
+      requestCipherSpawnTeleportForPlayer(playerId, true);
+      processCipherSpawnJobs("OnPlayerDeployed_LiveBotTeleport");
+      teleportCipherPlayerToRoutedAnchor(eventPlayer, playerId);
+      SafeSpawnCheckOrRedeploy(playerId);
+      if (bombCarrierPlayerId === playerId) {
+        syncCipherCarrierVisualsNow(getCurrentSchedulerNowSeconds(), "OnPlayerDeployed_LiveBotTeleport");
+      }
+      botObjectiveNextThinkAtSec = 0;
+      return;
+    }
+
+    applyPrematch889HealthForPlayer(playerId);
+    recordLastLiveHqSpawnSourceFromDeploy(eventPlayer, playerId);
+    applyPhaseInputRestrictionsForPlayer(eventPlayer);
+    const enteringForcedSafeSpawnFlow = safeSpawnForcedUndeploy[playerId] === true;
+    if (!enteringForcedSafeSpawnFlow) {
+      bumpSafeSpawnGeneration(playerId);
+      clearQueuedSafeSpawnStateForPlayer(playerId);
+    }
+  // If we spawned near ANY friendly player (<= 8m), do not allow safe-spawn recycling.
+    if (isSpawnNearFriendlyPlayer(eventPlayer, playerId, FRIENDLY_SPAWN_BYPASS_RADIUS_METERS)) {
+      safeSpawnForcedRedeploys[playerId] = 0;
+      if (!enteringForcedSafeSpawnFlow) {
+        safeSpawnForcedUndeploy[playerId] = false;
+        safeSpawnUnsafePending[playerId] = false;
+      }
       // Optional: you can also stop the squad probe logic if you want.
     }
 
@@ -18596,8 +21561,10 @@ async function Mode_OnPlayerDeployed(eventPlayer: mod.Player): Promise<void> {
 
       // Reset forced redeploy counter so a squad spawn doesn't inherit prior "unsafe" history.
       safeSpawnForcedRedeploys[playerId] = 0;
-      safeSpawnForcedUndeploy[playerId] = false;
-      safeSpawnUnsafePending[playerId] = false;
+      if (!enteringForcedSafeSpawnFlow) {
+        safeSpawnForcedUndeploy[playerId] = false;
+        safeSpawnUnsafePending[playerId] = false;
+      }
     } else {
       squadSpawnBypass[playerId] = false;
 
@@ -18609,7 +21576,7 @@ async function Mode_OnPlayerDeployed(eventPlayer: mod.Player): Promise<void> {
     requestCipherSpawnAnchorForPlayer(playerId, true);
     processCipherSpawnJobs("OnPlayerDeployed_LiveAnchor");
 
-    const wasForced = safeSpawnForcedUndeploy[playerId] === true;
+    const wasForced = enteringForcedSafeSpawnFlow;
 
   // IMPORTANT: Do NOT overwrite the player's HQ routing while we are in a forced safe-spawn recycle.
   // We only "commit" the route after the safe-spawn check succeeds.
@@ -18624,24 +21591,7 @@ async function Mode_OnPlayerDeployed(eventPlayer: mod.Player): Promise<void> {
     // Keep first-deploy state transitions, but no score mutation on deploy/death in this mode.
     p.isFirstDeploy();
 
-    await SafeSpawnCheckOrRedeploy(eventPlayer, playerId);
-
-    if (safeSpawnUnsafePending[playerId] !== true) {
-      requestCipherSpawnTeleportForPlayer(playerId, true);
-      processCipherSpawnJobs("OnPlayerDeployed_LiveTeleport");
-      teleportCipherPlayerToRoutedAnchor(eventPlayer, playerId);
-      if (bombCarrierPlayerId === playerId) {
-        syncCipherCarrierVisualsNow(getCurrentSchedulerNowSeconds(), "OnPlayerDeployed_LiveTeleport");
-      }
-      markCipherSecondHalfDeployReadyForPlayer(playerId, eventPlayer);
-    }
-    
-    HqDesyncCheckAndRecycle(eventPlayer, playerId);
-
-
-    if (safeSpawnUnsafePending[playerId] !== true) {
-      safeSpawnForcedUndeploy[playerId] = false;
-    }
+    SafeSpawnCheckOrRedeploy(playerId);
   } catch (err) {
     LogRuntimeError("OnPlayerDeployed", err);
   } finally {
@@ -18655,6 +21605,9 @@ async function Mode_OnPlayerUndeploy(eventPlayer: mod.Player): Promise<void> {
     const p = serverPlayers.get(id);
     if (!p) return;
     const wasDeployed = p.isDeployed === true;
+    const undeployedIsBot = getRuntimeBotSlotForPlayerId(id) !== undefined;
+    const isForcedSafeSpawnFlowAtUndeploy =
+      safeSpawnUnsafePending[id] === true || safeSpawnForcedUndeploy[id] === true;
 
     // Reset damage spacing state on undeploy
     dmgSpreadClearForPlayer(eventPlayer);
@@ -18670,8 +21623,13 @@ async function Mode_OnPlayerUndeploy(eventPlayer: mod.Player): Promise<void> {
     resetRestrictedAreaStateForPlayer(id);
     clearAllObjectiveAreaTriggerStateForPlayer(id);
     clearCipherPresenceForPlayer(id);
+    if (!isForcedSafeSpawnFlowAtUndeploy) {
+      bumpSafeSpawnGeneration(id);
+      clearQueuedSafeSpawnStateForPlayer(id);
+    }
     cancelObjectiveCaptureAttemptsForPlayer(id);
     UpdateDeployObjectiveTimerUiForPlayer(p);
+    updateCipherSuddenDeathAliveHudForAllPlayers();
 
     if (gameStatus === 3 && initialization[3] === true) {
       syncLiveHybridObjectiveSurfaceState("Mode_OnPlayerUndeploy");
@@ -18721,40 +21679,24 @@ async function Mode_OnPlayerUndeploy(eventPlayer: mod.Player): Promise<void> {
       stopCaptureTickLoop(id);
     }
 
-    if (safeSpawnUnsafePending[id] === true) {
+    if (gameStatus === 3 && undeployedIsBot) {
+      safeSpawnForcedRedeploys[id] = 0;
+      safeSpawnForcedUndeploy[id] = false;
       safeSpawnUnsafePending[id] = false;
+      safeSpawnPendingCheck[id] = false;
+      hqDesyncForcedRedeploys[id] = 0;
+      requestLiveBotSpawnForPlayerId(id, "OnPlayerUndeploy_Live", CIPHER_RUNTIME_BOT_RESPAWN_DELAY_SECONDS);
+      p.addDeath();
+      return;
+    }
 
-      const pendingHqObjId = safeSpawnUnsafeHqObjIdByPlayerId[id];
-      const pendingSpawnerObjId = safeSpawnUnsafeSpawnerObjId[id];
+    if (safeSpawnUnsafePending[id] === true) {
+      if (safeSpawnForcedQueuedGenerationByPlayerId[id] !== undefined) return;
+
+      safeSpawnUnsafePending[id] = false;
       safeSpawnUnsafeHqObjIdByPlayerId[id] = 0;
       safeSpawnUnsafeSpawnerObjId[id] = 0;
-
-      // Keep the original 0.1s undeploy buffer, but add an extra 0.5s between redeploy attempts
-      await mod.Wait(0.1);
-      await mod.Wait(0.5);
-
-      const team = mod.GetTeam(eventPlayer);
-      // Pending spawner is intentionally not trusted as authority;
-      // final spawnpoint is always recomputed from sanitized team HQ id.
-      let resolvedHqObjId = sanitizeForcedSafeSpawnHqForTeam(team, pendingHqObjId);
-      if (!pendingHqObjId && !pendingSpawnerObjId) {
-        resolvedHqObjId = getDefaultLiveSafeSpawnHqObjIdForTeam(team);
-      }
-
-      let spawnerObjId = getLiveSafeSpawnPlayerSpawnerIdForHq(resolvedHqObjId);
-      if (!isValidLiveSafeSpawnPlayerSpawnerIdForTeam(team, spawnerObjId)) {
-        resolvedHqObjId = getDefaultLiveSafeSpawnHqObjIdForTeam(team);
-        spawnerObjId = getLiveSafeSpawnPlayerSpawnerIdForHq(resolvedHqObjId);
-      }
-
-      if (isValidLiveSafeSpawnPlayerSpawnerIdForTeam(team, spawnerObjId)) {
-        lastLiveHqSpawnPointObjIdByPlayerId[id] = resolvedHqObjId;
-        lastForcedSafeSpawnHqObjIdByPlayerId[id] = resolvedHqObjId;
-        mod.SetRedeployTime(eventPlayer, 0);
-        trySpawnPlayerFromSpawnPointSafe(eventPlayer, spawnerObjId, "OnPlayerUndeploy_SafeSpawnRecycle");
-      }
-
-      mod.SetRedeployTime(eventPlayer, REDEPLOY_TIME);
+      safeSpawnForcedUndeploy[id] = false;
       return;
     }
 
@@ -18793,10 +21735,6 @@ function Mode_OnPlayerInteract(eventPlayer: mod.Player, eventInteractPoint: mod.
         return;
       }
 
-      if (ipId === IP_SPECTATOR) {
-        mod.SetCameraTypeForPlayer(eventPlayer, mod.Cameras.Free);
-      }
-
       if (ipId === IP_T1_SWITCH || ipId === IP_T2_SWITCH) {
         const switchingId = modlib.getPlayerId(eventPlayer);
         if (bombCarrierPlayerId === switchingId) {
@@ -18816,6 +21754,13 @@ function Mode_OnPlayerInteract(eventPlayer: mod.Player, eventInteractPoint: mod.
         } else {
           mod.SetTeam(eventPlayer, team1);
           p?.setTeam();
+        }
+        updateCipherSuddenDeathAliveHudForAllPlayers();
+        if (isCipherSuddenDeathActive()) {
+          const winner = resolveCipherSuddenDeathEliminationWinner();
+          if (!mod.Equals(winner, teamNeutral)) {
+            enterPostmatchFromLive(winner);
+          }
         }
       }
     }
@@ -19367,6 +22312,7 @@ function Mode_OnPlayerDied(
   const playerId = modlib.getPlayerId(eventPlayer);
   invalidateBombCarrierRestoreInsertForPlayer(playerId);
   if (gameStatus !== 3) return;
+  markRuntimeBotSlotForRespawn(playerId, CIPHER_RUNTIME_BOT_RESPAWN_DELAY_SECONDS);
 
   playerInMandownByPlayerId[playerId] = true;
   deactivateRestrictedAreaFeedbackForPlayer(playerId, true);
@@ -19390,6 +22336,7 @@ function Mode_OnPlayerDied(
     forceBombDropFromCarrier(playerId, "death", deathPos);
   }
   consumeCipherSuddenDeathLife(playerId);
+  updateCipherSuddenDeathAliveHudForAllPlayers();
 }
 
 function Mode_OnPlayerEarnedKill(
@@ -19459,7 +22406,6 @@ function Mode_OnPlayerEnterAreaTrigger(eventPlayer: mod.Player, eventAreaTrigger
     if (!pBomb.isDeployed) return;
     if (!mod.IsPlayerValid(eventPlayer)) return;
     if (!isPlayerAlive(eventPlayer)) return;
-    if (isBotBackfillPlayer(eventPlayer)) return;
 
     const team = getCipherKeyTeamSnapshot(playerId) ?? pBomb.team;
     if (!mod.Equals(team, team1) && !mod.Equals(team, team2)) return;
@@ -19488,14 +22434,6 @@ function Mode_OnPlayerEnterAreaTrigger(eventPlayer: mod.Player, eventAreaTrigger
     return;
   }
 
-  const isBombCarrierHqDropZoneTrigger =
-    triggerId === TEAM1_HQ_PROTECTION_TRIGGER_ID ||
-    triggerId === TEAM2_HQ_PROTECTION_TRIGGER_ID;
-  if (bombCarrierPlayerId === playerId && isBombCarrierHqDropZoneTrigger) {
-    const carrierPos = tryGetPlayerPositionSafe(eventPlayer);
-    forceBombDropFromCarrier(playerId, "hq_area", carrierPos);
-  }
-
   // Existing damage zone
   if (triggerId === DAMAGE_TRIGGER_ID) {
     playerInDamageZone[playerId] = true;
@@ -19508,6 +22446,10 @@ function Mode_OnPlayerEnterAreaTrigger(eventPlayer: mod.Player, eventAreaTrigger
     if (!isRestrictedTriggerForPlayer(triggerId, playerTeam)) return;
 
     markRestrictedTriggerActive(playerId, triggerId);
+    if (bombCarrierPlayerId === playerId) {
+      const carrierPos = tryGetPlayerPositionSafe(eventPlayer);
+      forceBombDropFromCarrier(playerId, "restricted_area", carrierPos);
+    }
     startRestrictedCountdownIfNeeded(p);
 
     return;
@@ -19621,6 +22563,35 @@ function Mode_OngoingMCOM(eventMCOM: mod.MCOM): void {
   reapplyLiveHybridObjectiveSurfaceStateForCp(cpId, "Mode_OngoingMCOM");
 }
 
+function Mode_OnAIMoveToFailed(eventPlayer: mod.Player): void {
+  const playerId = getPlayerIdSafe(eventPlayer);
+  if (playerId === undefined) return;
+  if (!getRuntimeBotSlotForPlayerId(playerId)) return;
+
+  botObjectiveLastCommandAtSecByPlayerId[playerId] = -999999;
+  delete botObjectiveLastTargetByPlayerId[playerId];
+  botObjectiveNextThinkAtSec = 0;
+}
+
+function Mode_OnAIMoveToSucceeded(eventPlayer: mod.Player): void {
+  const playerId = getPlayerIdSafe(eventPlayer);
+  if (playerId === undefined) return;
+  if (!getRuntimeBotSlotForPlayerId(playerId)) return;
+  botObjectiveNextThinkAtSec = 0;
+}
+
+function Mode_OnSpawnerSpawned(eventPlayer: mod.Player, eventSpawner: mod.Spawner): void {
+  try {
+    const spawnerObjId = mod.GetObjId(eventSpawner as mod.Object);
+    const slot = getRuntimeBotSlotById(runtimeBotSlotBySpawnerObjId[spawnerObjId]);
+    if (!slot) return;
+    bindRuntimeBotPlayerToSlot(slot, eventPlayer);
+    refreshCipherKeyPlayerSnapshots("OnSpawnerSpawned");
+  } catch (err) {
+    LogRuntimeError("OnSpawnerSpawned_RuntimeBot", err);
+  }
+}
+
 export function isSquadObliterationLivePhase(): boolean {
   return gameStatus === 3;
 }
@@ -19648,6 +22619,12 @@ export const objectiveRuntimeHandlers = {
   onMcomArmed: Mode_OnMCOMArmed,
   onMcomDefused: Mode_OnMCOMDefused,
   onMcomDestroyed: Mode_OnMCOMDestroyed,
+};
+
+export const botRuntimeHandlers = {
+  onAiMoveToFailed: Mode_OnAIMoveToFailed,
+  onAiMoveToSucceeded: Mode_OnAIMoveToSucceeded,
+  onSpawnerSpawned: Mode_OnSpawnerSpawned,
 };
 
 export const combatRuntimeHandlers = {
