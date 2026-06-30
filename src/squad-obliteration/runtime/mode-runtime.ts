@@ -15738,18 +15738,34 @@ const CIPHER_SD_ALIVE_FRIENDLY_WIDGET_NAME_PREFIX = "CipherSuddenDeathFriendlyAl
 const CIPHER_SD_ALIVE_ENEMY_WIDGET_NAME_PREFIX = "CipherSuddenDeathEnemyAlive";
 const CIPHER_SD_ALIVE_FRIENDLY_SLOT_WIDGET_NAME_PREFIX = "CipherSuddenDeathFriendlyAliveSlot";
 const CIPHER_SD_ALIVE_ENEMY_SLOT_WIDGET_NAME_PREFIX = "CipherSuddenDeathEnemyAliveSlot";
+
 const CIPHER_SD_ALIVE_ROOT_SIZE = SAFE_UI_ROOT_SIZE;
-const CIPHER_SD_ALIVE_PANEL_POS = safeContentVectorFromTopLeft(38.03 + LIVE_BOTTOM_HUD_OFFSET_X, 566.56, 288.02, 88);
+
+// Center-anchor positioning.
+// Negative X = move left from screen center.
+// Positive Y = move down from screen center.
+const CIPHER_SD_ALIVE_PANEL_POS_X = -580;
+const CIPHER_SD_ALIVE_PANEL_POS_Y = 90;
+const CIPHER_SD_ALIVE_PANEL_POS = mod.CreateVector(
+  CIPHER_SD_ALIVE_PANEL_POS_X,
+  CIPHER_SD_ALIVE_PANEL_POS_Y,
+  0
+);
+
 const CIPHER_SD_ALIVE_PANEL_SIZE = mod.CreateVector(288.02, 88, 0);
-const CIPHER_SD_ALIVE_TEXT_SHIFT_X = -24;
-const CIPHER_SD_ALIVE_TITLE_POS = mod.CreateVector(CIPHER_SD_ALIVE_TEXT_SHIFT_X, -30, 0);
-const CIPHER_SD_ALIVE_FRIENDLY_POS = mod.CreateVector(-112 + CIPHER_SD_ALIVE_TEXT_SHIFT_X, -6, 0);
-const CIPHER_SD_ALIVE_ENEMY_POS = mod.CreateVector(-112 + CIPHER_SD_ALIVE_TEXT_SHIFT_X, 24, 0);
-const CIPHER_SD_ALIVE_SLOT_START_X = -68 + CIPHER_SD_ALIVE_TEXT_SHIFT_X;
+
+// Internal positions are centered relative to the panel.
+const CIPHER_SD_ALIVE_TITLE_POS = mod.CreateVector(0, -30, 0);
+const CIPHER_SD_ALIVE_FRIENDLY_POS = mod.CreateVector(-96, -6, 0);
+const CIPHER_SD_ALIVE_ENEMY_POS = mod.CreateVector(-96, 24, 0);
+
+const CIPHER_SD_ALIVE_SLOT_START_X = -48;
 const CIPHER_SD_ALIVE_SLOT_SPACING_X = 22;
+
 const CIPHER_SD_ALIVE_TITLE_SIZE = mod.CreateVector(260, 20, 0);
 const CIPHER_SD_ALIVE_LABEL_SIZE = mod.CreateVector(54, 22, 0);
 const CIPHER_SD_ALIVE_SLOT_SIZE = mod.CreateVector(20, 24, 0);
+
 const CIPHER_SD_ALIVE_TITLE_TEXT_SIZE = 16;
 const CIPHER_SD_ALIVE_LABEL_TEXT_SIZE = 13;
 const CIPHER_SD_ALIVE_SLOT_TEXT_SIZE = 18;
@@ -15856,7 +15872,7 @@ function rebuildCipherSuddenDeathAliveHudForPlayer(p: Player): void {
     CIPHER_SD_ALIVE_ROOT_SIZE,
     mod.UIAnchor.Center,
     uiRoot,
-    false,
+    true,
     0,
     mod.CreateVector(0, 0, 0),
     0,

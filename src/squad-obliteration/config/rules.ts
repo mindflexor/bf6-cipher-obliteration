@@ -10,7 +10,7 @@ export const RULES = {
     countdownTimeSeconds: 5,
     preliveTimeSeconds: 15,
     postmatchTimeSeconds: 20,
-    redeployTimeSeconds: 0,
+    redeployTimeSeconds: 10,
     objectiveInteractHoldSeconds: 4.5,
     objectiveArmedDestroySeconds: 45,
     bombReturnToBaseSeconds: 30,
