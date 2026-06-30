@@ -16427,11 +16427,28 @@ function hasAllRequiredCipherSecondHalfDeployersReady(): boolean {
 function requestForceDeployForMissingCipherSecondHalfPlayers(source: string): void {
   serverPlayers.forEach((p) => {
     if (!p || !mod.IsPlayerValid(p.player)) return;
-    if (cipherSecondHalfDeployReadyByPlayerId[p.id] === true) return;
+
+    // CRITICAL FIX:
+    // Only force-deploy players that are part of the required deploy gate.
+    // The old version touched every serverPlayers entry, including players that may not be required
+    // for the transition. That can keep transition spawn work alive during the 5-second countdown.
+    if (!isRequiredSecondHalfDeployPlayer(p)) {
+      delete cipherSecondHalfDeployRequiredByPlayerId[p.id];
+      delete cipherSecondHalfDeployReadyByPlayerId[p.id];
+      return;
+    }
+
+    if (cipherSecondHalfDeployRequiredByPlayerId[p.id] !== true) {
+      cipherSecondHalfDeployRequiredByPlayerId[p.id] = true;
+    }
+
+    if (cipherSecondHalfDeployReadyByPlayerId[p.id] === true && p.isDeployed) return;
+
     if (p.isDeployed) {
       handleCipherTransitionDeployedPlayer(p.id, p.player, source + "_already_deployed");
       return;
     }
+
     mod.SetRedeployTime(p.player, 0);
     requestTransitionSpawn(p.id, source);
   });
@@ -16471,19 +16488,6 @@ function handleCipherTransitionDeployedPlayer(playerId: number, player: mod.Play
   return true;
 }
 
-async function settleForcedCipherSecondHalfDeploys(source: string): Promise<void> {
-  const settleEndAtSec = getCurrentSchedulerNowSeconds() + CIPHER_SECOND_HALF_FORCE_DEPLOY_SETTLE_SECONDS;
-  while (gameStatus === 3 && (cipherSecondHalfTransitionActive || cipherSuddenDeathTransitionActive)) {
-    requestForceDeployForMissingCipherSecondHalfPlayers(source);
-    processTransitionSpawnQueue(source);
-    processCipherSpawnJobs(source);
-    applyCipherSecondHalfDeployFreezeForReadyPlayers(source);
-    if (hasAllRequiredCipherSecondHalfDeployersReady()) return;
-    if (getCurrentSchedulerNowSeconds() >= settleEndAtSec) return;
-    await mod.Wait(0.2);
-  }
-}
-
 function runCipherTransitionStepWorkSafe(source: string, forceDeployMissingPlayers: boolean): void {
   if (forceDeployMissingPlayers) {
     try {
@@ -16512,6 +16516,54 @@ function runCipherTransitionStepWorkSafe(source: string, forceDeployMissingPlaye
   }
 }
 
+function showCipherTransitionHudSafe(
+  source: string,
+  titleKey: any,
+  titleFallback: string,
+  subtitleKey: any,
+  subtitleFallback: string,
+  timerKey: any,
+  timerFallback: string,
+  secondsRemaining: number,
+  showDeployProgress: boolean
+): void {
+  try {
+    showCipherTransitionHudForAllPlayers(
+      titleKey,
+      titleFallback,
+      subtitleKey,
+      subtitleFallback,
+      timerKey,
+      timerFallback,
+      secondsRemaining,
+      showDeployProgress
+    );
+  } catch (err) {
+    LogRuntimeError("TransitionStep/showTransitionHud/" + source, err);
+  }
+}
+
+function playCountdownHeartbeatSafe(source: string, volume: number): void {
+  try {
+    playCountdownHeartbeatToAll(volume);
+  } catch (err) {
+    LogRuntimeError("TransitionStep/playCountdownHeartbeat/" + source, err);
+  }
+}
+
+async function settleForcedCipherSecondHalfDeploys(source: string): Promise<void> {
+  const settleEndAtSec = getCurrentSchedulerNowSeconds() + CIPHER_SECOND_HALF_FORCE_DEPLOY_SETTLE_SECONDS;
+
+  while (gameStatus === 3 && (cipherSecondHalfTransitionActive || cipherSuddenDeathTransitionActive)) {
+    runCipherTransitionStepWorkSafe(source, true);
+
+    if (hasAllRequiredCipherSecondHalfDeployersReady()) return;
+    if (getCurrentSchedulerNowSeconds() >= settleEndAtSec) return;
+
+    await mod.Wait(0.2);
+  }
+}
+
 async function runCipherTransitionDeployWindow(
   source: string,
   deployTitleKey: any,
@@ -16522,12 +16574,14 @@ async function runCipherTransitionDeployWindow(
   subtitleFallback: string
 ): Promise<void> {
   markCipherSecondHalfDeployRequiredPlayers();
+
   cipherTransitionDeployTitleKey = deployTitleKey;
   cipherTransitionDeployTitleFallback = deployTitleFallback;
   cipherTransitionStartsTitleKey = startsTitleKey;
   cipherTransitionStartsTitleFallback = startsTitleFallback;
   cipherTransitionSubtitleKey = subtitleKey;
   cipherTransitionSubtitleFallback = subtitleFallback;
+
   SetCountdownOverlayVisible(false);
 
   for (
@@ -16545,24 +16599,23 @@ async function runCipherTransitionDeployWindow(
 
     setCipherTransitionCountdownSeconds(remaining);
 
-    try {
-      showCipherTransitionHudForAllPlayers(
-        deployTitleKey,
-        deployTitleFallback,
-        subtitleKey,
-        subtitleFallback,
-        (mod.stringkeys as any).CipherForceDeployIn,
-        "FORCE DEPLOY IN {}",
-        remaining,
-        true
-      );
-    } catch (err) {
-      LogRuntimeError("TransitionDeployWindow/showDeployHud/" + source, err);
-    }
+    showCipherTransitionHudSafe(
+      source + "_deploy_hud_" + String(remaining),
+      deployTitleKey,
+      deployTitleFallback,
+      subtitleKey,
+      subtitleFallback,
+      (mod.stringkeys as any).CipherForceDeployIn,
+      "FORCE DEPLOY IN {}",
+      remaining,
+      true
+    );
 
     runCipherTransitionStepWorkSafe(source + "_deploy_" + String(remaining), false);
 
-    if (hasAllRequiredCipherSecondHalfDeployersReady()) break;
+    if (hasAllRequiredCipherSecondHalfDeployersReady()) {
+      break;
+    }
 
     await mod.Wait(1);
   }
@@ -16575,9 +16628,13 @@ async function runCipherTransitionDeployWindow(
     return;
   }
 
+  // Enter final countdown.
   cipherSecondHalfTransitionStage = "countdown";
   setCipherTransitionCountdownSeconds(CIPHER_SECOND_HALF_FINAL_COUNTDOWN_SECONDS);
 
+  // Do one safe settle pass before showing 5.
+  // This prevents the common freeze where the function sets countdown to 5 and then dies
+  // inside a force-deploy/spawn/HUD/freeze call.
   runCipherTransitionStepWorkSafe(source + "_countdown_enter", true);
 
   for (let remaining = CIPHER_SECOND_HALF_FINAL_COUNTDOWN_SECONDS; remaining > 0; remaining--) {
@@ -16593,31 +16650,28 @@ async function runCipherTransitionDeployWindow(
 
     runCipherTransitionStepWorkSafe(source + "_countdown_" + String(remaining), true);
 
-    try {
-      showCipherTransitionHudForAllPlayers(
-        startsTitleKey,
-        startsTitleFallback,
-        subtitleKey,
-        subtitleFallback,
-        (mod.stringkeys as any).CipherStartsIn,
-        "STARTS IN {}",
-        remaining,
-        true
-      );
-    } catch (err) {
-      LogRuntimeError("TransitionDeployWindow/showCountdownHud/" + source, err);
-    }
+    showCipherTransitionHudSafe(
+      source + "_countdown_hud_" + String(remaining),
+      startsTitleKey,
+      startsTitleFallback,
+      subtitleKey,
+      subtitleFallback,
+      (mod.stringkeys as any).CipherStartsIn,
+      "STARTS IN {}",
+      remaining,
+      true
+    );
 
-    try {
-      playCountdownHeartbeatToAll(remaining <= 3 ? 0.85 : 0.6);
-    } catch (err) {
-      LogRuntimeError("TransitionDeployWindow/playHeartbeat/" + source, err);
-    }
+    playCountdownHeartbeatSafe(
+      source + "_countdown_heartbeat_" + String(remaining),
+      remaining <= 3 ? 0.85 : 0.6
+    );
 
     await mod.Wait(1);
   }
 
   setCipherTransitionCountdownSeconds(0);
+
   runCipherTransitionStepWorkSafe(source + "_countdown_zero", true);
 }
 
@@ -16670,14 +16724,22 @@ async function runCipherHalftimeIntermission(reasonKey: any, reasonFallback: str
   cipherTransitionStartsTitleKey = (mod.stringkeys as any).CipherSecondHalfStarts;
   cipherTransitionStartsTitleFallback = "SECOND HALF STARTS IN";
   SetCountdownOverlayVisible(false);
-  showCipherPhaseNoticeForAllPlayers(reasonKey, reasonFallback, 3);
+
+  try {
+    showCipherPhaseNoticeForAllPlayers(reasonKey, reasonFallback, 3);
+  } catch (err) {
+    LogRuntimeError("HalftimeIntermission/showPhaseNotice", err);
+  }
 
   for (let remaining = CIPHER_HALFTIME_INTERMISSION_SECONDS; remaining > 0; remaining--) {
     if (gameStatus !== 3 || !cipherSecondHalfTransitionActive || cipherSecondHalfTransitionStage !== "intermission") {
       return;
     }
+
     setCipherTransitionCountdownSeconds(remaining);
-    showCipherTransitionHudForAllPlayers(
+
+    showCipherTransitionHudSafe(
+      "second_half_intermission_hud_" + String(remaining),
       cipherTransitionDeployTitleKey,
       cipherTransitionDeployTitleFallback,
       cipherTransitionSubtitleKey,
@@ -16687,7 +16749,13 @@ async function runCipherHalftimeIntermission(reasonKey: any, reasonFallback: str
       remaining,
       false
     );
-    applyCipherIntermissionFreezeForDeployedPlayers("second_half_intermission");
+
+    try {
+      applyCipherIntermissionFreezeForDeployedPlayers("second_half_intermission_" + String(remaining));
+    } catch (err) {
+      LogRuntimeError("HalftimeIntermission/applyFreeze", err);
+    }
+
     await mod.Wait(1);
   }
 }
