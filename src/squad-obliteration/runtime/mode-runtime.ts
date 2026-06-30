@@ -10138,6 +10138,46 @@ function isSpawnNearFriendlyPlayer(eventPlayer: mod.Player, playerId: number, ra
   return nearFriendly;
 }
 
+function isNativeFriendlyOrSquadSpawn(eventPlayer: mod.Player, playerId: number): boolean {
+  // Treat any live deploy within 8m of a living teammate as a native team/squad spawn.
+  // This intentionally uses TEAM proximity, not only squad proximity, because Portal squad detection can race
+  // right after deploy. This matches the behavior you want: do not custom-teleport if the player spawned
+  // beside a friendly.
+  if (isSpawnNearFriendlyPlayer(eventPlayer, playerId, FRIENDLY_SPAWN_BYPASS_RADIUS_METERS)) {
+    return true;
+  }
+
+  // Keep the stricter squad check too, in case team snapshot timing is weird but squad resolves correctly.
+  if (checkIfSpawnedOnSquadmate(eventPlayer)) {
+    return true;
+  }
+
+  return false;
+}
+
+function finishSafeSpawnAsNativeFriendlyOrSquadSpawn(eventPlayer: mod.Player, playerId: number): void {
+  // This is the critical difference from finishSafeSpawnAsSafe():
+  // DO NOT call finalizeSafeSpawnDeploySuccess(), because that function requests/executes
+  // teleportCipherPlayerToRoutedAnchor().
+  safeSpawnForcedRedeploys[playerId] = 0;
+  safeSpawnForcedUndeploy[playerId] = false;
+  safeSpawnUnsafePending[playerId] = false;
+  safeSpawnPendingCheck[playerId] = false;
+
+  commitPendingDynamicHqForPlayer(playerId);
+
+  squadSpawnBypass[playerId] = true;
+  void clearSquadSpawnBypassLater(playerId);
+
+  // If this deploy happened during the second-half/sudden-death transition,
+  // still mark the player ready so transition logic can continue.
+  markCipherSecondHalfDeployReadyForPlayer(playerId, eventPlayer);
+
+  if (bombCarrierPlayerId === playerId) {
+    syncCipherCarrierVisualsNow(getCurrentSchedulerNowSeconds(), "NativeFriendlyOrSquadSpawn_NoTeleport");
+  }
+}
+
 function isValidDynamicSpawnId(id: number): boolean {
   return id >= TEAM1_FLAG_A_HQ && id <= TEAM2_NO_FLAG_HQ;
 }
@@ -10285,6 +10325,14 @@ function runSafeSpawnCheckOrRedeploy(playerId: number, generation: number): void
     if (!p.isDeployed) return;
     if (!isPlayerAlive(eventPlayer)) return;
 
+    // FIRST: native friendly/squad spawn bypass.
+    // This must happen before the enemy unsafe check. If a player chose a squad/friendly spawn,
+    // we do not recycle or anchor-teleport them even if enemies are nearby.
+    if (isNativeFriendlyOrSquadSpawn(eventPlayer, playerId) || isSquadSpawnBypassActive(playerId)) {
+      finishSafeSpawnAsNativeFriendlyOrSquadSpawn(eventPlayer, playerId);
+      return;
+    }
+
     const team = mod.GetTeam(eventPlayer);
     const pos = getPlayerPosition(eventPlayer);
     const used = safeSpawnForcedRedeploys[playerId] ?? 0;
@@ -10293,21 +10341,6 @@ function runSafeSpawnCheckOrRedeploy(playerId: number, generation: number): void
 
     if (unsafe) {
       queueForcedSafeSpawnRetryForCurrentRoute(eventPlayer, playerId, "SafeSpawnCheck_Unsafe");
-      return;
-    }
-
-    if (isSpawnNearFriendlyPlayer(eventPlayer, playerId, FRIENDLY_SPAWN_BYPASS_RADIUS_METERS)) {
-      finishSafeSpawnAsSafe(eventPlayer, playerId);
-      return;
-    }
-
-    if (isSquadSpawnBypassActive(playerId)) {
-      finishSafeSpawnAsSafe(eventPlayer, playerId);
-      return;
-    }
-
-    if (checkIfSpawnedOnSquadmate(eventPlayer)) {
-      finishSafeSpawnAsSafe(eventPlayer, playerId);
       return;
     }
 
@@ -16451,6 +16484,34 @@ async function settleForcedCipherSecondHalfDeploys(source: string): Promise<void
   }
 }
 
+function runCipherTransitionStepWorkSafe(source: string, forceDeployMissingPlayers: boolean): void {
+  if (forceDeployMissingPlayers) {
+    try {
+      requestForceDeployForMissingCipherSecondHalfPlayers(source + "_force_deploy");
+    } catch (err) {
+      LogRuntimeError("TransitionStep/requestForceDeploy/" + source, err);
+    }
+  }
+
+  try {
+    processTransitionSpawnQueue(source);
+  } catch (err) {
+    LogRuntimeError("TransitionStep/processTransitionSpawnQueue/" + source, err);
+  }
+
+  try {
+    processCipherSpawnJobs(source);
+  } catch (err) {
+    LogRuntimeError("TransitionStep/processCipherSpawnJobs/" + source, err);
+  }
+
+  try {
+    applyCipherSecondHalfDeployFreezeForReadyPlayers(source);
+  } catch (err) {
+    LogRuntimeError("TransitionStep/applyDeployFreeze/" + source, err);
+  }
+}
+
 async function runCipherTransitionDeployWindow(
   source: string,
   deployTitleKey: any,
@@ -16478,21 +16539,28 @@ async function runCipherTransitionDeployWindow(
       gameStatus !== 3 ||
       !(cipherSecondHalfTransitionActive || cipherSuddenDeathTransitionActive) ||
       cipherSecondHalfTransitionStage !== "deploy"
-    ) return;
+    ) {
+      return;
+    }
+
     setCipherTransitionCountdownSeconds(remaining);
-    showCipherTransitionHudForAllPlayers(
-      deployTitleKey,
-      deployTitleFallback,
-      subtitleKey,
-      subtitleFallback,
-      (mod.stringkeys as any).CipherForceDeployIn,
-      "FORCE DEPLOY IN {}",
-      remaining,
-      true
-    );
-    processTransitionSpawnQueue(source);
-    processCipherSpawnJobs(source);
-    applyCipherSecondHalfDeployFreezeForReadyPlayers(source);
+
+    try {
+      showCipherTransitionHudForAllPlayers(
+        deployTitleKey,
+        deployTitleFallback,
+        subtitleKey,
+        subtitleFallback,
+        (mod.stringkeys as any).CipherForceDeployIn,
+        "FORCE DEPLOY IN {}",
+        remaining,
+        true
+      );
+    } catch (err) {
+      LogRuntimeError("TransitionDeployWindow/showDeployHud/" + source, err);
+    }
+
+    runCipherTransitionStepWorkSafe(source + "_deploy_" + String(remaining), false);
 
     if (hasAllRequiredCipherSecondHalfDeployersReady()) break;
 
@@ -16503,43 +16571,54 @@ async function runCipherTransitionDeployWindow(
     gameStatus !== 3 ||
     !(cipherSecondHalfTransitionActive || cipherSuddenDeathTransitionActive) ||
     cipherSecondHalfTransitionStage !== "deploy"
-  ) return;
+  ) {
+    return;
+  }
 
   cipherSecondHalfTransitionStage = "countdown";
   setCipherTransitionCountdownSeconds(CIPHER_SECOND_HALF_FINAL_COUNTDOWN_SECONDS);
-  requestForceDeployForMissingCipherSecondHalfPlayers(source + "_force_deploy");
+
+  runCipherTransitionStepWorkSafe(source + "_countdown_enter", true);
 
   for (let remaining = CIPHER_SECOND_HALF_FINAL_COUNTDOWN_SECONDS; remaining > 0; remaining--) {
     if (
       gameStatus !== 3 ||
       !(cipherSecondHalfTransitionActive || cipherSuddenDeathTransitionActive) ||
       cipherSecondHalfTransitionStage !== "countdown"
-    ) return;
+    ) {
+      return;
+    }
 
     setCipherTransitionCountdownSeconds(remaining);
-    requestForceDeployForMissingCipherSecondHalfPlayers(source + "_final_countdown");
-    processTransitionSpawnQueue(source + "_final_countdown");
-    processCipherSpawnJobs(source + "_final_countdown");
-    applyCipherSecondHalfDeployFreezeForReadyPlayers(source + "_final_countdown");
-    showCipherTransitionHudForAllPlayers(
-      startsTitleKey,
-      startsTitleFallback,
-      subtitleKey,
-      subtitleFallback,
-      (mod.stringkeys as any).CipherStartsIn,
-      "STARTS IN {}",
-      remaining,
-      true
-    );
-    playCountdownHeartbeatToAll(remaining <= 3 ? 0.85 : 0.6);
+
+    runCipherTransitionStepWorkSafe(source + "_countdown_" + String(remaining), true);
+
+    try {
+      showCipherTransitionHudForAllPlayers(
+        startsTitleKey,
+        startsTitleFallback,
+        subtitleKey,
+        subtitleFallback,
+        (mod.stringkeys as any).CipherStartsIn,
+        "STARTS IN {}",
+        remaining,
+        true
+      );
+    } catch (err) {
+      LogRuntimeError("TransitionDeployWindow/showCountdownHud/" + source, err);
+    }
+
+    try {
+      playCountdownHeartbeatToAll(remaining <= 3 ? 0.85 : 0.6);
+    } catch (err) {
+      LogRuntimeError("TransitionDeployWindow/playHeartbeat/" + source, err);
+    }
+
     await mod.Wait(1);
   }
 
   setCipherTransitionCountdownSeconds(0);
-  requestForceDeployForMissingCipherSecondHalfPlayers(source + "_zero");
-  processTransitionSpawnQueue(source + "_zero");
-  processCipherSpawnJobs(source + "_zero");
-  applyCipherSecondHalfDeployFreezeForReadyPlayers(source + "_zero");
+  runCipherTransitionStepWorkSafe(source + "_countdown_zero", true);
 }
 
 function prepareCipherHalfForLive(
@@ -16692,6 +16771,12 @@ async function runCipherSecondHalfTransition(reason: CipherHalfTransitionReason)
   });
   startCipherPostTransitionLiveInputUnlock("half2", "second_half_live_start");
   showCipherPhaseNoticeForAllPlayers((mod.stringkeys as any).CipherSecondHalfLive, "SECOND HALF", 3);
+
+  // Hard guard: make sure the second half always gets a fresh clock/key after the transition.
+  // This prevents the mode from staying stuck in countdown/intermission if the first-half timer expired.
+  liveClockTimeoutHoldActive = false;
+  liveClockStarted = false;
+
   startCipherHalfClockAndKey(2, getCurrentSchedulerNowSeconds());
 }
 
@@ -21551,60 +21636,39 @@ async function Mode_OnPlayerDeployed(eventPlayer: mod.Player): Promise<void> {
     applyPrematch889HealthForPlayer(playerId);
     recordLastLiveHqSpawnSourceFromDeploy(eventPlayer, playerId);
     applyPhaseInputRestrictionsForPlayer(eventPlayer);
+
     const enteringForcedSafeSpawnFlow = safeSpawnForcedUndeploy[playerId] === true;
+
     if (!enteringForcedSafeSpawnFlow) {
       bumpSafeSpawnGeneration(playerId);
       clearQueuedSafeSpawnStateForPlayer(playerId);
     }
-  // If we spawned near ANY friendly player (<= 8m), do not allow safe-spawn recycling.
-    if (isSpawnNearFriendlyPlayer(eventPlayer, playerId, FRIENDLY_SPAWN_BYPASS_RADIUS_METERS)) {
-      safeSpawnForcedRedeploys[playerId] = 0;
-      if (!enteringForcedSafeSpawnFlow) {
-        safeSpawnForcedUndeploy[playerId] = false;
-        safeSpawnUnsafePending[playerId] = false;
-      }
-      // Optional: you can also stop the squad probe logic if you want.
-    }
 
-
-  // --- SQUAD SPAWN HARD BYPASS (within 8m) ---
-  // If the player spawned close to a living squadmate, we do NOT want safe-spawn recycling at all.
-  // This avoids the timing/race where the async probe hasn't set bypass yet.
-    const squadSpawnNow = checkIfSpawnedOnSquadmate(eventPlayer);
-    if (squadSpawnNow) {
-      squadSpawnBypass[playerId] = true;
-      void clearSquadSpawnBypassLater(playerId);
-
-      // Reset forced redeploy counter so a squad spawn doesn't inherit prior "unsafe" history.
-      safeSpawnForcedRedeploys[playerId] = 0;
-      if (!enteringForcedSafeSpawnFlow) {
-        safeSpawnForcedUndeploy[playerId] = false;
-        safeSpawnUnsafePending[playerId] = false;
-      }
-    } else {
-      squadSpawnBypass[playerId] = false;
-
-      // Keep your probe if you still want it for edge cases.
-      void startSquadSpawnBypassProbe(eventPlayer, playerId);
-    }
-
-    mod.SetRedeployTime(eventPlayer, REDEPLOY_TIME);
-    requestCipherSpawnAnchorForPlayer(playerId, true);
-    processCipherSpawnJobs("OnPlayerDeployed_LiveAnchor");
-
-    const wasForced = enteringForcedSafeSpawnFlow;
-
-  // IMPORTANT: Do NOT overwrite the player's HQ routing while we are in a forced safe-spawn recycle.
-  // We only "commit" the route after the safe-spawn check succeeds.
-    if (!wasForced && safeSpawnUnsafePending[playerId] !== true) {
+    // Store the current dynamic HQ route, but do not teleport yet.
+    // If this ends up being a native friendly/squad spawn, we will commit this route and exit.
+    if (!enteringForcedSafeSpawnFlow && safeSpawnUnsafePending[playerId] !== true) {
       const dyn = modlib.Equals(team, team1) ? currentDynamicHqTeam1 : currentDynamicHqTeam2;
       if (dyn && isValidDynamicSpawnId(dyn)) {
         pendingDynamicHqForPlayer[playerId] = dyn;
       }
     }
 
+    // CRITICAL FIX:
+    // If the player spawned near a teammate/squadmate, this is a native squad/friendly spawn.
+    // Do NOT request a Cipher anchor and do NOT call SafeSpawnCheckOrRedeploy(),
+    // because those paths can teleport the player to an anchor.
+    if (!enteringForcedSafeSpawnFlow && isNativeFriendlyOrSquadSpawn(eventPlayer, playerId)) {
+      mod.SetRedeployTime(eventPlayer, REDEPLOY_TIME);
+      p.isFirstDeploy();
+      finishSafeSpawnAsNativeFriendlyOrSquadSpawn(eventPlayer, playerId);
+      return;
+    }
 
-    // Keep first-deploy state transitions, but no score mutation on deploy/death in this mode.
+    // Normal custom Cipher spawn route.
+    mod.SetRedeployTime(eventPlayer, REDEPLOY_TIME);
+    requestCipherSpawnAnchorForPlayer(playerId, true);
+    processCipherSpawnJobs("OnPlayerDeployed_LiveAnchor");
+
     p.isFirstDeploy();
 
     SafeSpawnCheckOrRedeploy(playerId);
