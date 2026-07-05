@@ -12,9 +12,12 @@ export interface WorldIdsConfig {
         b: number;
         c: number;
         d: number;
-        e: number;
-        f: number;
+        aSecondHalf: number;
+        bSecondHalf: number;
+        cSecondHalf: number;
+        dSecondHalf: number;
     };
+    objectivePositionAnchors: Record<number, number>;
     interactPoints: {
         team1Switch: number;
         team1Ready: number;
@@ -43,8 +46,12 @@ export interface WorldIdsConfig {
 
 const WORLD_CP_A_ID = 201;
 const WORLD_CP_B_ID = 202;
-const WORLD_CP_E_ID = 301;
-const WORLD_CP_F_ID = 302;
+const WORLD_CP_C_ID = 203;
+const WORLD_CP_D_ID = 204;
+const WORLD_CP_A_SECOND_HALF_ID = 301;
+const WORLD_CP_B_SECOND_HALF_ID = 302;
+const WORLD_CP_C_SECOND_HALF_ID = 303;
+const WORLD_CP_D_SECOND_HALF_ID = 304;
 
 export const WORLD_IDS: WorldIdsConfig = {
     hq: {
@@ -58,10 +65,22 @@ export const WORLD_IDS: WorldIdsConfig = {
     capturePoints: {
         a: WORLD_CP_A_ID,
         b: WORLD_CP_B_ID,
-        c: 0,
-        d: 0,
-        e: WORLD_CP_E_ID,
-        f: WORLD_CP_F_ID,
+        c: WORLD_CP_C_ID,
+        d: WORLD_CP_D_ID,
+        aSecondHalf: WORLD_CP_A_SECOND_HALF_ID,
+        bSecondHalf: WORLD_CP_B_SECOND_HALF_ID,
+        cSecondHalf: WORLD_CP_C_SECOND_HALF_ID,
+        dSecondHalf: WORLD_CP_D_SECOND_HALF_ID,
+    },
+    objectivePositionAnchors: {
+        [WORLD_CP_A_ID]: 215,
+        [WORLD_CP_B_ID]: 216,
+        [WORLD_CP_C_ID]: 217,
+        [WORLD_CP_D_ID]: 218,
+        [WORLD_CP_A_SECOND_HALF_ID]: 215,
+        [WORLD_CP_B_SECOND_HALF_ID]: 216,
+        [WORLD_CP_C_SECOND_HALF_ID]: 217,
+        [WORLD_CP_D_SECOND_HALF_ID]: 218,
     },
     interactPoints: {
         team1Switch: 2001,
@@ -72,16 +91,24 @@ export const WORLD_IDS: WorldIdsConfig = {
         objectiveByCapturePoint: {
             [WORLD_CP_A_ID]: 2101,
             [WORLD_CP_B_ID]: 2102,
-            [WORLD_CP_E_ID]: 2105,
-            [WORLD_CP_F_ID]: 2106,
+            [WORLD_CP_C_ID]: 2103,
+            [WORLD_CP_D_ID]: 2104,
+            [WORLD_CP_A_SECOND_HALF_ID]: 2101,
+            [WORLD_CP_B_SECOND_HALF_ID]: 2102,
+            [WORLD_CP_C_SECOND_HALF_ID]: 2103,
+            [WORLD_CP_D_SECOND_HALF_ID]: 2104,
         },
     },
     areaTriggers: {
         objectiveByCapturePoint: {
             [WORLD_CP_A_ID]: 401,
             [WORLD_CP_B_ID]: 402,
-            [WORLD_CP_E_ID]: 503,
-            [WORLD_CP_F_ID]: 502,
+            [WORLD_CP_C_ID]: 403,
+            [WORLD_CP_D_ID]: 404,
+            [WORLD_CP_A_SECOND_HALF_ID]: 401,
+            [WORLD_CP_B_SECOND_HALF_ID]: 402,
+            [WORLD_CP_C_SECOND_HALF_ID]: 403,
+            [WORLD_CP_D_SECOND_HALF_ID]: 404,
         },
         damage: 7001,
         restricted: 7003,

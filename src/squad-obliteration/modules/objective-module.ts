@@ -14,6 +14,18 @@ export function installObjectiveModule(context: ModeContext): void {
             runtimeContext,
             Events.OnPlayerExitCapturePoint.subscribe(objectiveRuntimeHandlers.onPlayerExitCapturePoint)
         );
+        subscribeModuleHandler(
+            runtimeContext,
+            Events.OnCapturePointCaptured.subscribe(objectiveRuntimeHandlers.onCapturePointCaptured)
+        );
+        subscribeModuleHandler(
+            runtimeContext,
+            Events.OnCapturePointLost.subscribe(objectiveRuntimeHandlers.onCapturePointLost)
+        );
+        subscribeModuleHandler(
+            runtimeContext,
+            Events.OnCapturePointCapturing.subscribe(objectiveRuntimeHandlers.onCapturePointCapturing)
+        );
         subscribeModuleHandler(runtimeContext, Events.OngoingMCOM.subscribe(objectiveRuntimeHandlers.onOngoingMcom));
         subscribeModuleHandler(runtimeContext, Events.OnMCOMArmed.subscribe(objectiveRuntimeHandlers.onMcomArmed));
         subscribeModuleHandler(

@@ -18,7 +18,7 @@
         "strictNullChecks": true,
         "strictPropertyInitialization": true,
         "target": "ES2022",
-        "types": ["quickjs-types", "bf6-portal-mod-types"],
+        "types": ["quickjs-types"],
         "useDefineForClassFields": true,
         "verbatimModuleSyntax": true
     },

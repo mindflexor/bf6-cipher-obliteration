@@ -6,7 +6,7 @@ export const RULES = {
     halfScoreCap: 4,
     matchScoreCap: 8,
     cipherKeysToDestroyObjective: 2,
-    nodeOverloadCooldownSeconds: 35,
+    nodeOverloadCooldownSeconds: 45,
     countdownTimeSeconds: 5,
     preliveTimeSeconds: 15,
     postmatchTimeSeconds: 20,

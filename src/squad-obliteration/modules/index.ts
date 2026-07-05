@@ -1,4 +1,5 @@
 import type { ModeContext } from '../state/mode-context.ts';
+import { installAdminModule } from './admin-module.ts';
 import { installAudioModule } from './audio-module.ts';
 import { installBotModule } from './bot-module.ts';
 import { installCombatModule } from './combat-module.ts';
@@ -13,6 +14,7 @@ import { installUiModule } from './ui-module.ts';
 
 export function installSquadObliterationModules(context: ModeContext): void {
     installLifecycleModule(context);
+    installAdminModule(context);
     installBotModule(context);
     installPlayerSessionModule(context);
     installPrematchModule(context);
