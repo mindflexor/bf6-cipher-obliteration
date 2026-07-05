@@ -54,12 +54,18 @@ const ICON_FOLLOW_INTERVAL_SECONDS = 0.05; // 20 Hz
 const FAST_INTERVAL_SECONDS = 0.10; // 10 Hz
 const SLOW_INTERVAL_SECONDS = 0.30; // 3.3 Hz
 const ENDGAME_AUDIO_INTERVAL_SECONDS = 0.50; // 2 Hz
-const CIPHER_RUNTIME_BOTS_ENABLED = false;
-const CIPHER_RUNTIME_BOT_TARGET_TOTAL_PLAYERS = 8;
+const CIPHER_RUNTIME_BOTS_DEFAULT_ENABLED = false;
+const CIPHER_RUNTIME_BOT_DESIRED_TEAM_SIZE = 8;
+const CIPHER_RUNTIME_BOT_MAX_PER_TEAM = 8;
+const CIPHER_RUNTIME_BOT_MAX_TOTAL = 16;
 const CIPHER_RUNTIME_BOT_RECONCILE_INTERVAL_SECONDS = 1.0;
 const CIPHER_RUNTIME_BOT_SPAWN_RETRY_SECONDS = 2.0;
 const CIPHER_RUNTIME_BOT_RESPAWN_DELAY_SECONDS = 1.0;
 const CIPHER_RUNTIME_BOT_UNSPAWN_DELAY_SECONDS = 1.0;
+const CIPHER_RUNTIME_BOT_SPAWN_BIND_TIMEOUT_SECONDS = 5.0;
+const CIPHER_RUNTIME_BOT_CREATE_BUDGET_PER_RECONCILE = 2;
+const CIPHER_RUNTIME_BOT_RETIRE_BUDGET_PER_RECONCILE = 2;
+const CIPHER_RUNTIME_BOT_SPAWN_BUDGET_PER_RECONCILE = 2;
 const CIPHER_RUNTIME_BOT_TEAM1_SPAWNER_ID = 8085;
 const CIPHER_RUNTIME_BOT_TEAM2_SPAWNER_ID = 8086;
 const CIPHER_RUNTIME_BOT_REVIVE_SCAN_RADIUS_METERS = 18.0;
@@ -371,14 +377,26 @@ type CipherAdminAction =
   | "start_sudden_death"
   | "restart_prematch"
   | "end_match"
+  | "toggle_bots"
+  | "clear_bots"
+  | "force_bot_reconcile"
   | "close"
   | "close_x";
+
+type CipherAdminPrimaryClickPhase = "down" | "up";
+type CipherAdminPrimaryClickState = {
+  widgetName: string;
+  atSeconds: number;
+  phase: CipherAdminPrimaryClickPhase;
+};
 
 const CIPHER_ADMIN_INTERACT_AUTO_SPAWN_ENABLED = false; // false = admin interact point will NOT spawn on deploy/fallback
 const CIPHER_ADMIN_INTERACT_LIFETIME_SECONDS = 5;
 const CIPHER_ADMIN_INTERACT_FALLBACK_INTERVAL_SECONDS = 3;
 const CIPHER_ADMIN_INTERACT_HEIGHT_OFFSET_METERS = 1.25;
 const CIPHER_ADMIN_BUTTON_DEBOUNCE_TICKS = 6;
+const CIPHER_ADMIN_PRIMARY_CLICK_DEBOUNCE_SECONDS = 0.12;
+const CIPHER_ADMIN_PRIMARY_CLICK_RELEASE_GRACE_SECONDS = 2.0;
 const CIPHER_ADMIN_PANEL_ROOT_PREFIX = "CipherAdminRoot";
 const CIPHER_ADMIN_PANEL_PANEL_PREFIX = "CipherAdminPanel";
 const CIPHER_ADMIN_PANEL_TITLE_PREFIX = "CipherAdminTitle";
@@ -386,12 +404,10 @@ const CIPHER_ADMIN_PANEL_STATUS_PREFIX = "CipherAdminStatus";
 const CIPHER_ADMIN_PANEL_ACTION_COUNT_PREFIX = "CipherAdminActionCount";
 const CIPHER_ADMIN_BUTTON_PREFIX = "CipherAdminButton_";
 const CIPHER_ADMIN_BUTTON_LABEL_PREFIX = "CipherAdminButtonLabel_";
-const CIPHER_ADMIN_BUTTON_BG_PREFIX = "CipherAdminButtonBg_";
 const CIPHER_ADMIN_DEFERRED_DELETE_DELAY_SECONDS = 0.05;
-const CIPHER_ADMIN_PANEL_SIZE = mod.CreateVector(560, 456, 0);
+const CIPHER_ADMIN_PANEL_SIZE = mod.CreateVector(600, 540, 0);
 const CIPHER_ADMIN_PANEL_POS = mod.CreateVector(0, 0, 0);
 const CIPHER_ADMIN_PANEL_BG_COLOR = mod.CreateVector(0.0314, 0.0431, 0.0431);
-const CIPHER_ADMIN_BUTTON_BG_COLOR = mod.CreateVector(1, 1, 1);
 const CIPHER_ADMIN_BUTTON_BASE_COLOR = mod.CreateVector(0.0745, 0.1843, 0.2471);
 const CIPHER_ADMIN_BUTTON_DISABLED_COLOR = mod.CreateVector(0.05, 0.05, 0.05);
 const CIPHER_ADMIN_BUTTON_PRESSED_COLOR = mod.CreateVector(0.4392, 0.9216, 1);
@@ -399,10 +415,11 @@ const CIPHER_ADMIN_BUTTON_HOVER_COLOR = mod.CreateVector(0.16, 0.30, 0.36);
 const CIPHER_ADMIN_BUTTON_TEXT_COLOR = mod.CreateVector(1, 1, 1);
 const CIPHER_ADMIN_PANEL_ACCENT_COLOR = mod.CreateVector(0.4392, 0.9216, 1);
 const CIPHER_ADMIN_BUTTON_SIZE = mod.CreateVector(162, 34, 0);
+const CIPHER_ADMIN_GRID_BUTTON_SIZE = mod.CreateVector(260, 32, 0);
 const CIPHER_ADMIN_WIDE_BUTTON_SIZE = mod.CreateVector(250, 34, 0);
 const CIPHER_ADMIN_CLOSE_X_BUTTON_SIZE = mod.CreateVector(34, 30, 0);
 const CIPHER_ADMIN_BUTTON_BORDER_PADDING = 2;
-const CIPHER_ADMIN_BUTTON_TEXT_SIZE = 18;
+const CIPHER_ADMIN_BUTTON_TEXT_SIZE = 14;
 const CIPHER_ADMIN_STATUS_TEXT_SIZE = 16;
 const CIPHER_ADMIN_TITLE_TEXT_SIZE = 24;
 
@@ -416,6 +433,8 @@ let cipherAdminPanelVisibleByPlayerId: { [playerId: number]: boolean | undefined
 let cipherAdminButtonLastHandledTickByKey: { [key: string]: number | undefined } = {};
 let cipherAdminPanelCloseTokenByPlayerId: { [playerId: number]: number | undefined } = {};
 let cipherAdminPanelDeletingByPlayerId: { [playerId: number]: boolean | undefined } = {};
+let cipherAdminPanelDeleteTimerByPlayerId: { [playerId: number]: number | undefined } = {};
+let cipherAdminPrimaryClickByPlayerId: { [playerId: number]: CipherAdminPrimaryClickState | undefined } = {};
 let cipherAdminActionCount = 0;
 let cipherAdminNextInteractFallbackAtSec = 0;
 
@@ -1437,6 +1456,8 @@ type RuntimeBotSlot = {
   playerId: number | undefined;
   nextSpawnAtSec: number;
   forceRespawnAfterSec: number;
+  spawnToken: number;
+  pendingSinceSec: number;
   spawning: boolean;
   retired: boolean;
 };
@@ -1556,8 +1577,10 @@ let runtimeBotSlotByPlayerId: { [playerId: number]: number | undefined } = {};
 let runtimeBotPendingSlotIdsBySpawnerObjId: { [spawnerObjId: number]: number[] | undefined } = {};
 let runtimeBotAuthoredSpawnerByObjId: { [spawnerObjId: number]: mod.Spawner | undefined } = {};
 let runtimeBotReleasedPlayerId: { [playerId: number]: boolean | undefined } = {};
+let cipherRuntimeBotsEnabled = CIPHER_RUNTIME_BOTS_DEFAULT_ENABLED;
 let runtimeBotNextSlotId = 1;
 let runtimeBotNextReconcileAtSec = 0;
+let runtimeBotSpawnTokenCounter = 0;
 let runtimeBotSpawnerValidationComplete = false;
 let runtimeBotSpawnerValidationFailed = false;
 let runtimeBotSpawnerValidationWarned = false;
@@ -4236,11 +4259,13 @@ function clearRuntimeBotPlayerBinding(slot: RuntimeBotSlot, releaseOldPlayerId: 
   if (oldPlayerId !== undefined) {
     delete runtimeBotSlotByPlayerId[oldPlayerId];
     if (releaseOldPlayerId) runtimeBotReleasedPlayerId[oldPlayerId] = true;
+    clearBotObjectiveStateForPlayer(oldPlayerId);
   }
   slot.player = undefined;
   slot.playerId = undefined;
   slot.spawning = false;
   slot.forceRespawnAfterSec = 0;
+  slot.pendingSinceSec = 0;
 }
 
 function configureRuntimeBotCombat(player: mod.Player): void {
@@ -4295,9 +4320,19 @@ function countActiveRuntimeBotSlots(): number {
   return count;
 }
 
-function countRuntimeControlledPlayersByTeam(): { team1Count: number; team2Count: number; total: number } {
-  let team1Count = 0;
-  let team2Count = 0;
+type RuntimeBotTeamCounts = {
+  team1Humans: number;
+  team2Humans: number;
+  team1Bots: number;
+  team2Bots: number;
+  totalBots: number;
+};
+
+function countRuntimeBotTeamState(): RuntimeBotTeamCounts {
+  let team1Humans = 0;
+  let team2Humans = 0;
+  let team1Bots = 0;
+  let team2Bots = 0;
 
   serverPlayers.forEach((sp) => {
     if (!sp || !mod.IsPlayerValid(sp.player)) return;
@@ -4305,25 +4340,26 @@ function countRuntimeControlledPlayersByTeam(): { team1Count: number; team2Count
     if (isBotBackfillPlayerSafe(sp.player)) return;
 
     const team = getCipherKeyTeamSnapshot(sp.id) ?? mod.GetTeam(sp.player);
-    if (mod.Equals(team, team1)) team1Count += 1;
-    else if (mod.Equals(team, team2)) team2Count += 1;
+    if (mod.Equals(team, team1)) team1Humans += 1;
+    else if (mod.Equals(team, team2)) team2Humans += 1;
   });
 
   forEachRuntimeBotSlot((slot) => {
-    if (mod.Equals(slot.desiredTeam, team1)) team1Count += 1;
-    else if (mod.Equals(slot.desiredTeam, team2)) team2Count += 1;
+    if (mod.Equals(slot.desiredTeam, team1)) team1Bots += 1;
+    else if (mod.Equals(slot.desiredTeam, team2)) team2Bots += 1;
   });
 
   return {
-    team1Count,
-    team2Count,
-    total: team1Count + team2Count,
+    team1Humans,
+    team2Humans,
+    team1Bots,
+    team2Bots,
+    totalBots: team1Bots + team2Bots,
   };
 }
 
-function chooseRuntimeBotTeamForNewSlot(): mod.Team {
-  const counts = countRuntimeControlledPlayersByTeam();
-  return counts.team1Count <= counts.team2Count ? team1 : team2;
+function getDesiredRuntimeBotCountForHumanCount(humanCount: number): number {
+  return Math.max(0, Math.min(CIPHER_RUNTIME_BOT_MAX_PER_TEAM, CIPHER_RUNTIME_BOT_DESIRED_TEAM_SIZE - humanCount));
 }
 
 function createRuntimeBotSlot(desiredTeam: mod.Team, nowSec: number): RuntimeBotSlot {
@@ -4340,6 +4376,8 @@ function createRuntimeBotSlot(desiredTeam: mod.Team, nowSec: number): RuntimeBot
     playerId: undefined,
     nextSpawnAtSec: nowSec,
     forceRespawnAfterSec: 0,
+    spawnToken: 0,
+    pendingSinceSec: 0,
     spawning: false,
     retired: false,
   };
@@ -4390,7 +4428,11 @@ function takePendingRuntimeBotSlotForSpawner(spawnerObjId: number): RuntimeBotSl
   return undefined;
 }
 
-function resolveAuthoredRuntimeBotSpawnerByObjId(spawnerObjId: number, context: string): mod.Spawner | undefined {
+function resolveAuthoredRuntimeBotSpawnerByObjId(
+  spawnerObjId: number,
+  context: string,
+  logFailure: boolean = true
+): mod.Spawner | undefined {
   if (!(spawnerObjId > 0)) return undefined;
   const cached = runtimeBotAuthoredSpawnerByObjId[spawnerObjId];
   if (cached) return cached;
@@ -4406,7 +4448,9 @@ function resolveAuthoredRuntimeBotSpawnerByObjId(spawnerObjId: number, context: 
     } catch (_errUnspawnDelay) {}
     return spawner;
   } catch (err) {
-    LogRuntimeError("runtime_bot_get_authored_spawner/" + context + "/" + String(spawnerObjId), err);
+    if (logFailure) {
+      LogRuntimeError("runtime_bot_get_authored_spawner/" + context + "/" + String(spawnerObjId), err);
+    }
     return undefined;
   }
 }
@@ -4437,6 +4481,7 @@ function ensureRuntimeBotSpawnerForSlot(slot: RuntimeBotSlot): boolean {
 
 function spawnRuntimeBotFromSlot(slot: RuntimeBotSlot, nowSec: number, context: string): void {
   if (slot.retired) return;
+  if (slot.spawning && slot.pendingSinceSec > 0 && nowSec - slot.pendingSinceSec < CIPHER_RUNTIME_BOT_SPAWN_BIND_TIMEOUT_SECONDS) return;
   if (!ensureRuntimeBotSpawnerForSlot(slot)) {
     slot.nextSpawnAtSec = nowSec + CIPHER_RUNTIME_BOT_SPAWN_RETRY_SECONDS;
     return;
@@ -4445,6 +4490,10 @@ function spawnRuntimeBotFromSlot(slot: RuntimeBotSlot, nowSec: number, context: 
   if (nowSec < slot.nextSpawnAtSec) return;
 
   try {
+    runtimeBotSpawnTokenCounter += 1;
+    slot.spawnToken = runtimeBotSpawnTokenCounter;
+    slot.spawning = true;
+    slot.pendingSinceSec = nowSec;
     queuePendingRuntimeBotSlot(slot);
     mod.SpawnAIFromAISpawner(
       slot.spawner,
@@ -4452,19 +4501,20 @@ function spawnRuntimeBotFromSlot(slot: RuntimeBotSlot, nowSec: number, context: 
       mod.Message(mod.stringkeys.BotName),
       slot.desiredTeam
     );
-    slot.spawning = true;
     slot.nextSpawnAtSec = nowSec + CIPHER_RUNTIME_BOT_SPAWN_RETRY_SECONDS;
     slot.forceRespawnAfterSec = 0;
   } catch (err) {
     removePendingRuntimeBotSlot(slot.slotId, slot.spawnerObjId);
     LogRuntimeError("runtime_bot_spawn/" + context, err);
     slot.spawning = false;
+    slot.pendingSinceSec = 0;
     slot.nextSpawnAtSec = nowSec + CIPHER_RUNTIME_BOT_SPAWN_RETRY_SECONDS;
   }
 }
 
 function retireRuntimeBotSlot(slot: RuntimeBotSlot, context: string): void {
   slot.retired = true;
+  removePendingRuntimeBotSlot(slot.slotId, slot.spawnerObjId);
   clearRuntimeBotPlayerBinding(slot, true);
   clearRuntimeBotSpawnerForSlot(slot, true, context);
   delete runtimeBotSlotsBySlotId[slot.slotId];
@@ -4474,7 +4524,7 @@ function clearRuntimeBotState(unspawnSpawners: boolean): void {
   if (unspawnSpawners) {
     const authoredSpawnerIds = [CIPHER_RUNTIME_BOT_TEAM1_SPAWNER_ID, CIPHER_RUNTIME_BOT_TEAM2_SPAWNER_ID];
     for (let i = 0; i < authoredSpawnerIds.length; i++) {
-      const spawner = resolveAuthoredRuntimeBotSpawnerByObjId(authoredSpawnerIds[i], "clear_runtime_bot_state");
+      const spawner = runtimeBotAuthoredSpawnerByObjId[authoredSpawnerIds[i]];
       if (!spawner) continue;
       try {
         mod.UnspawnAllAIsFromAISpawner(spawner);
@@ -4482,12 +4532,12 @@ function clearRuntimeBotState(unspawnSpawners: boolean): void {
     }
   }
 
-  for (const slotIdKey in runtimeBotSlotsBySlotId) {
-    const slot = runtimeBotSlotsBySlotId[Number(slotIdKey)];
-    if (!slot) continue;
-    if (unspawnSpawners) {
-      retireRuntimeBotSlot(slot, "clear_runtime_bot_state");
-    }
+  const slotsToClear: RuntimeBotSlot[] = [];
+  forEachRuntimeBotSlot((slot) => {
+    slotsToClear.push(slot);
+  });
+  for (let i = 0; i < slotsToClear.length; i++) {
+    retireRuntimeBotSlot(slotsToClear[i], "clear_runtime_bot_state");
   }
 
   runtimeBotSlotsBySlotId = {};
@@ -4496,34 +4546,83 @@ function clearRuntimeBotState(unspawnSpawners: boolean): void {
   runtimeBotAuthoredSpawnerByObjId = {};
   runtimeBotNextSlotId = 1;
   runtimeBotNextReconcileAtSec = 0;
+  runtimeBotSpawnTokenCounter = 0;
+  clearBotObjectiveAssignments();
+  void unspawnSpawners;
 }
 
-function chooseRuntimeBotSlotToRetire(): RuntimeBotSlot | undefined {
+function chooseRuntimeBotSlotToRetire(team?: mod.Team): RuntimeBotSlot | undefined {
   let best: RuntimeBotSlot | undefined = undefined;
   forEachRuntimeBotSlot((slot) => {
+    if (team && !mod.Equals(slot.desiredTeam, team)) return;
     if (!best || slot.slotId > best.slotId) best = slot;
   });
   return best;
 }
 
 function reconcileRuntimeBotSlotCount(nowSec: number): void {
-  let counts = countRuntimeControlledPlayersByTeam();
+  let counts = countRuntimeBotTeamState();
+  const desiredTeam1Bots = getDesiredRuntimeBotCountForHumanCount(counts.team1Humans);
+  const desiredTeam2Bots = getDesiredRuntimeBotCountForHumanCount(counts.team2Humans);
 
-  while (counts.total > CIPHER_RUNTIME_BOT_TARGET_TOTAL_PLAYERS) {
+  let retireBudget = CIPHER_RUNTIME_BOT_RETIRE_BUDGET_PER_RECONCILE;
+  while (counts.team1Bots > desiredTeam1Bots && retireBudget > 0) {
+    const slot = chooseRuntimeBotSlotToRetire(team1);
+    if (!slot) return;
+    retireRuntimeBotSlot(slot, "team1_over_target");
+    retireBudget -= 1;
+    counts = countRuntimeBotTeamState();
+  }
+  while (counts.team2Bots > desiredTeam2Bots && retireBudget > 0) {
+    const slot = chooseRuntimeBotSlotToRetire(team2);
+    if (!slot) return;
+    retireRuntimeBotSlot(slot, "team2_over_target");
+    retireBudget -= 1;
+    counts = countRuntimeBotTeamState();
+  }
+  while (counts.totalBots > CIPHER_RUNTIME_BOT_MAX_TOTAL && retireBudget > 0) {
     const slot = chooseRuntimeBotSlotToRetire();
     if (!slot) return;
-    retireRuntimeBotSlot(slot, "over_target");
-    counts = countRuntimeControlledPlayersByTeam();
+    retireRuntimeBotSlot(slot, "total_over_target");
+    retireBudget -= 1;
+    counts = countRuntimeBotTeamState();
   }
 
-  while (counts.total < CIPHER_RUNTIME_BOT_TARGET_TOTAL_PLAYERS) {
-    createRuntimeBotSlot(chooseRuntimeBotTeamForNewSlot(), nowSec);
-    counts = countRuntimeControlledPlayersByTeam();
+  let createBudget = CIPHER_RUNTIME_BOT_CREATE_BUDGET_PER_RECONCILE;
+  while (
+    counts.team1Bots < desiredTeam1Bots &&
+    counts.team1Bots < CIPHER_RUNTIME_BOT_MAX_PER_TEAM &&
+    counts.totalBots < CIPHER_RUNTIME_BOT_MAX_TOTAL &&
+    createBudget > 0
+  ) {
+    createRuntimeBotSlot(team1, nowSec);
+    createBudget -= 1;
+    counts = countRuntimeBotTeamState();
+  }
+  while (
+    counts.team2Bots < desiredTeam2Bots &&
+    counts.team2Bots < CIPHER_RUNTIME_BOT_MAX_PER_TEAM &&
+    counts.totalBots < CIPHER_RUNTIME_BOT_MAX_TOTAL &&
+    createBudget > 0
+  ) {
+    createRuntimeBotSlot(team2, nowSec);
+    createBudget -= 1;
+    counts = countRuntimeBotTeamState();
   }
 }
 
 function shouldRuntimeBotSlotSpawn(slot: RuntimeBotSlot, nowSec: number): boolean {
   if (slot.retired) return false;
+  if (slot.spawning && slot.pendingSinceSec > 0 && nowSec - slot.pendingSinceSec < CIPHER_RUNTIME_BOT_SPAWN_BIND_TIMEOUT_SECONDS) {
+    return false;
+  }
+  if (slot.spawning && slot.pendingSinceSec > 0) {
+    removePendingRuntimeBotSlot(slot.slotId, slot.spawnerObjId);
+    slot.spawning = false;
+    slot.pendingSinceSec = 0;
+    slot.nextSpawnAtSec = nowSec + CIPHER_RUNTIME_BOT_SPAWN_RETRY_SECONDS;
+    return false;
+  }
   if (slot.playerId === undefined) return true;
 
   const sp = serverPlayers.get(slot.playerId);
@@ -4539,10 +4638,13 @@ function shouldRuntimeBotSlotSpawn(slot: RuntimeBotSlot, nowSec: number): boolea
 }
 
 function reconcileRuntimeBotSpawns(nowSec: number): void {
+  let spawnBudget = CIPHER_RUNTIME_BOT_SPAWN_BUDGET_PER_RECONCILE;
   forEachRuntimeBotSlot((slot) => {
+    if (spawnBudget <= 0) return;
     if (!shouldRuntimeBotSlotSpawn(slot, nowSec)) return;
     if (slot.spawning && nowSec < slot.nextSpawnAtSec) return;
     spawnRuntimeBotFromSlot(slot, nowSec, "reconcile");
+    spawnBudget -= 1;
   });
 }
 
@@ -4552,11 +4654,13 @@ function validateRuntimeBotSpawnersOnce(): boolean {
   runtimeBotSpawnerValidationComplete = true;
   const team1Spawner = resolveAuthoredRuntimeBotSpawnerByObjId(
     CIPHER_RUNTIME_BOT_TEAM1_SPAWNER_ID,
-    "validate_team1"
+    "validate_team1",
+    false
   );
   const team2Spawner = resolveAuthoredRuntimeBotSpawnerByObjId(
     CIPHER_RUNTIME_BOT_TEAM2_SPAWNER_ID,
-    "validate_team2"
+    "validate_team2",
+    false
   );
 
   runtimeBotSpawnerValidationFailed = !team1Spawner || !team2Spawner;
@@ -4575,13 +4679,23 @@ function validateRuntimeBotSpawnersOnce(): boolean {
 }
 
 function reconcileRuntimeBots(nowSec: number): void {
-  if (!CIPHER_RUNTIME_BOTS_ENABLED) {
+  if (!cipherRuntimeBotsEnabled) {
     if (countActiveRuntimeBotSlots() > 0) clearRuntimeBotState(true);
     return;
   }
-  if (gameStatus !== 3 || cipherSecondHalfTransitionActive || cipherSuddenDeathTransitionActive) return;
+  if (
+    gameStatus !== 3 ||
+    initialization[3] !== true ||
+    cipherSecondHalfTransitionActive ||
+    cipherSuddenDeathTransitionActive ||
+    isCipherSuddenDeathActive()
+  ) {
+    return;
+  }
   if (!validateRuntimeBotSpawnersOnce()) {
-    if (countActiveRuntimeBotSlots() > 0) clearRuntimeBotState(false);
+    if (countActiveRuntimeBotSlots() > 0) clearRuntimeBotState(true);
+    cipherRuntimeBotsEnabled = false;
+    refreshCipherAdminPanels();
     return;
   }
   if (nowSec < runtimeBotNextReconcileAtSec) return;
@@ -4599,6 +4713,7 @@ function bindRuntimeBotPlayerToSlot(slot: RuntimeBotSlot, player: mod.Player): v
     slot.player = player;
     slot.playerId = playerId;
     slot.spawning = false;
+    slot.pendingSinceSec = 0;
     slot.forceRespawnAfterSec = 0;
     runtimeBotSlotByPlayerId[playerId] = slot.slotId;
     delete runtimeBotReleasedPlayerId[playerId];
@@ -4648,7 +4763,7 @@ function detachRuntimeBotPlayerForRespawn(playerId: number, delaySeconds: number
 function isLiveBotPlayer(sp: Player | undefined): boolean {
   if (!sp) return false;
   if (!mod.IsPlayerValid(sp.player)) return false;
-  if (!CIPHER_RUNTIME_BOTS_ENABLED) return false;
+  if (!cipherRuntimeBotsEnabled) return false;
   if (!getRuntimeBotSlotForPlayerId(sp.id)) return false;
   const team = getCipherKeyTeamSnapshot(sp.id) ?? mod.GetTeam(sp.player);
   return mod.Equals(team, team1) || mod.Equals(team, team2);
@@ -4677,6 +4792,7 @@ function requestLiveBotSpawnForPlayerId(
 ): void {
   if (gameStatus !== 3) return;
   if (cipherSecondHalfTransitionActive || cipherSuddenDeathTransitionActive) return;
+  if (isCipherSuddenDeathActive()) return;
 
   const slot = getRuntimeBotSlotForPlayerId(playerId);
   if (!slot) return;
@@ -4708,9 +4824,34 @@ function shouldIssueBotMoveCommand(playerId: number, role: BotObjectiveRole, tar
   return nowSec - lastCommandAt >= BOT_OBJECTIVE_COMMAND_REFRESH_SECONDS;
 }
 
+function getRuntimeBotMoveSpeedForRole(role: BotObjectiveRole): mod.MoveSpeed {
+  if (role === "seekKey" || role === "deliverKey" || role === "interceptCarrier") return mod.MoveSpeed.Sprint;
+  if (role === "escortCarrier" || role === "revive") return mod.MoveSpeed.InvestigateRun;
+  return mod.MoveSpeed.Run;
+}
+
+function getRuntimeBotDefendRadiusForRole(role: BotObjectiveRole): number {
+  if (role === "escortCarrier") return 10;
+  if (role === "interceptCarrier") return 18;
+  if (role === "revive") return 8;
+  return 14;
+}
+
+function trySetRuntimeBotTarget(bot: Player, targetPlayer: mod.Player): void {
+  if (!isLiveBotDeployedAndAlive(bot)) return;
+  if (!mod.IsPlayerValid(targetPlayer)) return;
+  try {
+    mod.AISetTarget(bot.player, targetPlayer);
+  } catch (_errTarget) {}
+}
+
 function issueBotMoveCommand(sp: Player, role: BotObjectiveRole, target: mod.Vector, nowSec: number): void {
   if (!isLiveBotDeployedAndAlive(sp)) return;
   if (!shouldIssueBotMoveCommand(sp.id, role, target, nowSec)) return;
+
+  try {
+    mod.AISetMoveSpeed(sp.player, getRuntimeBotMoveSpeedForRole(role));
+  } catch (_errMoveSpeed) {}
 
   let issued = false;
   try {
@@ -4720,7 +4861,12 @@ function issueBotMoveCommand(sp: Player, role: BotObjectiveRole, target: mod.Vec
     try {
       mod.AIMoveToBehavior(sp.player, target);
       issued = true;
-    } catch (_errMove) {}
+    } catch (_errMove) {
+      try {
+        mod.AIDefendPositionBehavior(sp.player, target, 0, getRuntimeBotDefendRadiusForRole(role));
+        issued = true;
+      } catch (_errDefend) {}
+    }
   }
 
   if (!issued) return;
@@ -4755,6 +4901,19 @@ function getBotOffsetTarget(baseTarget: mod.Vector, playerId: number, radiusMete
   return mod.Add(baseTarget, mod.CreateVector(x, 0, z));
 }
 
+function getDefaultBotCipherKeyAnchorPosition(): mod.Vector | undefined {
+  const activeSlot = getBombBaseSlotIndexOrDefault(bombActiveBaseSlotIndex);
+  const activePos = getBombBaseSlotSpatialPosition(activeSlot);
+  if (activePos) return activePos;
+
+  for (let i = 0; i < BOMB_BASE_SLOT_CONFIGS.length; i++) {
+    const pos = getBombBaseSlotSpatialPosition(i);
+    if (pos) return pos;
+  }
+
+  return undefined;
+}
+
 function getBotCipherKeyTargetPosition(): mod.Vector | undefined {
   if (bombCarrierPlayerId !== undefined) return undefined;
   if (hasDroppedBombRuntimeObjects()) {
@@ -4765,15 +4924,22 @@ function getBotCipherKeyTargetPosition(): mod.Vector | undefined {
     return droppedIconPosition ?? tryResolveDroppedBombAnchorPosition();
   }
   if (bombPickupTriggerEnabled) {
-    return tryResolveBombBaseRuntimeLootPosition("bot_base_key_runtime") ?? tryGetActiveBasePickupAnchor();
+    return (
+      tryResolveBombBaseRuntimeLootPosition("bot_base_key_runtime") ??
+      tryGetActiveBasePickupAnchor() ??
+      nextKeyUnlockAnchorPosition ??
+      getDefaultBotCipherKeyAnchorPosition()
+    );
   }
-  return undefined;
+  return nextKeyUnlockAnchorPosition ?? tryGetActiveBasePickupAnchor() ?? getDefaultBotCipherKeyAnchorPosition();
 }
 
 function canBotRunToCipherKey(sp: Player, keyIsDropped: boolean): boolean {
   if (!isLiveBotDeployedAndAlive(sp)) return false;
   if (bombCarrierPlayerId === sp.id) return false;
-  return keyIsDropped ? isEligibleDroppedBombReclaimCandidate(sp) : isEligibleBombRadiusPickupCandidate(sp);
+  if (keyIsDropped) return isEligibleDroppedBombReclaimCandidate(sp);
+  if (bombPickupTriggerEnabled) return isEligibleBombRadiusPickupCandidate(sp);
+  return true;
 }
 
 function isValidBotCarrierDeliveryObjective(cpId: number, carrierTeam: mod.Team): boolean {
@@ -4998,6 +5164,12 @@ function evaluateBotCarrierSupportRouting(
     const friendlyCarrier = mod.Equals(botTeam, carrierRouting.carrierTeam);
     const role: BotObjectiveRole = friendlyCarrier ? "escortCarrier" : "interceptCarrier";
     const offsetMeters = friendlyCarrier ? 2.75 : 3.5;
+    if (!friendlyCarrier) {
+      const carrier = serverPlayers.get(carrierRouting.carrierId as number);
+      if (carrier && mod.IsPlayerValid(carrier.player)) {
+        trySetRuntimeBotTarget(sp, carrier.player);
+      }
+    }
     issueBotMoveCommand(sp, role, getBotOffsetTarget(carrierRouting.carrierPos as mod.Vector, sp.id, offsetMeters), nowSec);
     routedByPlayerId[sp.id] = true;
   });
@@ -14938,10 +15110,6 @@ function getCipherAdminButtonLabelWidgetName(playerId: number, action: CipherAdm
   return CIPHER_ADMIN_BUTTON_LABEL_PREFIX + action + "_" + playerId;
 }
 
-function getCipherAdminButtonBgWidgetName(playerId: number, action: CipherAdminAction): string {
-  return CIPHER_ADMIN_BUTTON_BG_PREFIX + action + "_" + playerId;
-}
-
 function getCipherAdminButtonBorderWidgetName(playerId: number, action: CipherAdminAction): string {
   return getCipherAdminButtonWidgetName(playerId, action) + "_BORDER";
 }
@@ -14961,9 +15129,18 @@ function getCipherAdminActions(): CipherAdminAction[] {
     "start_sudden_death",
     "restart_prematch",
     "end_match",
+    "toggle_bots",
+    "clear_bots",
+    "force_bot_reconcile",
     "close",
     "close_x",
   ];
+}
+
+function getCipherAdminToggleBotsLabelKey(): any {
+  return cipherRuntimeBotsEnabled
+    ? (mod.stringkeys as any).CipherAdminButtonToggleBotsOff
+    : (mod.stringkeys as any).CipherAdminButtonToggleBotsOn;
 }
 
 function isCipherHumanServerPlayer(p: Player | undefined): boolean {
@@ -15080,6 +15257,10 @@ function refreshCipherAdminPanelForPlayerId(playerId: number): void {
     getCipherAdminActionCountWidgetName(playerId),
     mod.Message((mod.stringkeys as any).CipherAdminActionCount, cipherAdminActionCount)
   );
+  SafeSetTextLabelByName(
+    getCipherAdminButtonLabelWidgetName(playerId, "toggle_bots"),
+    mod.Message(getCipherAdminToggleBotsLabelKey())
+  );
 }
 
 function refreshCipherAdminPanels(): void {
@@ -15112,7 +15293,6 @@ function disableCipherAdminButtonEventsForPlayerId(playerId: number): void {
 function deleteCipherAdminPanelForPlayerId(playerId: number): void {
   const actions = getCipherAdminActions();
   for (let i = 0; i < actions.length; i++) {
-    safeDeleteAllWidgetsByName(getCipherAdminButtonBgWidgetName(playerId, actions[i]));
     safeDeleteAllWidgetsByName(getCipherAdminButtonLabelWidgetName(playerId, actions[i]));
     safeDeleteAllWidgetsByName(getCipherAdminButtonWidgetName(playerId, actions[i]));
     safeDeleteAllWidgetsByName(getCipherAdminButtonBorderWidgetName(playerId, actions[i]));
@@ -15124,17 +15304,36 @@ function deleteCipherAdminPanelForPlayerId(playerId: number): void {
   safeDeleteAllWidgetsByName(getCipherAdminRootWidgetName(playerId));
 }
 
-async function deleteCipherAdminPanelForPlayerIdDeferred(playerId: number, expectedToken: number): Promise<void> {
-  await mod.Wait(CIPHER_ADMIN_DEFERRED_DELETE_DELAY_SECONDS);
-  if (cipherAdminPanelCloseTokenByPlayerId[playerId] !== expectedToken) return;
-  deleteCipherAdminPanelForPlayerId(playerId);
-  delete cipherAdminPanelDeletingByPlayerId[playerId];
+function clearCipherAdminPanelDeleteTimerForPlayerId(playerId: number): void {
+  const handle = cipherAdminPanelDeleteTimerByPlayerId[playerId];
+  if (handle !== undefined) {
+    Timers.clearTimeout(handle);
+  }
+  delete cipherAdminPanelDeleteTimerByPlayerId[playerId];
+}
+
+function clearAllCipherAdminPanelDeleteTimers(): void {
+  for (const playerIdKey in cipherAdminPanelDeleteTimerByPlayerId) {
+    clearCipherAdminPanelDeleteTimerForPlayerId(Number(playerIdKey));
+  }
+  cipherAdminPanelDeleteTimerByPlayerId = {};
+}
+
+function deleteCipherAdminPanelForPlayerIdDeferred(playerId: number, expectedToken: number): void {
+  clearCipherAdminPanelDeleteTimerForPlayerId(playerId);
+  cipherAdminPanelDeleteTimerByPlayerId[playerId] = Timers.setTimeout(() => {
+    if (cipherAdminPanelCloseTokenByPlayerId[playerId] !== expectedToken) return;
+    deleteCipherAdminPanelForPlayerId(playerId);
+    delete cipherAdminPanelDeletingByPlayerId[playerId];
+    delete cipherAdminPanelDeleteTimerByPlayerId[playerId];
+  }, CIPHER_ADMIN_DEFERRED_DELETE_DELAY_SECONDS * 1000);
 }
 
 function closeCipherAdminPanelForPlayerId(playerId: number, deleteImmediately: boolean = false): void {
   const token = (cipherAdminPanelCloseTokenByPlayerId[playerId] ?? 0) + 1;
   cipherAdminPanelCloseTokenByPlayerId[playerId] = token;
   delete cipherAdminPanelVisibleByPlayerId[playerId];
+  resetCipherAdminPrimaryClickTrackerForPlayerId(playerId);
   disableCipherAdminButtonEventsForPlayerId(playerId);
 
   let root: mod.UIWidget | undefined = undefined;
@@ -15155,17 +15354,20 @@ function closeCipherAdminPanelForPlayerId(playerId: number, deleteImmediately: b
   }
 
   if (deleteImmediately) {
+    clearCipherAdminPanelDeleteTimerForPlayerId(playerId);
     deleteCipherAdminPanelForPlayerId(playerId);
     delete cipherAdminPanelDeletingByPlayerId[playerId];
     return;
   }
 
   cipherAdminPanelDeletingByPlayerId[playerId] = true;
-  void deleteCipherAdminPanelForPlayerIdDeferred(playerId, token);
+  deleteCipherAdminPanelForPlayerIdDeferred(playerId, token);
 }
 
 function forceDeleteCipherAdminPanelForPlayerId(playerId: number): void {
   cipherAdminPanelCloseTokenByPlayerId[playerId] = (cipherAdminPanelCloseTokenByPlayerId[playerId] ?? 0) + 1;
+  clearCipherAdminPanelDeleteTimerForPlayerId(playerId);
+  resetCipherAdminPrimaryClickTrackerForPlayerId(playerId);
   deleteCipherAdminPanelForPlayerId(playerId);
   delete cipherAdminPanelVisibleByPlayerId[playerId];
   delete cipherAdminPanelDeletingByPlayerId[playerId];
@@ -15181,6 +15383,20 @@ function closeCipherAdminPanelsForAllPlayers(): void {
   for (const playerIdKey in cipherAdminPanelVisibleByPlayerId) {
     closeCipherAdminPanelForPlayerId(Number(playerIdKey));
   }
+}
+
+function forceDeleteCipherAdminPanelsForAllPlayers(): void {
+  const playerIdsByKey: { [playerId: number]: boolean } = {};
+  for (const playerIdKey in cipherAdminPanelVisibleByPlayerId) {
+    playerIdsByKey[Number(playerIdKey)] = true;
+  }
+  for (const playerIdKey in cipherAdminPanelDeleteTimerByPlayerId) {
+    playerIdsByKey[Number(playerIdKey)] = true;
+  }
+  for (const playerIdKey in playerIdsByKey) {
+    forceDeleteCipherAdminPanelForPlayerId(Number(playerIdKey));
+  }
+  clearAllCipherAdminPanelDeleteTimers();
 }
 
 function clearCipherAdminInteractPoint(context: string): void {
@@ -15199,9 +15415,10 @@ function clearCipherAdminInteractPoint(context: string): void {
 }
 
 function clearCipherAdminRuntimeState(context: string): void {
-  closeCipherAdminPanelsForAllPlayers();
+  forceDeleteCipherAdminPanelsForAllPlayers();
   clearCipherAdminInteractPoint(context);
   cipherAdminButtonLastHandledTickByKey = {};
+  cipherAdminPrimaryClickByPlayerId = {};
 }
 
 function enableCipherAdminInteractPointById(interactId: number, enabled: boolean): void {
@@ -15403,7 +15620,6 @@ function addCipherAdminButton(
 ): void {
   const buttonName = getCipherAdminButtonWidgetName(playerId, action);
   const labelName = getCipherAdminButtonLabelWidgetName(playerId, action);
-  const bgName = getCipherAdminButtonBgWidgetName(playerId, action);
   const borderName = getCipherAdminButtonBorderWidgetName(playerId, action);
   const size = sizeOverride ?? (wide ? CIPHER_ADMIN_WIDE_BUTTON_SIZE : CIPHER_ADMIN_BUTTON_SIZE);
   const borderSize = mod.Add(
@@ -15428,10 +15644,11 @@ function addCipherAdminButton(
 
   const border = mod.FindUIWidgetWithName(borderName);
   const buttonParent = border ?? parent;
+  const childPosition = border ? mod.CreateVector(0, 0, 0) : pos;
 
   mod.AddUIButton(
     buttonName,
-    mod.CreateVector(0, 0, 0),
+    childPosition,
     size,
     mod.UIAnchor.Center,
     buttonParent,
@@ -15459,12 +15676,13 @@ function addCipherAdminButton(
   if (button && border) {
     try {
       mod.SetUIWidgetParent(button, border);
+      mod.SetUIWidgetPosition(button, mod.CreateVector(0, 0, 0));
     } catch (_errParentButton) {}
   }
 
   mod.AddUIText(
     labelName,
-    mod.CreateVector(0, 0, 0),
+    childPosition,
     size,
     mod.UIAnchor.Center,
     buttonParent,
@@ -15486,11 +15704,12 @@ function addCipherAdminButton(
     try {
       mod.SetUIWidgetParent(label, border);
       mod.SetUIWidgetPosition(label, mod.CreateVector(0, 0, 0));
+      mod.SetUIWidgetSize(label, size);
+      mod.SetUITextAnchor(label, mod.UIAnchor.Center);
     } catch (_errParentLabel) {}
   }
 
   enableCipherAdminButtonEvents(mod.FindUIWidgetWithName(buttonName), true);
-  SafeSetWidgetDepthHandle(mod.FindUIWidgetWithName(bgName), mod.UIDepth.AboveGameUI);
   SafeSetWidgetDepthHandle(mod.FindUIWidgetWithName(borderName), mod.UIDepth.AboveGameUI);
   SafeSetWidgetDepthHandle(mod.FindUIWidgetWithName(buttonName), mod.UIDepth.AboveGameUI);
   SafeSetWidgetDepthHandle(mod.FindUIWidgetWithName(labelName), mod.UIDepth.AboveGameUI);
@@ -15545,7 +15764,7 @@ function openCipherAdminPanelForPlayer(player: mod.Player): void {
 
   mod.AddUIText(
     getCipherAdminTitleWidgetName(playerId),
-    mod.CreateVector(0, -196, 0),
+    mod.CreateVector(0, -242, 0),
     mod.CreateVector(500, 36, 0),
     mod.UIAnchor.Center,
     panel,
@@ -15564,7 +15783,7 @@ function openCipherAdminPanelForPlayer(player: mod.Player): void {
 
   mod.AddUIText(
     getCipherAdminStatusWidgetName(playerId),
-    mod.CreateVector(0, -160, 0),
+    mod.CreateVector(0, -208, 0),
     mod.CreateVector(500, 30, 0),
     mod.UIAnchor.Center,
     panel,
@@ -15583,7 +15802,7 @@ function openCipherAdminPanelForPlayer(player: mod.Player): void {
 
   mod.AddUIText(
     getCipherAdminActionCountWidgetName(playerId),
-    mod.CreateVector(0, -136, 0),
+    mod.CreateVector(0, -184, 0),
     mod.CreateVector(500, 24, 0),
     mod.UIAnchor.Center,
     panel,
@@ -15605,26 +15824,29 @@ function openCipherAdminPanelForPlayer(player: mod.Player): void {
     playerId,
     panel,
     "close_x",
-    mod.CreateVector(246, -198, 0),
+    mod.CreateVector(276, -244, 0),
     (mod.stringkeys as any).CipherAdminButtonCloseX,
     false,
     CIPHER_ADMIN_CLOSE_X_BUTTON_SIZE,
     20
   );
-  addCipherAdminButton(player, playerId, panel, "t1_dec", mod.CreateVector(-180, -104, 0), (mod.stringkeys as any).CipherAdminButtonT1Dec);
-  addCipherAdminButton(player, playerId, panel, "t1_inc", mod.CreateVector(0, -104, 0), (mod.stringkeys as any).CipherAdminButtonT1Inc);
-  addCipherAdminButton(player, playerId, panel, "t2_dec", mod.CreateVector(-180, -62, 0), (mod.stringkeys as any).CipherAdminButtonT2Dec);
-  addCipherAdminButton(player, playerId, panel, "t2_inc", mod.CreateVector(0, -62, 0), (mod.stringkeys as any).CipherAdminButtonT2Inc);
-  addCipherAdminButton(player, playerId, panel, "time_dec", mod.CreateVector(-180, -20, 0), (mod.stringkeys as any).CipherAdminButtonTimeDec);
-  addCipherAdminButton(player, playerId, panel, "time_inc", mod.CreateVector(0, -20, 0), (mod.stringkeys as any).CipherAdminButtonTimeInc);
-  addCipherAdminButton(player, playerId, panel, "expire_timer", mod.CreateVector(-180, 22, 0), (mod.stringkeys as any).CipherAdminButtonExpireTimer);
-  addCipherAdminButton(player, playerId, panel, "reset_timer", mod.CreateVector(0, 22, 0), (mod.stringkeys as any).CipherAdminButtonResetTimer);
-  addCipherAdminButton(player, playerId, panel, "force_half1", mod.CreateVector(-180, 64, 0), (mod.stringkeys as any).CipherAdminButtonForceHalf1);
-  addCipherAdminButton(player, playerId, panel, "force_half2", mod.CreateVector(0, 64, 0), (mod.stringkeys as any).CipherAdminButtonForceHalf2);
-  addCipherAdminButton(player, playerId, panel, "start_sudden_death", mod.CreateVector(90, 106, 0), (mod.stringkeys as any).CipherAdminButtonStartSuddenDeath, true);
-  addCipherAdminButton(player, playerId, panel, "restart_prematch", mod.CreateVector(-140, 148, 0), (mod.stringkeys as any).CipherAdminButtonRestartPrematch, true);
-  addCipherAdminButton(player, playerId, panel, "end_match", mod.CreateVector(140, 148, 0), (mod.stringkeys as any).CipherAdminButtonEndMatch, true);
-  addCipherAdminButton(player, playerId, panel, "close", mod.CreateVector(0, 190, 0), (mod.stringkeys as any).CipherAdminButtonClose, true);
+  addCipherAdminButton(player, playerId, panel, "t1_dec", mod.CreateVector(-145, -146, 0), (mod.stringkeys as any).CipherAdminButtonT1Dec, false, CIPHER_ADMIN_GRID_BUTTON_SIZE);
+  addCipherAdminButton(player, playerId, panel, "t1_inc", mod.CreateVector(145, -146, 0), (mod.stringkeys as any).CipherAdminButtonT1Inc, false, CIPHER_ADMIN_GRID_BUTTON_SIZE);
+  addCipherAdminButton(player, playerId, panel, "t2_dec", mod.CreateVector(-145, -108, 0), (mod.stringkeys as any).CipherAdminButtonT2Dec, false, CIPHER_ADMIN_GRID_BUTTON_SIZE);
+  addCipherAdminButton(player, playerId, panel, "t2_inc", mod.CreateVector(145, -108, 0), (mod.stringkeys as any).CipherAdminButtonT2Inc, false, CIPHER_ADMIN_GRID_BUTTON_SIZE);
+  addCipherAdminButton(player, playerId, panel, "time_dec", mod.CreateVector(-145, -70, 0), (mod.stringkeys as any).CipherAdminButtonTimeDec, false, CIPHER_ADMIN_GRID_BUTTON_SIZE);
+  addCipherAdminButton(player, playerId, panel, "time_inc", mod.CreateVector(145, -70, 0), (mod.stringkeys as any).CipherAdminButtonTimeInc, false, CIPHER_ADMIN_GRID_BUTTON_SIZE);
+  addCipherAdminButton(player, playerId, panel, "expire_timer", mod.CreateVector(-145, -32, 0), (mod.stringkeys as any).CipherAdminButtonExpireTimer, false, CIPHER_ADMIN_GRID_BUTTON_SIZE);
+  addCipherAdminButton(player, playerId, panel, "reset_timer", mod.CreateVector(145, -32, 0), (mod.stringkeys as any).CipherAdminButtonResetTimer, false, CIPHER_ADMIN_GRID_BUTTON_SIZE);
+  addCipherAdminButton(player, playerId, panel, "force_half1", mod.CreateVector(-145, 6, 0), (mod.stringkeys as any).CipherAdminButtonForceHalf1, false, CIPHER_ADMIN_GRID_BUTTON_SIZE);
+  addCipherAdminButton(player, playerId, panel, "force_half2", mod.CreateVector(145, 6, 0), (mod.stringkeys as any).CipherAdminButtonForceHalf2, false, CIPHER_ADMIN_GRID_BUTTON_SIZE);
+  addCipherAdminButton(player, playerId, panel, "start_sudden_death", mod.CreateVector(-145, 44, 0), (mod.stringkeys as any).CipherAdminButtonStartSuddenDeath, false, CIPHER_ADMIN_GRID_BUTTON_SIZE);
+  addCipherAdminButton(player, playerId, panel, "restart_prematch", mod.CreateVector(145, 44, 0), (mod.stringkeys as any).CipherAdminButtonRestartPrematch, false, CIPHER_ADMIN_GRID_BUTTON_SIZE, 13);
+  addCipherAdminButton(player, playerId, panel, "end_match", mod.CreateVector(-145, 82, 0), (mod.stringkeys as any).CipherAdminButtonEndMatch, false, CIPHER_ADMIN_GRID_BUTTON_SIZE);
+  addCipherAdminButton(player, playerId, panel, "toggle_bots", mod.CreateVector(145, 82, 0), getCipherAdminToggleBotsLabelKey(), false, CIPHER_ADMIN_GRID_BUTTON_SIZE);
+  addCipherAdminButton(player, playerId, panel, "clear_bots", mod.CreateVector(-145, 120, 0), (mod.stringkeys as any).CipherAdminButtonClearBots, false, CIPHER_ADMIN_GRID_BUTTON_SIZE);
+  addCipherAdminButton(player, playerId, panel, "force_bot_reconcile", mod.CreateVector(145, 120, 0), (mod.stringkeys as any).CipherAdminButtonForceBotReconcile, false, CIPHER_ADMIN_GRID_BUTTON_SIZE, 13);
+  addCipherAdminButton(player, playerId, panel, "close", mod.CreateVector(0, 220, 0), (mod.stringkeys as any).CipherAdminButtonClose, true, mod.CreateVector(540, 34, 0));
 
   cipherAdminPanelVisibleByPlayerId[playerId] = true;
   try {
@@ -15635,10 +15857,7 @@ function openCipherAdminPanelForPlayer(player: mod.Player): void {
 
 function parseCipherAdminActionFromWidgetName(widgetName: string, playerId: number): CipherAdminAction | undefined {
   const suffix = "_" + String(playerId);
-  let prefix = CIPHER_ADMIN_BUTTON_PREFIX;
-  if (widgetName.indexOf(prefix) !== 0) {
-    prefix = CIPHER_ADMIN_BUTTON_LABEL_PREFIX;
-  }
+  const prefix = CIPHER_ADMIN_BUTTON_PREFIX;
   if (widgetName.indexOf(prefix) !== 0) return undefined;
   if (widgetName.lastIndexOf(suffix) !== widgetName.length - suffix.length) return undefined;
 
@@ -15656,6 +15875,62 @@ function getUiWidgetNameSafe(widget: mod.UIWidget): string {
   } catch (_err) {
     return "";
   }
+}
+
+function resetCipherAdminPrimaryClickTrackerForPlayerId(playerId: number): void {
+  delete cipherAdminPrimaryClickByPlayerId[playerId];
+}
+
+function isCipherAdminPrimaryClickEvent(eventUIButtonEvent: mod.UIButtonEvent): boolean {
+  return (
+    mod.Equals(eventUIButtonEvent, mod.UIButtonEvent.ButtonDown) ||
+    mod.Equals(eventUIButtonEvent, mod.UIButtonEvent.ButtonUp)
+  );
+}
+
+function getCipherAdminPrimaryClickPhase(eventUIButtonEvent: mod.UIButtonEvent): CipherAdminPrimaryClickPhase {
+  return mod.Equals(eventUIButtonEvent, mod.UIButtonEvent.ButtonDown) ? "down" : "up";
+}
+
+function getCipherAdminClickTimeSeconds(): number {
+  try {
+    return mod.GetMatchTimeElapsed();
+  } catch (_err) {
+    return getCurrentSchedulerNowSeconds();
+  }
+}
+
+function tryConsumeCipherAdminPrimaryClickEvent(
+  playerId: number,
+  widgetName: string,
+  eventUIButtonEvent: mod.UIButtonEvent
+): boolean {
+  if (!isCipherAdminPrimaryClickEvent(eventUIButtonEvent)) return false;
+
+  const nowSec = getCipherAdminClickTimeSeconds();
+  const phase = getCipherAdminPrimaryClickPhase(eventUIButtonEvent);
+  const prior = cipherAdminPrimaryClickByPlayerId[playerId];
+
+  if (prior && prior.widgetName === widgetName) {
+    if (
+      prior.phase === "down" &&
+      phase === "up" &&
+      nowSec - prior.atSeconds <= CIPHER_ADMIN_PRIMARY_CLICK_RELEASE_GRACE_SECONDS
+    ) {
+      resetCipherAdminPrimaryClickTrackerForPlayerId(playerId);
+      return false;
+    }
+
+    if (
+      prior.phase === phase &&
+      nowSec - prior.atSeconds <= CIPHER_ADMIN_PRIMARY_CLICK_DEBOUNCE_SECONDS
+    ) {
+      return false;
+    }
+  }
+
+  cipherAdminPrimaryClickByPlayerId[playerId] = { widgetName, atSeconds: nowSec, phase };
+  return true;
 }
 
 function isCipherAdminButtonDebounced(playerId: number, action: CipherAdminAction): boolean {
@@ -15700,6 +15975,9 @@ function getCipherAdminActionLogKey(action: CipherAdminAction): any {
   if (action === "start_sudden_death") return (mod.stringkeys as any).CipherAdminActionLogStartSuddenDeath;
   if (action === "restart_prematch") return (mod.stringkeys as any).CipherAdminActionLogRestartPrematch;
   if (action === "end_match") return (mod.stringkeys as any).CipherAdminActionLogEndMatch;
+  if (action === "toggle_bots") return (mod.stringkeys as any).CipherAdminActionLogToggleBots;
+  if (action === "clear_bots") return (mod.stringkeys as any).CipherAdminActionLogClearBots;
+  if (action === "force_bot_reconcile") return (mod.stringkeys as any).CipherAdminActionLogForceBotReconcile;
   return undefined;
 }
 
@@ -15833,6 +16111,11 @@ function ensureCipherAdminLiveInitialized(): boolean {
 function forceCipherAdminLiveHalf(half: CipherHalfIndex): boolean {
   if (!ensureCipherAdminLiveInitialized()) return false;
 
+  if (half === 2 && cipherCurrentHalf === 1 && !isCipherLiveTransitionActive()) {
+    beginCipherSecondHalf(getCurrentSchedulerNowSeconds(), "scoreCap");
+    return true;
+  }
+
   invalidateDeferredBombSpawnTimer();
   invalidateCipherLiveTransitionOwnership();
   cipherSecondHalfTransitionActive = false;
@@ -15858,6 +16141,57 @@ function startCipherAdminSuddenDeath(): boolean {
   if (!ensureCipherAdminLiveInitialized()) return false;
   invalidateDeferredBombSpawnTimer();
   beginCipherSuddenDeath(getCurrentSchedulerNowSeconds());
+  return true;
+}
+
+function resetRuntimeBotSpawnerValidationState(): void {
+  runtimeBotSpawnerValidationComplete = false;
+  runtimeBotSpawnerValidationFailed = false;
+}
+
+function setCipherRuntimeBotsEnabled(enabled: boolean, context: string): boolean {
+  if (!enabled) {
+    cipherRuntimeBotsEnabled = false;
+    clearRuntimeBotState(true);
+    resetRuntimeBotSpawnerValidationState();
+    refreshCipherAdminPanels();
+    return true;
+  }
+
+  cipherRuntimeBotsEnabled = true;
+  runtimeBotNextReconcileAtSec = 0;
+  resetRuntimeBotSpawnerValidationState();
+
+  if (!validateRuntimeBotSpawnersOnce()) {
+    cipherRuntimeBotsEnabled = false;
+    clearRuntimeBotState(true);
+    refreshCipherAdminPanels();
+    return false;
+  }
+
+  reconcileRuntimeBots(getCurrentSchedulerNowSeconds());
+  refreshCipherAdminPanels();
+  void context;
+  return true;
+}
+
+function toggleCipherRuntimeBotsFromAdmin(context: string): boolean {
+  return setCipherRuntimeBotsEnabled(!cipherRuntimeBotsEnabled, context);
+}
+
+function clearCipherRuntimeBotsFromAdmin(): boolean {
+  clearRuntimeBotState(true);
+  runtimeBotNextReconcileAtSec = 0;
+  refreshCipherAdminPanels();
+  return true;
+}
+
+function forceCipherRuntimeBotReconcileFromAdmin(): boolean {
+  runtimeBotNextReconcileAtSec = 0;
+  if (cipherRuntimeBotsEnabled) {
+    reconcileRuntimeBots(getCurrentSchedulerNowSeconds());
+  }
+  refreshCipherAdminPanels();
   return true;
 }
 
@@ -15895,6 +16229,12 @@ function executeCipherAdminAction(player: mod.Player, playerId: number, action: 
       handled = true;
       closeCipherAdminPanelForPlayerId(playerId);
       enterPostmatchFromLive(resolveWinningTeamFromScores());
+    } else if (action === "toggle_bots") {
+      handled = toggleCipherRuntimeBotsFromAdmin("admin_toggle_bots");
+    } else if (action === "clear_bots") {
+      handled = clearCipherRuntimeBotsFromAdmin();
+    } else if (action === "force_bot_reconcile") {
+      handled = forceCipherRuntimeBotReconcileFromAdmin();
     }
 
     if (!handled) {
@@ -25202,7 +25542,7 @@ function Mode_OnPlayerLeaveGame(eventNumber: number): void {
     resetCipherSuddenDeathAliveHudRefsForPlayer(leaving);
     // Ensure HUD can be rebuilt cleanly if the engine destroys UI widgets on disconnect.
     liveHudBuiltByPlayerId[leaving.id] = false;
-    closeCipherAdminPanelForPlayerId(leaving.id);
+    forceDeleteCipherAdminPanelForPlayerId(leaving.id);
     if (cipherAdminPlayerId === leaving.id) {
       cipherAdminPlayerId = undefined;
       clearCipherAdminInteractPoint("admin_left");
@@ -25697,6 +26037,7 @@ function Mode_OnPlayerUIButtonEvent(
     const widgetName = getUiWidgetNameSafe(eventUIWidget);
     const action = parseCipherAdminActionFromWidgetName(widgetName, playerId);
     if (!action) return;
+    if (!tryConsumeCipherAdminPrimaryClickEvent(playerId, widgetName, eventUIButtonEvent)) return;
     if (isCipherAdminButtonDebounced(playerId, action)) return;
 
     executeCipherAdminAction(eventPlayer, playerId, action);
