@@ -32,6 +32,7 @@
 import { BOMB_CONFIG } from '../config/bomb.ts';
 import { SQUAD_OBJECTIVE_CONFIGS } from '../config/objectives.ts';
 import { RULES } from '../config/rules.ts';
+import { SPAWN_ROUTING_CONFIG } from '../config/spawn-routing.ts';
 import { WORLD_IDS } from '../config/world-ids.ts';
 import { modlib } from '../utils/mod-compat.ts';
 import { PerformanceStats } from 'bf6-portal-utils/performance-stats/index.ts';
@@ -264,6 +265,7 @@ type CipherTransitionWorkItem = {
 const CIPHER_DEFERRED_LIVE_START_KEY_DELAY_SECONDS = 0.05;
 const CIPHER_TRANSITION_NORMAL_WORK_PER_TICK = 2;
 const CIPHER_TRANSITION_HEAVY_WORK_PER_TICK = 1;
+const CIPHER_TRANSITION_UNDEPLOY_WORK_PER_TICK = 2;
 const CIPHER_TRANSITION_FINALIZER_WATCHDOG_SECONDS = 8;
 const CIPHER_TRANSITION_OBJECTIVE_EVENT_SUPPRESS_SECONDS = 0.35;
 
@@ -310,6 +312,7 @@ let cipherTransitionFinalizerActive = false;
 let cipherTransitionFinalizerKind: CipherLiveTransitionSupervisorKind = "none";
 let cipherTransitionFinalizerToken = 0;
 let cipherTransitionFinalizerStartedAtSec = 0;
+let cipherTransitionUndeployCursor = 0;
 let cipherTransitionLastCheckpoint = "";
 let cipherTransitionLastError = "";
 let cipherTransitionEngineMutationActive = false;
@@ -787,6 +790,10 @@ for (let i = 0; i < OBJECTIVE_DEFINITIONS.length; i++) {
 }
 const HARD_DISABLED_OBJECTIVE_MCOM_IDS: number[] = [7101, 7102, 7103, 7104];
 const EXPECTED_OBJECTIVE_MCOM_IDS: number[] = HARD_DISABLED_OBJECTIVE_MCOM_IDS.slice();
+const HARD_DISABLED_OBJECTIVE_MCOM_DROP_Y = -300;
+const hardObjectiveMcomMovedBelowMapById: { [mcomId: number]: boolean } = {};
+const hardObjectiveMcomInitialPositionById: { [mcomId: number]: mod.Vector | undefined } = {};
+const hardObjectiveMcomMoveWarnedByKey: { [key: string]: boolean } = {};
 
 const DAMAGE_PER_PULSE = 8;
 const DAMAGE_INTERVAL_SECONDS = 0.25;
@@ -1066,9 +1073,15 @@ const HQ_DESYNC_MAX_FORCED_REDEPLOYS = 2;     // safety: prevent infinite loops
 
 
 /* Safe spawn tuning */
-const SAFE_SPAWN_CHECK_DELAY_SECONDS = 0.1;
+const SAFE_SPAWN_CHECK_DELAY_SECONDS = SPAWN_ROUTING_CONFIG.safeSpawnCheckDelaySeconds;
 const CIPHER_SPAWN_ENEMY_DANGER_RADIUS_METERS = 18;
 const SAFE_SPAWN_ENEMY_RADIUS_METERS = CIPHER_SPAWN_ENEMY_DANGER_RADIUS_METERS;
+const CIPHER_RESPAWN_ROUTE_EVALUATION_SECONDS = SPAWN_ROUTING_CONFIG.routeEvaluationDurationSeconds;
+const CIPHER_RESPAWN_ROUTE_TICK_SECONDS = SPAWN_ROUTING_CONFIG.routeEvaluationTickSeconds;
+const CIPHER_RESPAWN_OBJECTIVE_PRESSURE_RADIUS_METERS = SPAWN_ROUTING_CONFIG.objectivePressureRadiusMeters;
+const CIPHER_RESPAWN_CANDIDATE_SAFETY_RADIUS_METERS = SPAWN_ROUTING_CONFIG.queuedCandidateSafetyRadiusMeters;
+const CIPHER_RESPAWN_REROUTE_SAFETY_RADIUS_METERS = SPAWN_ROUTING_CONFIG.rerouteSafetyRadiusMeters;
+const CIPHER_RESPAWN_ROUTE_TICK_MS = mod.Max(1, CIPHER_RESPAWN_ROUTE_TICK_SECONDS * 1000);
 
 // This is the number of unsafe attempts allowed before we stop forcing recycle attempts.
 const SAFE_SPAWN_MAX_FORCED_REDEPLOYS = 5;
@@ -1118,6 +1131,17 @@ type CipherSpawnJob = {
   createdAtSec: number;
   attempt: number;
 };
+type CipherRespawnRouteJob = {
+  token: number;
+  playerId: number;
+  teamId: number;
+  startedAtSec: number;
+  currentSecond: number;
+  currentCandidate?: CipherQueuedSpawnAnchor;
+  finalizedCandidate?: CipherQueuedSpawnAnchor;
+  timerHandle?: number;
+  dangerDetected: boolean;
+};
 type SafeSpawnCheckQueueItem = {
   playerId: number;
   generation: number;
@@ -1148,6 +1172,8 @@ let cipherLastSpawnRegionAtSecByTeamId: { [teamId: string]: number | undefined }
 let cipherQueuedAnchorByPlayerId: { [playerId: number]: CipherQueuedSpawnAnchor | undefined } = {};
 let cipherPendingSpawnJobs: CipherSpawnJob[] = [];
 let cipherUrgentSpawnJobs: CipherSpawnJob[] = [];
+let cipherRespawnRouteJobByPlayerId: { [playerId: number]: CipherRespawnRouteJob | undefined } = {};
+const cipherRespawnRouteTokenByPlayerId: { [playerId: number]: number } = {};
 const CIPHER_SPAWN_JOBS_PER_TICK = 1;
 const CIPHER_SPAWN_RETRY_WINDOW_SECONDS = 0.75;
 let safeSpawnCheckQueue: SafeSpawnCheckQueueItem[] = [];
@@ -1496,6 +1522,7 @@ let bombReturnToBaseToken = 0;
 let bombDroppedReturnDeadlineAtSec = 0;
 let bombDroppedWorldIconLastShownSeconds = -1;
 let bombDeferredBaseSpawnToken = 0;
+let cipherDeferredLiveStartKeyTimerHandle: number | undefined = undefined;
 let nextKeyUnlockCountdownToken = 0;
 let nextKeyUnlockDeadlineAtSec = 0;
 let nextKeyUnlockAnchorPosition: mod.Vector | undefined = undefined;
@@ -4109,11 +4136,27 @@ function getObjectivePositionAnchorObjectId(cpId: number): number | undefined {
 
 function getObjectiveAnchorPosition(cpId: number): mod.Vector | undefined {
   const anchorObjectId = getObjectivePositionAnchorObjectId(cpId);
-  if (!anchorObjectId) return undefined;
+  if (!anchorObjectId) {
+    return getObjectiveFallbackPosition(cpId);
+  }
 
   try {
     const anchorObject = mod.GetSpatialObject(anchorObjectId) as unknown as mod.Object;
     return mod.GetObjectPosition(anchorObject);
+  } catch (_err) {
+    return getObjectiveFallbackPosition(cpId);
+  }
+}
+
+function getObjectiveFallbackPosition(cpId: number): mod.Vector | undefined {
+  const mcomPos = tryGetObjectiveMcomPosition(cpId);
+  if (mcomPos) return mcomPos;
+
+  const capturePoint = resolveObjectiveCapturePointHandleByCpId(cpId, "getObjectiveFallbackPosition");
+  if (!capturePoint) return undefined;
+
+  try {
+    return mod.GetObjectPosition(capturePoint as unknown as mod.Object);
   } catch (_err) {
     return undefined;
   }
@@ -5017,6 +5060,7 @@ function snapshotVector(position: mod.Vector): CipherVectorSnapshot {
 }
 
 function resetCipherSpawnRoutingState(): void {
+  cancelAllCipherRespawnRouteJobs();
   cipherPresenceZoneActivePlayersByZone = {};
   cipherPresenceZonesByPlayerId = {};
   cipherAnchorPositionByObjectId = {};
@@ -5031,6 +5075,7 @@ function resetCipherSpawnRoutingState(): void {
   cipherQueuedAnchorByPlayerId = {};
   cipherPendingSpawnJobs = [];
   cipherUrgentSpawnJobs = [];
+  cipherRespawnRouteJobByPlayerId = {};
 }
 
 function clearCipherSpawnJobQueues(): void {
@@ -5370,10 +5415,27 @@ function buildCipherSpawnRegionCandidates(team: mod.Team, side: CipherMapSide): 
   return candidates;
 }
 
-function isCipherAnchorSafeFromEnemies(anchorPos: mod.Vector, team: mod.Team): boolean {
+function countCipherEnemiesNearPosition(
+  team: mod.Team,
+  pos: mod.Vector,
+  radiusMeters: number,
+  ignorePlayerId: number = -1
+): number {
+  return countCipherEnemiesNearPositionWithinRadius(team, pos, radiusMeters, ignorePlayerId);
+}
+
+function countCipherEnemiesNearPositionWithinRadius(
+  team: mod.Team,
+  pos: mod.Vector,
+  radiusMeters: number,
+  ignorePlayerId: number = -1
+): number {
   const enemyTeam = getOpposingTeam(team);
+  let count = 0;
+
   for (const playerIdKey in cipherPlayerPositionSnapshotByPlayerId) {
     const playerId = Number(playerIdKey);
+    if (playerId === ignorePlayerId) continue;
     const sp = serverPlayers.get(playerId);
     if (!sp || !mod.IsPlayerValid(sp.player)) continue;
     if (!sp.isDeployed) continue;
@@ -5388,17 +5450,28 @@ function isCipherAnchorSafeFromEnemies(anchorPos: mod.Vector, team: mod.Team): b
     }
     cipherPlayerPositionSnapshotByPlayerId[playerId] = snapshot;
     const enemyPos = mod.CreateVector(snapshot.x, snapshot.y, snapshot.z);
-    if (getBombVectorHorizontalDistanceMeters(anchorPos, enemyPos) <= CIPHER_ANCHOR_ENEMY_SAFETY_RADIUS_METERS) {
-      return false;
+    if (getBombVectorHorizontalDistanceMeters(pos, enemyPos) <= radiusMeters) {
+      count += 1;
     }
   }
-  return true;
+
+  return count;
+}
+
+function isCipherAnchorSafeFromEnemiesWithinRadius(anchorPos: mod.Vector, team: mod.Team, radiusMeters: number): boolean {
+  return countCipherEnemiesNearPositionWithinRadius(team, anchorPos, radiusMeters) <= 0;
+}
+
+function isCipherAnchorSafeFromEnemies(anchorPos: mod.Vector, team: mod.Team): boolean {
+  return isCipherAnchorSafeFromEnemiesWithinRadius(anchorPos, team, CIPHER_ANCHOR_ENEMY_SAFETY_RADIUS_METERS);
 }
 
 function chooseCipherAnchorIdForRegion(
   playerId: number,
   team: mod.Team,
-  region: CipherSpawnRegion
+  region: CipherSpawnRegion,
+  safetyRadiusMeters: number = CIPHER_ANCHOR_ENEMY_SAFETY_RADIUS_METERS,
+  allowUnsafeFallback: boolean = false
 ): number | undefined {
   const anchorIds = getCipherAnchorIdsForRegion(region);
   if (anchorIds.length <= 0) return undefined;
@@ -5408,13 +5481,25 @@ function chooseCipherAnchorIdForRegion(
   const startIndex = cipherAnchorRoundRobinIndexByKey[key] ?? 0;
   let safeCooldownFallbackAnchorId: number | undefined = undefined;
   let safeCooldownFallbackIndex = startIndex;
+  let leastDangerousAnchorId: number | undefined = undefined;
+  let leastDangerousEnemyCount = 999999;
+  let leastDangerousIndex = startIndex;
 
   for (let offset = 0; offset < anchorIds.length; offset++) {
     const idx = mod.Modulo(startIndex + offset, anchorIds.length);
     const anchorId = anchorIds[idx];
     const anchorPos = getCachedCipherAnchorPosition(anchorId);
     if (!anchorPos) continue;
-    if (!isCipherAnchorSafeFromEnemies(anchorPos, team)) continue;
+    const enemyCount = countCipherEnemiesNearPositionWithinRadius(team, anchorPos, safetyRadiusMeters, playerId);
+    if (
+      enemyCount < leastDangerousEnemyCount ||
+      (enemyCount === leastDangerousEnemyCount && anchorId < (leastDangerousAnchorId ?? 999999))
+    ) {
+      leastDangerousAnchorId = anchorId;
+      leastDangerousEnemyCount = enemyCount;
+      leastDangerousIndex = idx;
+    }
+    if (enemyCount > 0) continue;
 
     const cooldownUntil = cipherAnchorCooldownUntilSecByObjectId[anchorId] ?? 0;
     if (cooldownUntil > nowSec) {
@@ -5433,21 +5518,31 @@ function chooseCipherAnchorIdForRegion(
   if (safeCooldownFallbackAnchorId !== undefined) {
     cipherAnchorRoundRobinIndexByKey[key] = mod.Modulo(safeCooldownFallbackIndex + 1, anchorIds.length);
     cipherAnchorCooldownUntilSecByObjectId[safeCooldownFallbackAnchorId] = nowSec + CIPHER_ANCHOR_COOLDOWN_SECONDS;
+    return safeCooldownFallbackAnchorId;
+  }
+
+  if (allowUnsafeFallback && leastDangerousAnchorId !== undefined) {
+    cipherAnchorRoundRobinIndexByKey[key] = mod.Modulo(leastDangerousIndex + 1, anchorIds.length);
+    cipherAnchorCooldownUntilSecByObjectId[leastDangerousAnchorId] = nowSec + CIPHER_ANCHOR_COOLDOWN_SECONDS;
+    return leastDangerousAnchorId;
   }
   void playerId;
-  return safeCooldownFallbackAnchorId;
+  return undefined;
 }
 
 function chooseCipherSpawnAnchorForPlayer(
   playerId: number,
   team: mod.Team,
-  defaultSide: CipherMapSide
+  defaultSide: CipherMapSide,
+  preferredRegions?: CipherSpawnRegion[],
+  safetyRadiusMeters: number = CIPHER_ANCHOR_ENEMY_SAFETY_RADIUS_METERS,
+  allowUnsafeFallback: boolean = false
 ): CipherQueuedSpawnAnchor | undefined {
-  const candidates = buildCipherSpawnRegionCandidates(team, defaultSide);
+  const candidates = preferredRegions ?? buildCipherSpawnRegionCandidates(team, defaultSide);
 
   for (let i = 0; i < candidates.length; i++) {
     const region = candidates[i];
-    const anchorId = chooseCipherAnchorIdForRegion(playerId, team, region);
+    const anchorId = chooseCipherAnchorIdForRegion(playerId, team, region, safetyRadiusMeters, allowUnsafeFallback);
     if (anchorId === undefined) continue;
     return {
       anchorObjectId: anchorId,
@@ -5457,6 +5552,257 @@ function chooseCipherSpawnAnchorForPlayer(
   }
 
   return undefined;
+}
+
+function cancelCipherRespawnRouteJobForPlayer(playerId: number): void {
+  const job = cipherRespawnRouteJobByPlayerId[playerId];
+  if (job?.timerHandle !== undefined) {
+    Timers.clearInterval(job.timerHandle);
+  }
+  delete cipherRespawnRouteJobByPlayerId[playerId];
+}
+
+function cancelAllCipherRespawnRouteJobs(): void {
+  for (const playerIdKey in cipherRespawnRouteJobByPlayerId) {
+    cancelCipherRespawnRouteJobForPlayer(Number(playerIdKey));
+  }
+  cipherRespawnRouteJobByPlayerId = {};
+}
+
+function nextCipherRespawnRouteToken(playerId: number): number {
+  const token = (cipherRespawnRouteTokenByPlayerId[playerId] ?? 0) + 1;
+  cipherRespawnRouteTokenByPlayerId[playerId] = token;
+  return token;
+}
+
+function invalidateCipherRespawnRouteJobForPlayer(playerId: number): void {
+  nextCipherRespawnRouteToken(playerId);
+  cancelCipherRespawnRouteJobForPlayer(playerId);
+}
+
+function isCipherRespawnRouteJobCurrent(job: CipherRespawnRouteJob): boolean {
+  if (cipherRespawnRouteTokenByPlayerId[job.playerId] !== job.token) return false;
+  if (gameStatus !== 3) return false;
+  if (isCipherLiveTransitionActive()) return false;
+  if (isCipherSuddenDeathActive()) return false;
+
+  const sp = serverPlayers.get(job.playerId);
+  if (!sp || !mod.IsPlayerValid(sp.player)) return false;
+  if (sp.isDeployed) return false;
+
+  const team = mod.GetTeam(sp.player);
+  const teamId = modlib.getTeamId(team);
+  if (teamId !== job.teamId) return false;
+  return mod.Equals(team, team1) || mod.Equals(team, team2);
+}
+
+function getCipherActiveObjectiveDefsForDefendingTeam(team: mod.Team): ObjectiveDefinition[] {
+  const defs: ObjectiveDefinition[] = [];
+  for (let i = 0; i < OBJECTIVE_DEFINITIONS.length; i++) {
+    const def = OBJECTIVE_DEFINITIONS[i];
+    if (def.half !== cipherCurrentHalf) continue;
+    if (!def.countsForRouting) continue;
+    if (!mod.Equals(def.defendingTeam, team)) continue;
+    defs.push(def);
+  }
+  return defs;
+}
+
+function getCipherPresenceLaneForObjective(def: ObjectiveDefinition): CipherPresenceLane {
+  return def.lane === "A" || def.lane === "C" ? "west" : "east";
+}
+
+function getCipherObjectivePressureSpawnRegion(team: mod.Team, side: CipherMapSide): CipherSpawnRegion | undefined {
+  const defs = getCipherActiveObjectiveDefsForDefendingTeam(team);
+  if (defs.length <= 0) return undefined;
+
+  refreshCipherPlayerPositionSnapshots();
+  const pressure: CipherLanePressure = { west: 0, east: 0 };
+  for (let i = 0; i < defs.length; i++) {
+    const def = defs[i];
+    const pos = getCachedObjectiveAnchorPosition(def.cpId);
+    if (!pos) continue;
+    const lane = getCipherPresenceLaneForObjective(def);
+    pressure[lane] += countCipherEnemiesNearPosition(
+      team,
+      pos,
+      CIPHER_RESPAWN_OBJECTIVE_PRESSURE_RADIUS_METERS
+    );
+  }
+
+  if (pressure.west === pressure.east) return undefined;
+  const targetLane: CipherPresenceLane = pressure.west > pressure.east ? "east" : "west";
+  return getCipherStrictSpawnRegionForQuadrant(getCipherStrictQuadrantForSideAndLane(side, targetLane));
+}
+
+function buildCipherRespawnRouteRegionCandidates(team: mod.Team, side: CipherMapSide): CipherSpawnRegion[] {
+  const candidates: CipherSpawnRegion[] = [];
+  const addedByKey: { [key: string]: boolean } = {};
+  const objectivePressureRegion = getCipherObjectivePressureSpawnRegion(team, side);
+  if (objectivePressureRegion) addCipherSpawnRegionCandidate(candidates, addedByKey, objectivePressureRegion);
+
+  const presencePressureRegion = getCipherLanePressureSpawnRegion(team, side);
+  if (presencePressureRegion) addCipherSpawnRegionCandidate(candidates, addedByKey, presencePressureRegion);
+
+  addCipherSpawnRegionCandidate(candidates, addedByKey, getDefaultCipherSpawnRegion(team, side));
+  appendCipherRegionsByLowestPressure(candidates, addedByKey, team, side);
+  return candidates;
+}
+
+function selectCipherRespawnRouteCandidate(
+  playerId: number,
+  team: mod.Team,
+  safetyRadiusMeters: number,
+  allowUnsafeFallback: boolean
+): CipherQueuedSpawnAnchor | undefined {
+  const side = getCipherTeamSideForCurrentHalf(team);
+  if (!side) return undefined;
+  const candidates = buildCipherRespawnRouteRegionCandidates(team, side);
+  return chooseCipherSpawnAnchorForPlayer(playerId, team, side, candidates, safetyRadiusMeters, allowUnsafeFallback);
+}
+
+function isCipherRespawnCandidateSafe(
+  candidate: CipherQueuedSpawnAnchor | undefined,
+  team: mod.Team,
+  radiusMeters: number
+): boolean {
+  if (!candidate) return false;
+  const pos = getCachedCipherAnchorPosition(candidate.anchorObjectId);
+  if (!pos) return false;
+  refreshCipherPlayerPositionSnapshots();
+  return isCipherAnchorSafeFromEnemiesWithinRadius(pos, team, radiusMeters);
+}
+
+function finalizeCipherRespawnRouteJobForPlayer(playerId: number, source: string): void {
+  const job = cipherRespawnRouteJobByPlayerId[playerId];
+  if (!job) return;
+
+  const sp = serverPlayers.get(playerId);
+  if (!sp || !mod.IsPlayerValid(sp.player)) {
+    invalidateCipherRespawnRouteJobForPlayer(playerId);
+    return;
+  }
+
+  const team = mod.GetTeam(sp.player);
+  let candidate = job.finalizedCandidate ?? job.currentCandidate;
+  if (!candidate || !isCipherQueuedSpawnAnchorValidForTeam(candidate, team)) {
+    candidate = selectCipherRespawnRouteCandidate(
+      playerId,
+      team,
+      CIPHER_RESPAWN_REROUTE_SAFETY_RADIUS_METERS,
+      true
+    );
+  }
+
+  if (candidate) {
+    cipherQueuedAnchorByPlayerId[playerId] = candidate;
+  }
+
+  void source;
+  cancelCipherRespawnRouteJobForPlayer(playerId);
+}
+
+function tickCipherRespawnRouteJob(playerId: number, token: number): void {
+  const job = cipherRespawnRouteJobByPlayerId[playerId];
+  if (!job || job.token !== token) return;
+  if (!isCipherRespawnRouteJobCurrent(job)) {
+    invalidateCipherRespawnRouteJobForPlayer(playerId);
+    return;
+  }
+
+  const sp = serverPlayers.get(playerId);
+  if (!sp || !mod.IsPlayerValid(sp.player)) {
+    invalidateCipherRespawnRouteJobForPlayer(playerId);
+    return;
+  }
+
+  const team = mod.GetTeam(sp.player);
+  job.currentSecond += 1;
+
+  if (job.currentSecond === 1) {
+    job.currentCandidate = selectCipherRespawnRouteCandidate(
+      playerId,
+      team,
+      CIPHER_RESPAWN_OBJECTIVE_PRESSURE_RADIUS_METERS,
+      true
+    );
+  } else if (job.currentSecond === 2) {
+    job.dangerDetected = !isCipherRespawnCandidateSafe(
+      job.currentCandidate,
+      team,
+      CIPHER_RESPAWN_CANDIDATE_SAFETY_RADIUS_METERS
+    );
+  } else if (job.currentSecond === 3) {
+    if (job.dangerDetected) {
+      job.currentCandidate = selectCipherRespawnRouteCandidate(
+        playerId,
+        team,
+        CIPHER_RESPAWN_REROUTE_SAFETY_RADIUS_METERS,
+        true
+      );
+      job.dangerDetected = !isCipherRespawnCandidateSafe(
+        job.currentCandidate,
+        team,
+        CIPHER_RESPAWN_REROUTE_SAFETY_RADIUS_METERS
+      );
+    }
+  } else if (job.currentSecond === 4) {
+    if (!isCipherRespawnCandidateSafe(job.currentCandidate, team, CIPHER_RESPAWN_CANDIDATE_SAFETY_RADIUS_METERS)) {
+      job.currentCandidate = selectCipherRespawnRouteCandidate(
+        playerId,
+        team,
+        CIPHER_RESPAWN_REROUTE_SAFETY_RADIUS_METERS,
+        true
+      );
+    }
+  }
+
+  if (job.currentSecond >= CIPHER_RESPAWN_ROUTE_EVALUATION_SECONDS) {
+    job.finalizedCandidate = job.currentCandidate ?? selectCipherRespawnRouteCandidate(
+      playerId,
+      team,
+      CIPHER_RESPAWN_REROUTE_SAFETY_RADIUS_METERS,
+      true
+    );
+    finalizeCipherRespawnRouteJobForPlayer(playerId, "route_timer_complete");
+  }
+}
+
+function shouldStartCipherRespawnRouteJobForPlayer(playerId: number, wasDeployed: boolean): boolean {
+  if (!wasDeployed) return false;
+  if (gameStatus !== 3) return false;
+  if (isCipherLiveTransitionActive()) return false;
+  if (isCipherSuddenDeathActive()) return false;
+  if (safeSpawnForcedUndeploy[playerId] === true || safeSpawnUnsafePending[playerId] === true) return false;
+  if (isCipherRuntimeBotPlayerId(playerId)) return false;
+
+  const sp = serverPlayers.get(playerId);
+  if (!sp || !mod.IsPlayerValid(sp.player)) return false;
+  const team = mod.GetTeam(sp.player);
+  return mod.Equals(team, team1) || mod.Equals(team, team2);
+}
+
+function startCipherRespawnRouteJobForPlayer(playerId: number, wasDeployed: boolean, source: string): void {
+  if (!shouldStartCipherRespawnRouteJobForPlayer(playerId, wasDeployed)) return;
+
+  cancelCipherRespawnRouteJobForPlayer(playerId);
+  const sp = serverPlayers.get(playerId);
+  if (!sp || !mod.IsPlayerValid(sp.player)) return;
+
+  const team = mod.GetTeam(sp.player);
+  const token = nextCipherRespawnRouteToken(playerId);
+  const job: CipherRespawnRouteJob = {
+    token,
+    playerId,
+    teamId: modlib.getTeamId(team),
+    startedAtSec: getCurrentSchedulerNowSeconds(),
+    currentSecond: 0,
+    dangerDetected: false,
+  };
+
+  job.timerHandle = Timers.setInterval(() => tickCipherRespawnRouteJob(playerId, token), CIPHER_RESPAWN_ROUTE_TICK_MS);
+  cipherRespawnRouteJobByPlayerId[playerId] = job;
+  void source;
 }
 
 function getCipherAttackObjectiveCenterForSide(side: CipherMapSide): mod.Vector | undefined {
@@ -5599,6 +5945,49 @@ function getCipherTeleportYawRadians(anchorPos: mod.Vector, targetCenter: mod.Ve
   return Math.atan2(dx, dz);
 }
 
+function getClosestCipherEnemyObjectivePositionForTeleport(
+  team: mod.Team,
+  spawnPos: mod.Vector,
+  queuedAnchor: CipherQueuedSpawnAnchor
+): mod.Vector | undefined {
+  const enemyTeam = getOpposingTeam(team);
+  let defs = getCipherActiveObjectiveDefsForDefendingTeam(enemyTeam);
+
+  if (defs.length <= 0) {
+    const fallbackSide = queuedAnchor.side === "north" ? "south" : "north";
+    const cpIds = getActiveObjectiveCpIdsForSide(fallbackSide);
+    defs = [];
+    for (let i = 0; i < cpIds.length; i++) {
+      const def = objectiveDefByCpId[cpIds[i]];
+      if (def) defs.push(def);
+    }
+  }
+
+  let bestPos: mod.Vector | undefined = undefined;
+  let bestDistance = 999999999;
+  for (let i = 0; i < defs.length; i++) {
+    const pos = getCachedObjectiveAnchorPosition(defs[i].cpId);
+    if (!pos) continue;
+    const distance = getBombVectorHorizontalDistanceSquared(spawnPos, pos);
+    if (distance < bestDistance) {
+      bestDistance = distance;
+      bestPos = pos;
+    }
+  }
+
+  return bestPos;
+}
+
+function computeCipherTeleportYawTowardObjective(
+  spawnPos: mod.Vector,
+  team: mod.Team,
+  queuedAnchor: CipherQueuedSpawnAnchor
+): number {
+  const target = getClosestCipherEnemyObjectivePositionForTeleport(team, spawnPos, queuedAnchor);
+  if (target) return getCipherTeleportYawRadians(spawnPos, target);
+  return getCipherTeleportYawRadians(spawnPos, getCipherAttackObjectiveCenterForSide(queuedAnchor.side));
+}
+
 function teleportCipherPlayerToRoutedAnchor(player: mod.Player, playerId: number): boolean {
   if (!isCipherSpawnRoutingPhaseActive()) return false;
   if (!mod.IsPlayerValid(player)) return false;
@@ -5642,8 +6031,7 @@ function teleportCipherPlayerToRoutedAnchor(player: mod.Player, playerId: number
     }
   }
 
-  const targetCenter = getCipherAttackObjectiveCenterForSide(finalQueuedAnchor.side);
-  const yawRadians = getCipherTeleportYawRadians(anchorPos, targetCenter);
+  const yawRadians = computeCipherTeleportYawTowardObjective(anchorPos, team, finalQueuedAnchor);
 
   try {
     (mod as any).Teleport(player, anchorPos, yawRadians);
@@ -6319,6 +6707,9 @@ function invalidateBombReturnToBaseTimer(): void {
 
 function invalidateDeferredBombSpawnTimer(): void {
   bombDeferredBaseSpawnToken += 1;
+  cipherDeferredLiveStartKeyToken += 1;
+  Timers.clearTimeout(cipherDeferredLiveStartKeyTimerHandle);
+  cipherDeferredLiveStartKeyTimerHandle = undefined;
   clearNextKeyUnlockCountdown("invalidateDeferredBombSpawnTimer", true);
 }
 
@@ -7791,6 +8182,45 @@ function disableHardObjectiveMcoms(context: string): void {
     const def = OBJECTIVE_DEFINITIONS[i];
     if (def.mcomId !== undefined && isHardDisabledObjectiveMcomId(def.mcomId)) {
       objectiveMcomObjectiveEnabledByCpId[def.cpId] = false;
+    }
+  }
+}
+
+function warnHardObjectiveMcomMoveOnce(mcomId: number, context: string, reason: string, err?: unknown): void {
+  const key = String(mcomId) + "/" + reason;
+  if (hardObjectiveMcomMoveWarnedByKey[key] === true) return;
+  hardObjectiveMcomMoveWarnedByKey[key] = true;
+  if (err !== undefined) {
+    LogRuntimeError("MoveHardObjectiveMCOM/" + context + "/" + String(mcomId) + "/" + reason, err);
+    return;
+  }
+  warnObjectiveEngineCallOnce(
+    "move_hard_mcom/" + context + "/" + String(mcomId) + "/" + reason,
+    mod.Message("[OBJECTIVE ENGINE] move-down MCOM skipped id/context/reason {}", String(mcomId) + "/" + context + "/" + reason)
+  );
+}
+
+function moveHardObjectiveMcomsBelowMapOnce(context: string): void {
+  const delta = mod.CreateVector(0, HARD_DISABLED_OBJECTIVE_MCOM_DROP_Y, 0);
+
+  for (let i = 0; i < HARD_DISABLED_OBJECTIVE_MCOM_IDS.length; i++) {
+    const mcomId = HARD_DISABLED_OBJECTIVE_MCOM_IDS[i];
+    if (hardObjectiveMcomMovedBelowMapById[mcomId] === true) continue;
+
+    let mcomObject: mod.Object | undefined = undefined;
+    try {
+      mcomObject = mod.GetMCOM(mcomId) as unknown as mod.Object;
+    } catch (err) {
+      warnHardObjectiveMcomMoveOnce(mcomId, context, "missing", err);
+      continue;
+    }
+
+    try {
+      hardObjectiveMcomInitialPositionById[mcomId] = mod.GetObjectPosition(mcomObject);
+      mod.MoveObject(mcomObject, delta);
+      hardObjectiveMcomMovedBelowMapById[mcomId] = true;
+    } catch (err) {
+      warnHardObjectiveMcomMoveOnce(mcomId, context, "move_failed", err);
     }
   }
 }
@@ -11407,7 +11837,7 @@ function processForcedSafeSpawnQueue(): void {
     lastForcedSafeSpawnHqObjIdByPlayerId[item.playerId] = item.hqObjId;
     mod.SetRedeployTime(p.player, 0);
     trySpawnPlayerFromSpawnPointSafe(p.player, item.spawnerObjId, "SafeSpawnForcedQueue");
-    mod.SetRedeployTime(p.player, REDEPLOY_TIME);
+    mod.SetRedeployTime(p.player, isCipherSuddenDeathActive() ? 9999 : REDEPLOY_TIME);
   }
 
   safeSpawnForcedQueue = remaining;
@@ -18598,6 +19028,7 @@ function clearCipherLivePhaseTransitionRuntimeState(
 ): void {
   resetTransitionSpawnQueueState(false);
   clearCipherSpawnJobQueues();
+  cancelAllCipherRespawnRouteJobs();
   clearCipherSecondHalfDeployFreezeForAllPlayers();
   hardUnlockCipherLiveInputsForAllPlayers(source);
   cipherPhaseTransitionUndeployIgnoreUntilSec = 0;
@@ -18669,7 +19100,7 @@ function getCipherSecondHalfForceDeployToken(): number {
 }
 
 function forceDeployMissingCipherSecondHalfPlayersOnce(source: string): void {
-  if (!cipherSecondHalfTransitionActive) return;
+  if (!isCipherLiveTransitionActive()) return;
   const transitionToken = getCipherSecondHalfForceDeployToken();
   if (transitionToken <= 0) return;
   if (cipherSecondHalfForceDeployIssuedForTransitionToken === transitionToken) return;
@@ -18975,14 +19406,14 @@ function scheduleCipherLiveStartKeyRetry(context: string): void {
   }
 }
 
-async function runDeferredCipherLiveStartKeySpawn(
+function runDeferredCipherLiveStartKeySpawn(
   token: number,
   expectedHalf: CipherHalfIndex,
   expectedStage: CipherMatchStage,
   context: string
-): Promise<void> {
-  await mod.Wait(CIPHER_DEFERRED_LIVE_START_KEY_DELAY_SECONDS);
+): void {
   if (cipherDeferredLiveStartKeyToken !== token) return;
+  cipherDeferredLiveStartKeyTimerHandle = undefined;
   if (gameStatus !== 3 || initialization[3] !== true) return;
   if (isCipherLiveTransitionActive()) return;
   if (cipherCurrentHalf !== expectedHalf || cipherMatchStage !== expectedStage) return;
@@ -19005,7 +19436,11 @@ function scheduleCipherLiveStartKeySpawn(
 ): void {
   const token = cipherDeferredLiveStartKeyToken + 1;
   cipherDeferredLiveStartKeyToken = token;
-  void runDeferredCipherLiveStartKeySpawn(token, expectedHalf, expectedStage, context);
+  Timers.clearTimeout(cipherDeferredLiveStartKeyTimerHandle);
+  cipherDeferredLiveStartKeyTimerHandle = Timers.setTimeout(
+    () => runDeferredCipherLiveStartKeySpawn(token, expectedHalf, expectedStage, context),
+    CIPHER_DEFERRED_LIVE_START_KEY_DELAY_SECONDS * 1000
+  );
 }
 
 function startCipherHalfClockAndKey(half: CipherHalfIndex, nowSec?: number): void {
@@ -19131,11 +19566,47 @@ function abortCipherTransitionSupervisor(context: string, resetBombRuntime: bool
   SetCountdownOverlayVisible(false);
 }
 
+function verifyCipherTransitionPlayersUndeployed(source: string): void {
+  const players: Player[] = [];
+  serverPlayers.forEach((p) => {
+    if (!p || !mod.IsPlayerValid(p.player)) return;
+    if (!isRequiredSecondHalfDeployPlayer(p)) return;
+    players.push(p);
+  });
+
+  if (players.length <= 0) return;
+
+  let scanned = 0;
+  let processed = 0;
+  while (scanned < players.length && processed < CIPHER_TRANSITION_UNDEPLOY_WORK_PER_TICK) {
+    const idx = mod.Modulo(cipherTransitionUndeployCursor, players.length);
+    cipherTransitionUndeployCursor = mod.Modulo(cipherTransitionUndeployCursor + 1, players.length);
+    scanned += 1;
+
+    const p = players[idx];
+    if (!p || !mod.IsPlayerValid(p.player)) continue;
+    if (!p.isDeployed) continue;
+
+    processed += 1;
+    try {
+      setCipherSecondHalfDeployFreezeForPlayer(p.player, true, source);
+      mod.SetRedeployTime(p.player, 9999);
+      mod.UndeployPlayer(p.player);
+    } catch (err) {
+      LogRuntimeError("TransitionUndeployVerify/" + source + "/" + String(p.id), err);
+    }
+  }
+}
+
 function enterCipherSecondHalfDeploySupervisorStage(nowSec: number): void {
   cipherSecondHalfForceDeployIssuedForTransitionToken = 0;
   clearCipherSecondHalfDeployFreezeForAllPlayers();
-  prepareCipherHalfForLive(2, "second_half_supervisor_deploy", 0);
-  applyCipherSecondHalfHqSpawns("second_half_supervisor_deploy");
+  if (cipherLiveTransitionSupervisorKind === "suddenDeath") {
+    prepareCipherSuddenDeathForLive("sudden_death_supervisor_deploy");
+  } else {
+    prepareCipherHalfForLive(2, "second_half_supervisor_deploy", 0);
+  }
+  applyCipherSecondHalfHqSpawns(cipherLiveTransitionSupervisorKind + "_supervisor_deploy");
   mod.SetSpawnMode(mod.SpawnModes.Deploy);
   serverPlayers.forEach((p) => {
     mod.SetRedeployTime(p.player, 0);
@@ -19143,10 +19614,10 @@ function enterCipherSecondHalfDeploySupervisorStage(nowSec: number): void {
     clearCipherSecondHalfDeployReadyForPlayer(p.id, true);
   });
   mod.UndeployAllPlayers();
-  applyCipherSecondHalfHqSpawns("second_half_supervisor_deploy_after_undeploy");
+  applyCipherSecondHalfHqSpawns(cipherLiveTransitionSupervisorKind + "_supervisor_deploy_after_undeploy");
   markCipherSecondHalfDeployRequiredPlayers();
   startCipherTransitionSupervisorStage("deploy", CIPHER_SECOND_HALF_DEPLOY_PHASE_SECONDS, nowSec);
-  runCipherTransitionStepWorkSafe("second_half_supervisor_deploy_enter", false);
+  runCipherTransitionStepWorkSafe(cipherLiveTransitionSupervisorKind + "_supervisor_deploy_enter", false);
 }
 
 function enterCipherTransitionCountdownSupervisorStage(
@@ -19154,10 +19625,10 @@ function enterCipherTransitionCountdownSupervisorStage(
   forceMissingSecondHalfPlayers: boolean = false
 ): void {
   startCipherTransitionSupervisorStage("countdown", CIPHER_SECOND_HALF_FINAL_COUNTDOWN_SECONDS, nowSec);
-  if (cipherLiveTransitionSupervisorKind === "secondHalf") {
-    applyCipherSecondHalfHqSpawns("second_half_supervisor_countdown_enter");
+  if (cipherLiveTransitionSupervisorKind === "secondHalf" || cipherLiveTransitionSupervisorKind === "suddenDeath") {
+    applyCipherSecondHalfHqSpawns(cipherLiveTransitionSupervisorKind + "_supervisor_countdown_enter");
     if (forceMissingSecondHalfPlayers) {
-      forceDeployMissingCipherSecondHalfPlayersOnce("second_half_supervisor_countdown_enter");
+      forceDeployMissingCipherSecondHalfPlayersOnce(cipherLiveTransitionSupervisorKind + "_supervisor_countdown_enter");
     }
   }
   runCipherTransitionStepWorkSafe(cipherLiveTransitionSupervisorKind + "_supervisor_countdown_enter", false);
@@ -19495,7 +19966,7 @@ function forceFinishCipherTransitionFinalizer(nowSec: number, reason: string): v
       LogRuntimeError("TransitionWatchdog/suddenDeathSurface/" + context, err);
     }
     try {
-      restoreCipherTransitionPlayersForLive(0, context);
+      restoreCipherTransitionPlayersForLive(9999, context);
     } catch (err) {
       LogRuntimeError("TransitionWatchdog/restorePlayers/" + context, err);
     }
@@ -19644,7 +20115,7 @@ function beginCipherTransitionFinalizer(
       applyCipherMinimalHalfObjectiveSurface(2, context + "_surface")
     );
     enqueueCipherTransitionWork(token, context + "/restorePlayers", "heavy", () =>
-      restoreCipherTransitionPlayersForLive(0, context)
+      restoreCipherTransitionPlayersForLive(9999, context)
     );
     enqueueCipherTransitionWork(token, context + "/clockAliveHud", "normal", () => {
       liveClockTimeoutHoldActive = false;
@@ -19727,6 +20198,7 @@ function tickCipherLiveTransitionSupervisor(nowSec: number): boolean {
   if (cipherSecondHalfTransitionStage === "intermission") {
     try {
       applyCipherIntermissionFreezeForDeployedPlayers("second_half_supervisor_intermission");
+      verifyCipherTransitionPlayersUndeployed(cipherLiveTransitionSupervisorKind + "_supervisor_intermission_verify");
     } catch (err) {
       LogRuntimeError("TransitionSupervisor/applyIntermissionFreeze", err);
     }
@@ -19773,6 +20245,16 @@ function beginCipherSecondHalfSupervisor(
   cipherSecondHalfTransitionStage = "intermission";
   clearCipherLivePhaseTransitionRuntimeState("second_half_supervisor_enter", true, true);
   cipherSecondHalfTransitionStage = "intermission";
+  cipherTransitionUndeployCursor = 0;
+  mod.SetSpawnMode(mod.SpawnModes.Deploy);
+  serverPlayers.forEach((p) => {
+    if (!p || !mod.IsPlayerValid(p.player)) return;
+    try {
+      mod.SetRedeployTime(p.player, 9999);
+    } catch (err) {
+      LogRuntimeError("SecondHalfSupervisor/redeployLock/" + String(p.id), err);
+    }
+  });
   liveClockStarted = false;
   liveClockTimeoutHoldActive = false;
   clearAllCipherNodeRebootState("second_half_supervisor_enter", true);
@@ -19802,6 +20284,7 @@ function beginCipherSecondHalfSupervisor(
   }
 
   startCipherTransitionSupervisorStage("intermission", CIPHER_HALFTIME_INTERMISSION_SECONDS, nowSec);
+  verifyCipherTransitionPlayersUndeployed("second_half_supervisor_enter");
   tickCipherLiveTransitionSupervisor(nowSec);
 }
 
@@ -19813,17 +20296,21 @@ function beginCipherSuddenDeathSupervisor(nowSec: number): void {
   cipherLiveTransitionSupervisorToken = transitionToken;
   cipherSuddenDeathTransitionActive = true;
   cipherSecondHalfTransitionActive = false;
-  cipherSecondHalfTransitionStage = "deploy";
+  cipherSecondHalfTransitionStage = "intermission";
   clearCipherLivePhaseTransitionRuntimeState("sudden_death_supervisor_enter", true, true);
-  cipherSecondHalfTransitionStage = "deploy";
+  cipherSecondHalfTransitionStage = "intermission";
+  cipherTransitionUndeployCursor = 0;
   liveClockStarted = false;
   liveClockTimeoutHoldActive = false;
   clearAllCipherNodeRebootState("sudden_death_supervisor_enter", true);
   HideAllObjectiveHoldProgressUi();
   HideAllDeployObjectiveTimerUi();
   clearBombNoticeState();
-  showCipherPhaseNoticeForAllPlayers((mod.stringkeys as any).CipherSuddenDeathOneLife, "SUDDEN DEATH - ONE LIFE", 5);
-  prepareCipherSuddenDeathForLive("sudden_death_supervisor_deploy");
+  try {
+    showCipherPhaseNoticeForAllPlayers((mod.stringkeys as any).CipherSuddenDeathOneLife, "SUDDEN DEATH - ONE LIFE", 5);
+  } catch (err) {
+    LogRuntimeError("TransitionSupervisor/showSuddenDeathNotice", err);
+  }
   cipherTransitionDeployTitleKey = (mod.stringkeys as any).CipherSuddenDeathOneLife;
   cipherTransitionDeployTitleFallback = "SUDDEN DEATH";
   cipherTransitionStartsTitleKey = (mod.stringkeys as any).CipherSuddenDeathStarts;
@@ -19832,6 +20319,7 @@ function beginCipherSuddenDeathSupervisor(nowSec: number): void {
   cipherTransitionSubtitleFallback = "NO RESPAWNS";
   cipherSuddenDeathUndeployIgnoreUntilSec =
     nowSec +
+    CIPHER_HALFTIME_INTERMISSION_SECONDS +
     CIPHER_SECOND_HALF_DEPLOY_PHASE_SECONDS +
     CIPHER_SECOND_HALF_FINAL_COUNTDOWN_SECONDS +
     CIPHER_SECOND_HALF_FORCE_DEPLOY_SETTLE_SECONDS +
@@ -19839,14 +20327,17 @@ function beginCipherSuddenDeathSupervisor(nowSec: number): void {
   cipherPhaseTransitionUndeployIgnoreUntilSec = cipherSuddenDeathUndeployIgnoreUntilSec;
   mod.SetSpawnMode(mod.SpawnModes.Deploy);
   serverPlayers.forEach((p) => {
-    mod.SetRedeployTime(p.player, 0);
-    p.setCapturePoint(null);
-    clearCipherSecondHalfDeployReadyForPlayer(p.id, true);
+    if (!p || !mod.IsPlayerValid(p.player)) return;
+    try {
+      mod.SetRedeployTime(p.player, 9999);
+      p.setCapturePoint(null);
+      clearCipherSecondHalfDeployReadyForPlayer(p.id, true);
+    } catch (err) {
+      LogRuntimeError("SuddenDeathSupervisor/redeployLock/" + String(p.id), err);
+    }
   });
-  mod.UndeployAllPlayers();
-  markCipherSecondHalfDeployRequiredPlayers();
-  startCipherTransitionSupervisorStage("deploy", CIPHER_SECOND_HALF_DEPLOY_PHASE_SECONDS, nowSec);
-  runCipherTransitionStepWorkSafe("sudden_death_supervisor_deploy_enter", false);
+  startCipherTransitionSupervisorStage("intermission", CIPHER_HALFTIME_INTERMISSION_SECONDS, nowSec);
+  verifyCipherTransitionPlayersUndeployed("sudden_death_supervisor_enter");
   tickCipherLiveTransitionSupervisor(nowSec);
 }
 
@@ -22861,7 +23352,7 @@ function InitializeLive(): void {
     } else {
       emitLiveTransitionCheckpoint("live_init_success_bomb_schedule_before");
       try {
-        spawnBombPickupObjectAtLiveStart();
+        scheduleCipherLiveStartKeySpawn(1, "half1", "InitializeLive");
         emitLiveTransitionCheckpoint("live_init_success_bomb_schedule_after");
       } catch (bombErr) {
         LogRuntimeError("InitializeLive/bombSchedule", bombErr);
@@ -24272,6 +24763,7 @@ function Mode_OnGameModeStarted(): void {
 
   refreshObjectiveResolvedMcomAliases("Mode_OnGameModeStarted");
   ValidateObjectiveConfiguration();
+  moveHardObjectiveMcomsBelowMapOnce("Mode_OnGameModeStarted");
   validateRequiredQuadBikeAnchorConfigurationOnce();
   resetObjectiveRuntimeState();
   resetObjectiveDisableAndAwardFxState();
@@ -24303,6 +24795,7 @@ function Mode_OnGameModeEnding(): void {
   stopMainLoopTimer();
   stopDamageZonePulseTimer();
   clearCipherAdminRuntimeState("Mode_OnGameModeEnding");
+  cancelAllCipherRespawnRouteJobs();
   clearRuntimeBotState(true);
   stopAllObjectiveAwardBursts();
   StopAllObjectiveMcomSfx();
@@ -24790,6 +25283,7 @@ function Mode_OnPlayerLeaveGame(eventNumber: number): void {
     clearPrematch889StateForPlayer(leaving.id);
     clearAllObjectiveAreaTriggerStateForPlayer(leaving.id);
     clearCipherPresenceForPlayer(leaving.id);
+    invalidateCipherRespawnRouteJobForPlayer(leaving.id);
 
     if (gameStatus === 3 && !leavingIsRuntimeBot) {
       leaving.addDeath();
@@ -24909,6 +25403,8 @@ async function Mode_OnPlayerDeployed(eventPlayer: mod.Player): Promise<void> {
       return;
     }
 
+    const liveRedeploySeconds = isCipherSuddenDeathActive() ? 9999 : REDEPLOY_TIME;
+
     if (deployedIsBot) {
       if (deployedRuntimeBotSlot) {
         mod.SetTeam(eventPlayer, deployedRuntimeBotSlot.desiredTeam);
@@ -24917,7 +25413,7 @@ async function Mode_OnPlayerDeployed(eventPlayer: mod.Player): Promise<void> {
       configureRuntimeBotCombat(eventPlayer);
       applyPrematch889HealthForPlayer(playerId);
       applyPhaseInputRestrictionsForPlayer(eventPlayer);
-      mod.SetRedeployTime(eventPlayer, REDEPLOY_TIME);
+      mod.SetRedeployTime(eventPlayer, liveRedeploySeconds);
       safeSpawnForcedRedeploys[playerId] = 0;
       safeSpawnForcedUndeploy[playerId] = false;
       safeSpawnUnsafePending[playerId] = false;
@@ -24964,14 +25460,16 @@ async function Mode_OnPlayerDeployed(eventPlayer: mod.Player): Promise<void> {
     // Do NOT request a Cipher anchor and do NOT call SafeSpawnCheckOrRedeploy(),
     // because those paths can teleport the player to an anchor.
     if (!enteringForcedSafeSpawnFlow && isNativeFriendlyOrSquadSpawn(eventPlayer, playerId)) {
-      mod.SetRedeployTime(eventPlayer, REDEPLOY_TIME);
+      invalidateCipherRespawnRouteJobForPlayer(playerId);
+      mod.SetRedeployTime(eventPlayer, liveRedeploySeconds);
       p.isFirstDeploy();
       finishSafeSpawnAsNativeFriendlyOrSquadSpawn(eventPlayer, playerId);
       return;
     }
 
     // Normal custom Cipher spawn route.
-    mod.SetRedeployTime(eventPlayer, REDEPLOY_TIME);
+    mod.SetRedeployTime(eventPlayer, liveRedeploySeconds);
+    finalizeCipherRespawnRouteJobForPlayer(playerId, "OnPlayerDeployed_Live");
     requestCipherSpawnAnchorForPlayer(playerId, true);
     processCipherSpawnJobs("OnPlayerDeployed_LiveAnchor");
 
@@ -25093,7 +25591,10 @@ async function Mode_OnPlayerUndeploy(eventPlayer: mod.Player): Promise<void> {
     if (gameStatus === 2) return;
     if (gameStatus === 3 && getCurrentSchedulerNowSeconds() < cipherPhaseTransitionUndeployIgnoreUntilSec) return;
 
-    if (gameStatus === 3) p.addDeath();
+    if (gameStatus === 3) {
+      startCipherRespawnRouteJobForPlayer(id, wasDeployed, "OnPlayerUndeploy_Live");
+      p.addDeath();
+    }
   } catch (err) {
     LogRuntimeError("OnPlayerUndeploy", err);
   } finally {
@@ -25159,6 +25660,7 @@ function Mode_OnPlayerInteract(eventPlayer: mod.Player, eventInteractPoint: mod.
           mod.SetTeam(eventPlayer, team1);
           p?.setTeam();
         }
+        invalidateCipherRespawnRouteJobForPlayer(switchingId);
         updateCipherSuddenDeathAliveHudForAllPlayers();
         if (isCipherSuddenDeathActive()) {
           const winner = resolveCipherSuddenDeathEliminationWinner();
