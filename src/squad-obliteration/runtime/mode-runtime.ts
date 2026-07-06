@@ -54,22 +54,29 @@ const ICON_FOLLOW_INTERVAL_SECONDS = 0.05; // 20 Hz
 const FAST_INTERVAL_SECONDS = 0.10; // 10 Hz
 const SLOW_INTERVAL_SECONDS = 0.30; // 3.3 Hz
 const ENDGAME_AUDIO_INTERVAL_SECONDS = 0.50; // 2 Hz
-const CIPHER_RUNTIME_BOTS_DEFAULT_ENABLED = false;
+const CIPHER_RUNTIME_BOTS_DEFAULT_ENABLED = true;
 const CIPHER_RUNTIME_BOT_DESIRED_TEAM_SIZE = 8;
 const CIPHER_RUNTIME_BOT_MAX_PER_TEAM = 8;
 const CIPHER_RUNTIME_BOT_MAX_TOTAL = 16;
 const CIPHER_RUNTIME_BOT_RECONCILE_INTERVAL_SECONDS = 1.0;
 const CIPHER_RUNTIME_BOT_SPAWN_RETRY_SECONDS = 2.0;
 const CIPHER_RUNTIME_BOT_RESPAWN_DELAY_SECONDS = 1.0;
-const CIPHER_RUNTIME_BOT_UNSPAWN_DELAY_SECONDS = 1.0;
+const CIPHER_RUNTIME_BOT_MANDOWN_REVIVE_WINDOW_SECONDS = 5.0;
+const CIPHER_RUNTIME_BOT_UNSPAWN_DELAY_SECONDS = CIPHER_RUNTIME_BOT_MANDOWN_REVIVE_WINDOW_SECONDS;
 const CIPHER_RUNTIME_BOT_SPAWN_BIND_TIMEOUT_SECONDS = 5.0;
 const CIPHER_RUNTIME_BOT_CREATE_BUDGET_PER_RECONCILE = 2;
 const CIPHER_RUNTIME_BOT_RETIRE_BUDGET_PER_RECONCILE = 2;
 const CIPHER_RUNTIME_BOT_SPAWN_BUDGET_PER_RECONCILE = 2;
 const CIPHER_RUNTIME_BOT_TEAM1_SPAWNER_ID = 8085;
 const CIPHER_RUNTIME_BOT_TEAM2_SPAWNER_ID = 8086;
-const CIPHER_RUNTIME_BOT_REVIVE_SCAN_RADIUS_METERS = 18.0;
-const CIPHER_RUNTIME_BOT_REVIVE_FORCE_RADIUS_METERS = 3.0;
+const CIPHER_RUNTIME_BOT_REVIVE_SCAN_RADIUS_METERS = 8.0;
+const CIPHER_RUNTIME_BOT_REVIVE_FORCE_RADIUS_METERS = 2.5;
+const CIPHER_RUNTIME_BOT_REVIVE_ASSIGNMENT_SECONDS = 0.8;
+const CIPHER_RUNTIME_BOT_ENEMY_SCAN_RADIUS_METERS = 55.0;
+const CIPHER_RUNTIME_BOT_TARGET_REFRESH_SECONDS = 0.75;
+const CIPHER_RUNTIME_BOT_STAGED_SPAWN_INTERVAL_TICKS = TICK_RATE;
+const CIPHER_RUNTIME_BOT_LOCK_REAPPLY_INTERVAL_TICKS = mod.Max(1, mod.Floor(0.25 * TICK_RATE));
+const CIPHER_TRANSITION_LIVE_START_SETTLE_SECONDS = 2.0;
 
 // Bot objective controller timing.
 // These are used by shouldIssueBotMoveCommand(...) and evaluateBotObjectiveController(...).
@@ -85,7 +92,7 @@ const BOT_OBJECTIVE_MOVE_SUCCESS_RECHECK_SECONDS = 0.35;
 // Bots should not instantly recycle on death, otherwise they appear to disappear instead of being revivable.
 // If the engine gives them a real mandown state, this delay gives friendly bots time to revive them.
 // If the engine fully kills the AI, they still come back later for testing.
-const CIPHER_RUNTIME_BOT_DEATH_RESPAWN_DELAY_SECONDS = 8.0;
+const CIPHER_RUNTIME_BOT_DEATH_RESPAWN_DELAY_SECONDS = CIPHER_RUNTIME_BOT_MANDOWN_REVIVE_WINDOW_SECONDS;
 
 // Live bot respawn delay after an authored AI bot undeploys.
 const BOT_LIVE_SPAWN_INITIAL_DELAY_SECONDS = 0.25;
@@ -295,7 +302,7 @@ type CipherTransitionWorkItem = {
 const CIPHER_DEFERRED_LIVE_START_KEY_DELAY_SECONDS = 0.05;
 const CIPHER_TRANSITION_NORMAL_WORK_PER_TICK = 2;
 const CIPHER_TRANSITION_HEAVY_WORK_PER_TICK = 1;
-const CIPHER_TRANSITION_UNDEPLOY_WORK_PER_TICK = 2;
+const CIPHER_TRANSITION_UNDEPLOY_WORK_PER_TICK = 8;
 const CIPHER_TRANSITION_FINALIZER_WATCHDOG_SECONDS = 8;
 const CIPHER_TRANSITION_OBJECTIVE_EVENT_SUPPRESS_SECONDS = 0.35;
 
@@ -322,6 +329,7 @@ let cipherSecondHalfTransitionStage: CipherSecondHalfTransitionStage = "none";
 let cipherLiveTransitionSupervisorKind: CipherLiveTransitionSupervisorKind = "none";
 let cipherLiveTransitionSupervisorToken = 0;
 let cipherLiveTransitionSupervisorDeadlineAtSec = 0;
+let cipherLiveTransitionSupervisorDeadlineTick = 0;
 let cipherLiveTransitionSupervisorLastShownSeconds = -1;
 let cipherLiveTransitionSupervisorReason: CipherHalfTransitionReason = "scoreCap";
 let cipherDeferredLiveStartKeyToken = 0;
@@ -1471,6 +1479,12 @@ type BotObjectiveRole =
   | "revive"
   | "pressureObjective"
   | "regroup";
+type BotEnemyTarget = {
+  player: mod.Player;
+  playerId: number;
+  pos: mod.Vector;
+  distance: number;
+};
 type RuntimeBotSlot = {
   slotId: number;
   desiredTeam: mod.Team;
@@ -1594,6 +1608,10 @@ let botObjectiveNextThinkAtSec = 0;
 let botObjectiveAssignedRoleByPlayerId: { [playerId: number]: BotObjectiveRole | undefined } = {};
 let botObjectiveLastCommandAtSecByPlayerId: { [playerId: number]: number | undefined } = {};
 let botObjectiveLastTargetByPlayerId: { [playerId: number]: mod.Vector | undefined } = {};
+let botObjectiveTargetPlayerIdByPlayerId: { [playerId: number]: number | undefined } = {};
+let botObjectiveTargetRefreshAtSecByPlayerId: { [playerId: number]: number | undefined } = {};
+let botReviveTargetPlayerIdByReviverId: { [playerId: number]: number | undefined } = {};
+let botReviveAssignmentStartedAtSecByReviverId: { [playerId: number]: number | undefined } = {};
 let botLiveSpawnRequestedByPlayerId: { [playerId: number]: boolean | undefined } = {};
 let botLiveSpawnNextAttemptAtSecByPlayerId: { [playerId: number]: number | undefined } = {};
 let botBackfillKnownByPlayerId: { [playerId: number]: boolean | undefined } = {};
@@ -1602,6 +1620,7 @@ let runtimeBotSlotByPlayerId: { [playerId: number]: number | undefined } = {};
 let runtimeBotPendingSlotIdsBySpawnerObjId: { [spawnerObjId: number]: number[] | undefined } = {};
 let runtimeBotAuthoredSpawnerByObjId: { [spawnerObjId: number]: mod.Spawner | undefined } = {};
 let runtimeBotReleasedPlayerId: { [playerId: number]: boolean | undefined } = {};
+let runtimeBotRespawnAfterSecByPlayerId: { [playerId: number]: number | undefined } = {};
 let cipherRuntimeBotsEnabled = CIPHER_RUNTIME_BOTS_DEFAULT_ENABLED;
 let runtimeBotNextSlotId = 1;
 let runtimeBotNextReconcileAtSec = 0;
@@ -1609,6 +1628,15 @@ let runtimeBotSpawnTokenCounter = 0;
 let runtimeBotSpawnerValidationComplete = false;
 let runtimeBotSpawnerValidationFailed = false;
 let runtimeBotSpawnerValidationWarned = false;
+let runtimeBotPhaseLockedByPlayerId: { [playerId: number]: boolean | undefined } = {};
+let runtimeBotStagedSpawnNextTick = 0;
+let runtimeBotStagedSpawnTeamToggle = 0;
+let runtimeBotLockReapplyNextTick = 0;
+let cipherTransitionReconcileQueued = false;
+let cipherTransitionReconcileReason = "";
+let cipherLiveStartSettlingUntilSec = 0;
+let cipherLiveStartSettlingStage: CipherMatchStage | "none" = "none";
+let cipherLiveStartSettleToken = 0;
 let visualSubtickLastOutputSec = 0;
 let visualSubtickLastPreferredSec = -1;
 let visualSubtickLastPreferredFloorSec = -1;
@@ -4214,6 +4242,10 @@ function clearBotObjectiveStateForPlayer(playerId: number): void {
   delete botObjectiveAssignedRoleByPlayerId[playerId];
   delete botObjectiveLastCommandAtSecByPlayerId[playerId];
   delete botObjectiveLastTargetByPlayerId[playerId];
+  delete botObjectiveTargetPlayerIdByPlayerId[playerId];
+  delete botObjectiveTargetRefreshAtSecByPlayerId[playerId];
+  delete botReviveTargetPlayerIdByReviverId[playerId];
+  delete botReviveAssignmentStartedAtSecByReviverId[playerId];
   delete botLiveSpawnRequestedByPlayerId[playerId];
   delete botLiveSpawnNextAttemptAtSecByPlayerId[playerId];
 }
@@ -4222,6 +4254,10 @@ function clearBotObjectiveAssignments(): void {
   botObjectiveAssignedRoleByPlayerId = {};
   botObjectiveLastCommandAtSecByPlayerId = {};
   botObjectiveLastTargetByPlayerId = {};
+  botObjectiveTargetPlayerIdByPlayerId = {};
+  botObjectiveTargetRefreshAtSecByPlayerId = {};
+  botReviveTargetPlayerIdByReviverId = {};
+  botReviveAssignmentStartedAtSecByReviverId = {};
   botObjectiveNextThinkAtSec = 0;
 }
 
@@ -4283,6 +4319,8 @@ function clearRuntimeBotPlayerBinding(slot: RuntimeBotSlot, releaseOldPlayerId: 
   const oldPlayerId = slot.playerId;
   if (oldPlayerId !== undefined) {
     delete runtimeBotSlotByPlayerId[oldPlayerId];
+    delete runtimeBotRespawnAfterSecByPlayerId[oldPlayerId];
+    delete runtimeBotPhaseLockedByPlayerId[oldPlayerId];
     if (releaseOldPlayerId) runtimeBotReleasedPlayerId[oldPlayerId] = true;
     clearBotObjectiveStateForPlayer(oldPlayerId);
   }
@@ -4305,6 +4343,109 @@ function configureRuntimeBotCombat(player: mod.Player): void {
   } catch (_errGadgets) {}
 }
 
+function configureRuntimeBotLocked(player: mod.Player): void {
+  try {
+    mod.AIEnableTargeting(player, false);
+  } catch (_errTargeting) {}
+  try {
+    mod.AIEnableShooting(player, false);
+  } catch (_errShooting) {}
+  try {
+    mod.AIGadgetSettings(player, false, false, false);
+  } catch (_errGadgets) {}
+  try {
+    mod.AISetTarget(player);
+  } catch (_errClearTarget) {}
+}
+
+function shouldRuntimeBotsBePhaseLocked(): boolean {
+  if (gameStatus === 2) return true;
+  if (isCipherLiveTransitionActive()) return true;
+  return cipherLiveStartSettlingStage !== "none" && getCurrentSchedulerNowSeconds() < cipherLiveStartSettlingUntilSec;
+}
+
+function isRuntimeBotPhaseLocked(playerId: number): boolean {
+  return runtimeBotPhaseLockedByPlayerId[playerId] === true || shouldRuntimeBotsBePhaseLocked();
+}
+
+function applyRuntimeBotPhaseLockForPlayer(player: mod.Player, playerId: number, _source: string): void {
+  if (!mod.IsPlayerValid(player)) return;
+  runtimeBotPhaseLockedByPlayerId[playerId] = true;
+  clearBotObjectiveStateForPlayer(playerId);
+  configureRuntimeBotLocked(player);
+  try {
+    clearCipherLiveInputRestrictionsForPlayer(player);
+  } catch (_errClearInputs) {}
+  try {
+    mod.SetPlayerMovementSpeedMultiplier(player, 0);
+  } catch (_errSpeed) {}
+  for (let i = 0; i < CIPHER_DEPLOY_READY_FREEZE_INPUTS.length; i++) {
+    try {
+      mod.EnableInputRestriction(player, CIPHER_DEPLOY_READY_FREEZE_INPUTS[i], true);
+    } catch (_errInput) {}
+  }
+}
+
+function releaseRuntimeBotPhaseLockForPlayer(player: mod.Player, playerId: number, _source: string): void {
+  if (!mod.IsPlayerValid(player)) return;
+  delete runtimeBotPhaseLockedByPlayerId[playerId];
+  try {
+    clearCipherLiveInputRestrictionsForPlayer(player);
+  } catch (_errClearInputs) {}
+  configureRuntimeBotCombat(player);
+}
+
+function applyRuntimeBotPhaseLocksForAll(source: string): void {
+  if (serverTickCount < runtimeBotLockReapplyNextTick) return;
+  runtimeBotLockReapplyNextTick = serverTickCount + CIPHER_RUNTIME_BOT_LOCK_REAPPLY_INTERVAL_TICKS;
+  serverPlayers.forEach((sp) => {
+    if (!sp || !mod.IsPlayerValid(sp.player)) return;
+    if (!getRuntimeBotSlotForPlayerId(sp.id)) return;
+    if (!sp.isDeployed) return;
+    applyRuntimeBotPhaseLockForPlayer(sp.player, sp.id, source);
+  });
+}
+
+function releaseRuntimeBotPhaseLocksForAll(source: string): void {
+  runtimeBotPhaseLockedByPlayerId = {};
+  runtimeBotLockReapplyNextTick = 0;
+  serverPlayers.forEach((sp) => {
+    if (!sp || !mod.IsPlayerValid(sp.player)) return;
+    if (!getRuntimeBotSlotForPlayerId(sp.id)) return;
+    releaseRuntimeBotPhaseLockForPlayer(sp.player, sp.id, source);
+  });
+}
+
+function finishRuntimeBotLiveStartSettle(token: number, expectedStage: CipherMatchStage, source: string): void {
+  if (token !== cipherLiveStartSettleToken) return;
+  if (gameStatus !== 3 || cipherMatchStage !== expectedStage) return;
+  if (cipherSecondHalfTransitionActive || cipherSuddenDeathTransitionActive) return;
+
+  cipherLiveStartSettlingStage = "none";
+  cipherLiveStartSettlingUntilSec = 0;
+  releaseRuntimeBotPhaseLocksForAll(source + "_release");
+  requestCipherTransitionReconcile(source + "_settled");
+  botObjectiveNextThinkAtSec = 0;
+  runtimeBotNextReconcileAtSec = 0;
+}
+
+function isCipherLiveStartSettling(): boolean {
+  return cipherLiveStartSettlingStage !== "none" && getCurrentSchedulerNowSeconds() < cipherLiveStartSettlingUntilSec;
+}
+
+function startRuntimeBotLiveStartSettle(expectedStage: CipherMatchStage, source: string): void {
+  cipherLiveStartSettleToken += 1;
+  const token = cipherLiveStartSettleToken;
+  cipherLiveStartSettlingStage = expectedStage;
+  cipherLiveStartSettlingUntilSec = getCurrentSchedulerNowSeconds() + CIPHER_TRANSITION_LIVE_START_SETTLE_SECONDS;
+  runtimeBotLockReapplyNextTick = 0;
+  applyRuntimeBotPhaseLocksForAll(source + "_settle");
+  Timers.setTimeout(
+    () => finishRuntimeBotLiveStartSettle(token, expectedStage, source),
+    CIPHER_TRANSITION_LIVE_START_SETTLE_SECONDS * 1000
+  );
+}
+
 function routeRuntimeBotToCipherSpawnAnchor(player: mod.Player, playerId: number, context: string): void {
   try {
     requestCipherSpawnAnchorForPlayer(playerId, true);
@@ -4312,7 +4453,9 @@ function routeRuntimeBotToCipherSpawnAnchor(player: mod.Player, playerId: number
     requestCipherSpawnTeleportForPlayer(playerId, true);
     processCipherSpawnJobs(context + "_teleport");
     teleportCipherPlayerToRoutedAnchor(player, playerId);
-    if (gameStatus === 3) SafeSpawnCheckOrRedeploy(playerId);
+    if (gameStatus === 3 && !isCipherLiveTransitionActive() && !isRuntimeBotPhaseLocked(playerId)) {
+      SafeSpawnCheckOrRedeploy(playerId);
+    }
     if (bombCarrierPlayerId === playerId) {
       syncCipherCarrierVisualsNow(getCurrentSchedulerNowSeconds(), context + "_carrier_visuals");
     }
@@ -4583,9 +4726,14 @@ function clearRuntimeBotState(unspawnSpawners: boolean): void {
   runtimeBotSlotByPlayerId = {};
   runtimeBotPendingSlotIdsBySpawnerObjId = {};
   runtimeBotAuthoredSpawnerByObjId = {};
+  runtimeBotRespawnAfterSecByPlayerId = {};
+  runtimeBotPhaseLockedByPlayerId = {};
   runtimeBotNextSlotId = 1;
   runtimeBotNextReconcileAtSec = 0;
   runtimeBotSpawnTokenCounter = 0;
+  runtimeBotStagedSpawnNextTick = 0;
+  runtimeBotStagedSpawnTeamToggle = 0;
+  runtimeBotLockReapplyNextTick = 0;
   clearBotObjectiveAssignments();
   void unspawnSpawners;
 }
@@ -4650,6 +4798,73 @@ function reconcileRuntimeBotSlotCount(nowSec: number): void {
   }
 }
 
+function resetRuntimeBotStagedSpawnSchedule(): void {
+  runtimeBotStagedSpawnNextTick = 0;
+  runtimeBotStagedSpawnTeamToggle = 0;
+  runtimeBotLockReapplyNextTick = 0;
+}
+
+function chooseReadyRuntimeBotSlotForStagedSpawn(nowSec: number): RuntimeBotSlot | undefined {
+  let best: RuntimeBotSlot | undefined = undefined;
+  forEachRuntimeBotSlot((slot) => {
+    if (best) return;
+    if (slot.retired || slot.spawning) return;
+    if (slot.playerId !== undefined) return;
+    if (nowSec < slot.nextSpawnAtSec) return;
+    best = slot;
+  });
+  return best;
+}
+
+function chooseRuntimeBotTeamForStagedSlot(counts: RuntimeBotTeamCounts): mod.Team | undefined {
+  const desiredTeam1Bots = getDesiredRuntimeBotCountForHumanCount(counts.team1Humans);
+  const desiredTeam2Bots = getDesiredRuntimeBotCountForHumanCount(counts.team2Humans);
+  const team1Needed = counts.team1Bots < desiredTeam1Bots && counts.team1Bots < CIPHER_RUNTIME_BOT_MAX_PER_TEAM;
+  const team2Needed = counts.team2Bots < desiredTeam2Bots && counts.team2Bots < CIPHER_RUNTIME_BOT_MAX_PER_TEAM;
+
+  if (!team1Needed && !team2Needed) return undefined;
+  if (team1Needed && !team2Needed) return team1;
+  if (team2Needed && !team1Needed) return team2;
+
+  runtimeBotStagedSpawnTeamToggle = 1 - runtimeBotStagedSpawnTeamToggle;
+  return runtimeBotStagedSpawnTeamToggle === 0 ? team1 : team2;
+}
+
+function spawnOneRuntimeBotStaged(nowSec: number, source: string): void {
+  if (!cipherRuntimeBotsEnabled) return;
+  if (!validateRuntimeBotSpawnersOnce()) {
+    if (countActiveRuntimeBotSlots() > 0) clearRuntimeBotState(true);
+    cipherRuntimeBotsEnabled = false;
+    refreshCipherAdminPanels();
+    return;
+  }
+
+  let slot = chooseReadyRuntimeBotSlotForStagedSpawn(nowSec);
+  if (!slot) {
+    const counts = countRuntimeBotTeamState();
+    if (counts.totalBots >= CIPHER_RUNTIME_BOT_MAX_TOTAL) return;
+    const team = chooseRuntimeBotTeamForStagedSlot(counts);
+    if (!team) return;
+    slot = createRuntimeBotSlot(team, nowSec);
+  }
+
+  spawnRuntimeBotFromSlot(slot, nowSec, source + "_staged");
+}
+
+function tickRuntimeBotStagedSpawning(nowSec: number, source: string): void {
+  if (!cipherRuntimeBotsEnabled) {
+    if (countActiveRuntimeBotSlots() > 0) clearRuntimeBotState(true);
+    return;
+  }
+  if (!shouldRuntimeBotsBePhaseLocked()) return;
+
+  applyRuntimeBotPhaseLocksForAll(source + "_lock");
+
+  if (runtimeBotStagedSpawnNextTick > 0 && serverTickCount < runtimeBotStagedSpawnNextTick) return;
+  runtimeBotStagedSpawnNextTick = serverTickCount + CIPHER_RUNTIME_BOT_STAGED_SPAWN_INTERVAL_TICKS;
+  spawnOneRuntimeBotStaged(nowSec, source);
+}
+
 function shouldRuntimeBotSlotSpawn(slot: RuntimeBotSlot, nowSec: number): boolean {
   if (slot.retired) return false;
   if (slot.spawning && slot.pendingSinceSec > 0 && nowSec - slot.pendingSinceSec < CIPHER_RUNTIME_BOT_SPAWN_BIND_TIMEOUT_SECONDS) {
@@ -4665,13 +4880,27 @@ function shouldRuntimeBotSlotSpawn(slot: RuntimeBotSlot, nowSec: number): boolea
   if (slot.playerId === undefined) return true;
 
   const sp = serverPlayers.get(slot.playerId);
+  if (slot.forceRespawnAfterSec > 0) {
+    if (nowSec < slot.forceRespawnAfterSec) return false;
+
+    if (
+      !sp ||
+      !mod.IsPlayerValid(sp.player) ||
+      !sp.isDeployed ||
+      playerInMandownByPlayerId[sp.id] === true ||
+      !isPlayerAliveSafe(sp.player)
+    ) {
+      if (sp) delete playerInMandownByPlayerId[sp.id];
+      clearRuntimeBotPlayerBinding(slot, true);
+      return true;
+    }
+
+    clearRuntimeBotRespawnStateForPlayer(sp.id);
+    return false;
+  }
+
   if (!sp || !mod.IsPlayerValid(sp.player)) return true;
   if (!sp.isDeployed) return true;
-
-  if (slot.forceRespawnAfterSec > 0 && nowSec >= slot.forceRespawnAfterSec && !isPlayerAliveSafe(sp.player)) {
-    clearRuntimeBotPlayerBinding(slot, true);
-    return true;
-  }
 
   return false;
 }
@@ -4720,6 +4949,10 @@ function validateRuntimeBotSpawnersOnce(): boolean {
 function reconcileRuntimeBots(nowSec: number): void {
   if (!cipherRuntimeBotsEnabled) {
     if (countActiveRuntimeBotSlots() > 0) clearRuntimeBotState(true);
+    return;
+  }
+  if (shouldRuntimeBotsBePhaseLocked()) {
+    applyRuntimeBotPhaseLocksForAll("runtime_bot_reconcile_phase_lock");
     return;
   }
   if (
@@ -4772,7 +5005,11 @@ function bindRuntimeBotPlayerToSlot(slot: RuntimeBotSlot, player: mod.Player): v
     sp.team = slot.desiredTeam;
     sp.isDeployed = true;
 
-    configureRuntimeBotCombat(player);
+    if (shouldRuntimeBotsBePhaseLocked()) {
+      applyRuntimeBotPhaseLockForPlayer(player, playerId, "runtime_bot_bind");
+    } else {
+      releaseRuntimeBotPhaseLockForPlayer(player, playerId, "runtime_bot_bind");
+    }
 
     try {
       mod.SetRedeployTime(player, REDEPLOY_TIME);
@@ -4785,6 +5022,7 @@ function bindRuntimeBotPlayerToSlot(slot: RuntimeBotSlot, player: mod.Player): v
     // Do not route/teleport/safe-spawn from OnSpawnerSpawned.
     // The bot objective controller will command movement after spawn.
     botObjectiveNextThinkAtSec = 0;
+    requestCipherTransitionReconcile("runtime_bot_bound");
     runtimeBotNextReconcileAtSec = getCurrentSchedulerNowSeconds() + CIPHER_RUNTIME_BOT_RECONCILE_INTERVAL_SECONDS;
   } catch (err) {
     slot.spawning = false;
@@ -4797,9 +5035,50 @@ function bindRuntimeBotPlayerToSlot(slot: RuntimeBotSlot, player: mod.Player): v
 function markRuntimeBotSlotForRespawn(playerId: number, delaySeconds: number): void {
   const slot = getRuntimeBotSlotForPlayerId(playerId);
   if (!slot) return;
-  slot.forceRespawnAfterSec = getCurrentSchedulerNowSeconds() + delaySeconds;
-  slot.nextSpawnAtSec = slot.forceRespawnAfterSec;
+  const respawnAfterSec = getCurrentSchedulerNowSeconds() + mod.Max(0, delaySeconds);
+  slot.forceRespawnAfterSec = respawnAfterSec;
+  slot.nextSpawnAtSec = respawnAfterSec;
   slot.spawning = false;
+  runtimeBotRespawnAfterSecByPlayerId[playerId] = respawnAfterSec;
+}
+
+function clearRuntimeBotRespawnStateForPlayer(playerId: number): void {
+  const slot = getRuntimeBotSlotForPlayerId(playerId);
+  if (slot) {
+    slot.forceRespawnAfterSec = 0;
+    slot.nextSpawnAtSec = 0;
+    slot.spawning = false;
+  }
+  delete runtimeBotRespawnAfterSecByPlayerId[playerId];
+}
+
+function handleRuntimeBotRevivedForPlayer(playerId: number, player: mod.Player, _source: string): void {
+  const slot = getRuntimeBotSlotForPlayerId(playerId);
+  if (!slot) return;
+
+  slot.player = player;
+  slot.playerId = playerId;
+  slot.spawning = false;
+  slot.pendingSinceSec = 0;
+  clearRuntimeBotRespawnStateForPlayer(playerId);
+  runtimeBotSlotByPlayerId[playerId] = slot.slotId;
+  delete runtimeBotReleasedPlayerId[playerId];
+
+  const sp = serverPlayers.get(playerId);
+  if (sp) {
+    sp.player = player;
+    sp.isDeployed = true;
+    sp.team = slot.desiredTeam;
+  }
+
+  delete playerInMandownByPlayerId[playerId];
+  if (shouldRuntimeBotsBePhaseLocked()) {
+    applyRuntimeBotPhaseLockForPlayer(player, playerId, "runtime_bot_revived");
+  } else {
+    releaseRuntimeBotPhaseLockForPlayer(player, playerId, "runtime_bot_revived");
+  }
+  botObjectiveNextThinkAtSec = 0;
+  runtimeBotNextReconcileAtSec = getCurrentSchedulerNowSeconds() + CIPHER_RUNTIME_BOT_RECONCILE_INTERVAL_SECONDS;
 }
 
 function detachRuntimeBotPlayerForRespawn(playerId: number, delaySeconds: number): void {
@@ -4845,17 +5124,57 @@ function requestLiveBotSpawnForPlayerId(
 
   const slot = getRuntimeBotSlotForPlayerId(playerId);
   if (!slot) return;
-  if (source.indexOf("Undeploy") >= 0) {
-    detachRuntimeBotPlayerForRespawn(playerId, delaySeconds);
-  } else {
-    markRuntimeBotSlotForRespawn(playerId, delaySeconds);
-  }
+  void source;
+  markRuntimeBotSlotForRespawn(playerId, delaySeconds);
   runtimeBotNextReconcileAtSec = 0;
 }
 
 function requestLiveBotSpawnsForAllBots(_source: string): void {
   runtimeBotNextReconcileAtSec = 0;
   reconcileRuntimeBots(getCurrentSchedulerNowSeconds());
+}
+
+function handleRuntimeBotDeployedForCurrentPhase(
+  eventPlayer: mod.Player,
+  playerId: number,
+  slot: RuntimeBotSlot,
+  source: string
+): void {
+  let sp = serverPlayers.get(playerId);
+  if (!sp) {
+    sp = new Player(eventPlayer);
+    serverPlayers.set(playerId, sp);
+  }
+
+  sp.player = eventPlayer;
+  sp.team = slot.desiredTeam;
+  sp.isDeployed = true;
+
+  clearCipherKeyHudCacheForPlayer(playerId);
+  clearQueuedSafeSpawnStateForPlayer(playerId);
+  invalidateCipherRespawnRouteJobForPlayer(playerId);
+  clearTransitionSpawnStateForPlayer(playerId);
+
+  safeSpawnForcedRedeploys[playerId] = 0;
+  safeSpawnForcedUndeploy[playerId] = false;
+  safeSpawnUnsafePending[playerId] = false;
+  safeSpawnPendingCheck[playerId] = false;
+  hqDesyncForcedRedeploys[playerId] = 0;
+
+  try {
+    mod.SetRedeployTime(eventPlayer, isCipherSuddenDeathActive() ? 9999 : REDEPLOY_TIME);
+  } catch (_errRedeploy) {}
+
+  if (gameStatus === 2 || isCipherLiveTransitionActive() || shouldRuntimeBotsBePhaseLocked()) {
+    routeRuntimeBotToCipherSpawnAnchor(eventPlayer, playerId, source);
+    applyRuntimeBotPhaseLockForPlayer(eventPlayer, playerId, source);
+  } else {
+    releaseRuntimeBotPhaseLockForPlayer(eventPlayer, playerId, source);
+  }
+
+  sp.isFirstDeploy();
+  botObjectiveNextThinkAtSec = 0;
+  requestCipherTransitionReconcile(source);
 }
 
 function processLiveBotSpawnRequests(nowSec: number): void {
@@ -4888,14 +5207,103 @@ function getRuntimeBotDefendRadiusForRole(role: BotObjectiveRole): number {
 
 function trySetRuntimeBotTarget(bot: Player, targetPlayer: mod.Player): void {
   if (!isLiveBotDeployedAndAlive(bot)) return;
+  if (isRuntimeBotPhaseLocked(bot.id)) return;
   if (!mod.IsPlayerValid(targetPlayer)) return;
   try {
     mod.AISetTarget(bot.player, targetPlayer);
   } catch (_errTarget) {}
 }
 
+function chooseNearestRuntimeBotEnemyTarget(sp: Player, maxRadiusMeters: number): BotEnemyTarget | undefined {
+  if (!isLiveBotDeployedAndAlive(sp)) return undefined;
+  if (isRuntimeBotPhaseLocked(sp.id)) return undefined;
+
+  const botTeam = getCipherKeyTeamSnapshot(sp.id) ?? mod.GetTeam(sp.player);
+  if (!mod.Equals(botTeam, team1) && !mod.Equals(botTeam, team2)) return undefined;
+
+  const botPos = tryGetPlayerPositionSafe(sp.player);
+  if (!botPos) return undefined;
+
+  let best: BotEnemyTarget | undefined = undefined;
+
+  serverPlayers.forEach((candidate) => {
+    if (!candidate || candidate.id === sp.id) return;
+    if (!candidate.isDeployed || !mod.IsPlayerValid(candidate.player)) return;
+    if (playerInMandownByPlayerId[candidate.id] === true) return;
+    if (!isPlayerAliveSafe(candidate.player)) return;
+
+    const candidateTeam = getCipherKeyTeamSnapshot(candidate.id) ?? mod.GetTeam(candidate.player);
+    if (!mod.Equals(candidateTeam, team1) && !mod.Equals(candidateTeam, team2)) return;
+    if (mod.Equals(candidateTeam, botTeam)) return;
+
+    const candidatePos = tryGetPlayerPositionSafe(candidate.player);
+    if (!candidatePos) return;
+
+    const dist = mod.DistanceBetween(botPos, candidatePos);
+    if (dist > maxRadiusMeters) return;
+
+    if (
+      best === undefined ||
+      dist < best.distance - 0.0001 ||
+      (Math.abs(dist - best.distance) <= 0.0001 && candidate.id < best.playerId)
+    ) {
+      best = {
+        player: candidate.player,
+        playerId: candidate.id,
+        pos: candidatePos,
+        distance: dist,
+      };
+    }
+  });
+
+  return best;
+}
+
+function refreshRuntimeBotEnemyTarget(sp: Player, nowSec: number): BotEnemyTarget | undefined {
+  if (isRuntimeBotPhaseLocked(sp.id)) return undefined;
+  const target = chooseNearestRuntimeBotEnemyTarget(sp, CIPHER_RUNTIME_BOT_ENEMY_SCAN_RADIUS_METERS);
+  const lastTargetPlayerId = botObjectiveTargetPlayerIdByPlayerId[sp.id];
+  const lastRefreshAtSec = botObjectiveTargetRefreshAtSecByPlayerId[sp.id] ?? -999999;
+
+  if (!target) {
+    if (lastTargetPlayerId !== undefined) {
+      try {
+        mod.AISetTarget(sp.player);
+      } catch (_errClearTarget) {}
+      delete botObjectiveTargetPlayerIdByPlayerId[sp.id];
+      delete botObjectiveTargetRefreshAtSecByPlayerId[sp.id];
+    }
+    return undefined;
+  }
+
+  if (
+    lastTargetPlayerId !== target.playerId ||
+    nowSec - lastRefreshAtSec >= CIPHER_RUNTIME_BOT_TARGET_REFRESH_SECONDS
+  ) {
+    trySetRuntimeBotTarget(sp, target.player);
+    try {
+      mod.AISetFocusPoint(sp.player, target.pos, true);
+    } catch (_errFocus) {}
+    botObjectiveTargetPlayerIdByPlayerId[sp.id] = target.playerId;
+    botObjectiveTargetRefreshAtSecByPlayerId[sp.id] = nowSec;
+  }
+
+  return target;
+}
+
+function refreshRuntimeBotEnemyTargets(nowSec: number): { [playerId: number]: BotEnemyTarget | undefined } {
+  const targets: { [playerId: number]: BotEnemyTarget | undefined } = {};
+  serverPlayers.forEach((sp) => {
+    if (!isLiveBotDeployedAndAlive(sp)) return;
+    if (isRuntimeBotPhaseLocked(sp.id)) return;
+    targets[sp.id] = refreshRuntimeBotEnemyTarget(sp, nowSec);
+  });
+  return targets;
+}
+
 function issueBotMoveCommand(sp: Player, role: BotObjectiveRole, target: mod.Vector, nowSec: number): void {
   if (!isLiveBotDeployedAndAlive(sp)) return;
+  if (isRuntimeBotPhaseLocked(sp.id)) return;
   if (!shouldIssueBotMoveCommand(sp.id, role, target, nowSec)) return;
 
   try {
@@ -5071,7 +5479,12 @@ function chooseNearestBotTeammatePosition(sp: Player, botTeam: mod.Team): mod.Ve
 
 function tryIssueBotReviveAssignment(sp: Player, nowSec: number): boolean {
   if (!isLiveBotDeployedAndAlive(sp)) return false;
-  if (bombCarrierPlayerId === sp.id) return false;
+  if (isRuntimeBotPhaseLocked(sp.id)) return false;
+  if (bombCarrierPlayerId === sp.id) {
+    delete botReviveTargetPlayerIdByReviverId[sp.id];
+    delete botReviveAssignmentStartedAtSecByReviverId[sp.id];
+    return false;
+  }
 
   const botTeam = getCipherKeyTeamSnapshot(sp.id) ?? mod.GetTeam(sp.player);
   const botPos = tryGetPlayerPositionSafe(sp.player);
@@ -5109,12 +5522,27 @@ function tryIssueBotReviveAssignment(sp: Player, nowSec: number): boolean {
     }
   });
 
-  if (!best.player || !best.pos) return false;
+  if (!best.player || !best.pos) {
+    delete botReviveTargetPlayerIdByReviverId[sp.id];
+    delete botReviveAssignmentStartedAtSecByReviverId[sp.id];
+    return false;
+  }
 
-  if (best.distance <= CIPHER_RUNTIME_BOT_REVIVE_FORCE_RADIUS_METERS) {
+  if (botReviveTargetPlayerIdByReviverId[sp.id] !== best.playerId) {
+    botReviveTargetPlayerIdByReviverId[sp.id] = best.playerId;
+    botReviveAssignmentStartedAtSecByReviverId[sp.id] = nowSec;
+  }
+
+  const assignmentStartedAtSec = botReviveAssignmentStartedAtSecByReviverId[sp.id] ?? nowSec;
+  const assignmentReady = nowSec - assignmentStartedAtSec >= CIPHER_RUNTIME_BOT_REVIVE_ASSIGNMENT_SECONDS;
+
+  if (best.distance <= CIPHER_RUNTIME_BOT_REVIVE_FORCE_RADIUS_METERS && assignmentReady) {
     try {
       mod.ForceRevive(best.player);
+      handleRuntimeBotRevivedForPlayer(best.playerId, best.player, "bot_force_revive");
       delete playerInMandownByPlayerId[best.playerId];
+      delete botReviveTargetPlayerIdByReviverId[sp.id];
+      delete botReviveAssignmentStartedAtSecByReviverId[sp.id];
       botObjectiveNextThinkAtSec = 0;
       return true;
     } catch (_errRevive) {}
@@ -5193,7 +5621,10 @@ function evaluateBotCarrierRouting(nowSec: number): BotCarrierRoutingResult {
   return { carrierId: carrier.id, carrierTeam, carrierPos, routed: true };
 }
 
-function evaluateBotKeyRunnerRouting(nowSec: number, excludedPlayerId: number | undefined): { [playerId: number]: boolean } {
+function evaluateBotKeyRunnerRouting(
+  nowSec: number,
+  excludedPlayerId: number | undefined
+): { [playerId: number]: boolean } {
   const routedByPlayerId: { [playerId: number]: boolean } = {};
   const keyTarget = getBotCipherKeyTargetPosition();
   if (!keyTarget) return routedByPlayerId;
@@ -5261,6 +5692,8 @@ function evaluateBotObjectiveController(nowSec: number): void {
   if (cipherSecondHalfTransitionActive || cipherSuddenDeathTransitionActive) return;
   if (nowSec < botObjectiveNextThinkAtSec) return;
   botObjectiveNextThinkAtSec = nowSec + BOT_OBJECTIVE_THINK_INTERVAL_SECONDS;
+
+  refreshRuntimeBotEnemyTargets(nowSec);
 
   // Keep pickup logic alive even when bots are already standing near the spawned key.
   // This prevents bots from reaching the key area and then waiting forever.
@@ -16378,6 +16811,7 @@ function setCipherRuntimeBotsEnabled(enabled: boolean, context: string): boolean
   cipherRuntimeBotsEnabled = true;
   runtimeBotNextReconcileAtSec = 0;
   botObjectiveNextThinkAtSec = 0;
+  resetRuntimeBotStagedSpawnSchedule();
   resetRuntimeBotSpawnerValidationState();
 
   safeSendPortalLogToAdmin("bots_enabled_" + context);
@@ -16406,6 +16840,7 @@ function toggleCipherRuntimeBotsFromAdmin(context: string): boolean {
 function clearCipherRuntimeBotsFromAdmin(): boolean {
   clearRuntimeBotState(true);
   runtimeBotNextReconcileAtSec = 0;
+  resetRuntimeBotStagedSpawnSchedule();
   refreshCipherAdminPanels();
   return true;
 }
@@ -16413,6 +16848,7 @@ function clearCipherRuntimeBotsFromAdmin(): boolean {
 function forceCipherRuntimeBotReconcileFromAdmin(): boolean {
   runtimeBotNextReconcileAtSec = 0;
   botObjectiveNextThinkAtSec = 0;
+  resetRuntimeBotStagedSpawnSchedule();
 
   if (cipherRuntimeBotsEnabled) {
     reconcileRuntimeBots(getCurrentSchedulerNowSeconds());
@@ -19488,6 +19924,7 @@ const CIPHER_DEPLOY_READY_FREEZE_INPUTS: mod.RestrictedInputs[] = [
 
 function isRequiredSecondHalfDeployPlayer(p: Player): boolean {
   if (!p || !mod.IsPlayerValid(p.player)) return false;
+  if (isCipherRuntimeBotPlayerId(p.id)) return false;
   const team = mod.GetTeam(p.player);
   if (!mod.Equals(team, team1) && !mod.Equals(team, team2)) return false;
   if (isBotBackfillPlayer(p.player)) return false;
@@ -19575,9 +20012,11 @@ function applyCipherIntermissionFreezeForDeployedPlayers(source: string): void {
 function applyCipherTransitionInputLocksForPlayers(source: string): void {
   if (cipherSecondHalfTransitionStage === "intermission") {
     applyCipherIntermissionFreezeForDeployedPlayers(source);
+    applyRuntimeBotPhaseLocksForAll(source + "_bots");
     return;
   }
   applyCipherSecondHalfDeployFreezeForReadyPlayers(source);
+  applyRuntimeBotPhaseLocksForAll(source + "_bots");
 }
 
 function hardUnlockCipherLiveInputsForAllPlayers(_source: string): void {
@@ -19618,6 +20057,9 @@ function clearCipherLivePhaseTransitionRuntimeState(
   cancelAllCipherRespawnRouteJobs();
   clearCipherSecondHalfDeployFreezeForAllPlayers();
   hardUnlockCipherLiveInputsForAllPlayers(source);
+  cipherLiveStartSettleToken += 1;
+  cipherLiveStartSettlingStage = "none";
+  cipherLiveStartSettlingUntilSec = 0;
   cipherPhaseTransitionUndeployIgnoreUntilSec = 0;
   cipherSuddenDeathUndeployIgnoreUntilSec = 0;
   if (resetDeployTracking) {
@@ -19787,6 +20229,7 @@ function runCipherTransitionStepWorkSafe(source: string, forceDeployMissingPlaye
 
   try {
     applyCipherSecondHalfDeployFreezeForReadyPlayers(source);
+    applyRuntimeBotPhaseLocksForAll(source + "_bots");
   } catch (err) {
     LogRuntimeError("TransitionStep/applyDeployFreeze/" + source, err);
   }
@@ -20060,6 +20503,7 @@ function clearCipherTransitionSupervisorState(): void {
   cipherLiveTransitionSupervisorKind = "none";
   cipherLiveTransitionSupervisorToken = 0;
   cipherLiveTransitionSupervisorDeadlineAtSec = 0;
+  cipherLiveTransitionSupervisorDeadlineTick = 0;
   cipherLiveTransitionSupervisorLastShownSeconds = -1;
 }
 
@@ -20079,24 +20523,46 @@ function startCipherTransitionSupervisorStage(
   nowSec: number
 ): void {
   cipherSecondHalfTransitionStage = stage;
-  cipherLiveTransitionSupervisorDeadlineAtSec = nowSec + mod.Max(0, durationSeconds);
+  const safeDurationSeconds = mod.Max(0, durationSeconds);
+  cipherLiveTransitionSupervisorDeadlineAtSec = nowSec + safeDurationSeconds;
+  cipherLiveTransitionSupervisorDeadlineTick = serverTickCount + mod.Ceiling(safeDurationSeconds * TICK_RATE);
   cipherLiveTransitionSupervisorLastShownSeconds = -1;
-  setCipherTransitionCountdownSeconds(durationSeconds);
+  setCipherTransitionCountdownSeconds(safeDurationSeconds);
+}
+
+function getCipherTransitionStageDurationSeconds(stage: CipherSecondHalfTransitionStage): number {
+  if (stage === "intermission") return CIPHER_HALFTIME_INTERMISSION_SECONDS;
+  if (stage === "deploy") return CIPHER_SECOND_HALF_DEPLOY_PHASE_SECONDS;
+  if (stage === "countdown") return CIPHER_SECOND_HALF_FINAL_COUNTDOWN_SECONDS;
+  if (stage === "finalizing") return CIPHER_TRANSITION_FINALIZER_WATCHDOG_SECONDS;
+  return 0;
 }
 
 function repairCipherTransitionSupervisorDeadlineIfMissing(nowSec: number): void {
-  if (cipherLiveTransitionSupervisorDeadlineAtSec > 0) return;
-  if (cipherSecondHalfTransitionStage === "intermission") {
-    startCipherTransitionSupervisorStage("intermission", CIPHER_HALFTIME_INTERMISSION_SECONDS, nowSec);
-  } else if (cipherSecondHalfTransitionStage === "deploy") {
-    startCipherTransitionSupervisorStage("deploy", CIPHER_SECOND_HALF_DEPLOY_PHASE_SECONDS, nowSec);
-  } else if (cipherSecondHalfTransitionStage === "countdown") {
-    startCipherTransitionSupervisorStage("countdown", CIPHER_SECOND_HALF_FINAL_COUNTDOWN_SECONDS, nowSec);
+  const durationSeconds = getCipherTransitionStageDurationSeconds(cipherSecondHalfTransitionStage);
+  if (durationSeconds <= 0) return;
+
+  const maxFutureTicks = mod.Ceiling((durationSeconds + 2) * TICK_RATE);
+  if (
+    cipherLiveTransitionSupervisorDeadlineTick > 0 &&
+    cipherLiveTransitionSupervisorDeadlineTick <= serverTickCount + maxFutureTicks
+  ) {
+    return;
   }
+
+  startCipherTransitionSupervisorStage(cipherSecondHalfTransitionStage, durationSeconds, nowSec);
 }
 
 function getCipherTransitionSupervisorRemainingSeconds(nowSec: number): number {
   repairCipherTransitionSupervisorDeadlineIfMissing(nowSec);
+  if (
+    cipherSecondHalfTransitionStage === "intermission" ||
+    cipherSecondHalfTransitionStage === "deploy" ||
+    cipherSecondHalfTransitionStage === "countdown"
+  ) {
+    const remainingTicks = mod.Max(0, cipherLiveTransitionSupervisorDeadlineTick - serverTickCount);
+    return mod.Max(0, mod.Ceiling(remainingTicks / TICK_RATE));
+  }
   return mod.Max(0, mod.Ceiling(cipherLiveTransitionSupervisorDeadlineAtSec - nowSec));
 }
 
@@ -20136,6 +20602,46 @@ function refreshCipherTransitionSupervisorSecond(remainingSeconds: number): void
       cipherLiveTransitionSupervisorKind + "_supervisor_countdown_" + String(remainingSeconds),
       remainingSeconds <= 3 ? 0.85 : 0.6
     );
+  }
+}
+
+function requestCipherTransitionReconcile(reason: string): void {
+  if (!isCipherLiveTransitionActive() && cipherLiveStartSettlingStage === "none") return;
+  cipherTransitionReconcileQueued = true;
+  if (cipherTransitionReconcileReason.length <= 0) {
+    cipherTransitionReconcileReason = reason;
+  } else if (cipherTransitionReconcileReason.indexOf(reason) < 0) {
+    cipherTransitionReconcileReason = cipherTransitionReconcileReason + ";" + reason;
+  }
+}
+
+function runQueuedCipherTransitionReconcile(nowSec: number): void {
+  if (
+    cipherLiveStartSettlingStage !== "none" &&
+    cipherLiveStartSettlingUntilSec > 0 &&
+    nowSec >= cipherLiveStartSettlingUntilSec
+  ) {
+    finishRuntimeBotLiveStartSettle(cipherLiveStartSettleToken, cipherLiveStartSettlingStage, "transition_reconcile");
+  }
+
+  if (!cipherTransitionReconcileQueued) return;
+  const reason = cipherTransitionReconcileReason;
+  cipherTransitionReconcileQueued = false;
+  cipherTransitionReconcileReason = "";
+
+  if (!isCipherLiveTransitionActive()) return;
+
+  repairCipherTransitionSupervisorDeadlineIfMissing(nowSec);
+
+  if (cipherSecondHalfTransitionStage === "intermission") {
+    verifyCipherTransitionPlayersUndeployed("transition_reconcile_intermission/" + reason);
+    applyCipherTransitionInputLocksForPlayers("transition_reconcile_intermission/" + reason);
+    return;
+  }
+
+  if (cipherSecondHalfTransitionStage === "deploy" || cipherSecondHalfTransitionStage === "countdown") {
+    runCipherTransitionStepWorkSafe("transition_reconcile_" + cipherSecondHalfTransitionStage + "/" + reason, false);
+    tickRuntimeBotStagedSpawning(nowSec, "transition_reconcile_" + cipherSecondHalfTransitionStage);
   }
 }
 
@@ -20203,7 +20709,9 @@ function enterCipherSecondHalfDeploySupervisorStage(nowSec: number): void {
   mod.UndeployAllPlayers();
   applyCipherSecondHalfHqSpawns(cipherLiveTransitionSupervisorKind + "_supervisor_deploy_after_undeploy");
   markCipherSecondHalfDeployRequiredPlayers();
+  resetRuntimeBotStagedSpawnSchedule();
   startCipherTransitionSupervisorStage("deploy", CIPHER_SECOND_HALF_DEPLOY_PHASE_SECONDS, nowSec);
+  tickRuntimeBotStagedSpawning(nowSec, cipherLiveTransitionSupervisorKind + "_supervisor_deploy_enter");
   runCipherTransitionStepWorkSafe(cipherLiveTransitionSupervisorKind + "_supervisor_deploy_enter", false);
 }
 
@@ -20456,6 +20964,7 @@ function finalizeCipherTransitionLiveStart(
   cipherTransitionLastCheckpoint = context + "/complete";
 
   startCipherPostTransitionLiveInputUnlock(expectedStage, context + "_input_unlock");
+  startRuntimeBotLiveStartSettle(expectedStage, context + "_bot_settle");
   scheduleCipherLiveStartKeySpawn(2, expectedStage, context + "_live_start");
 }
 
@@ -20795,6 +21304,7 @@ function tickCipherLiveTransitionSupervisor(nowSec: number): boolean {
 
   if (cipherSecondHalfTransitionStage === "deploy") {
     runCipherTransitionStepWorkSafe(cipherLiveTransitionSupervisorKind + "_supervisor_deploy", false);
+    tickRuntimeBotStagedSpawning(nowSec, cipherLiveTransitionSupervisorKind + "_supervisor_deploy");
     const forceWindowReached = remaining <= CIPHER_SECOND_HALF_FINAL_COUNTDOWN_SECONDS;
     if (hasAllRequiredCipherSecondHalfDeployersReady() || forceWindowReached) {
       enterCipherTransitionCountdownSupervisorStage(nowSec, forceWindowReached);
@@ -20804,6 +21314,7 @@ function tickCipherLiveTransitionSupervisor(nowSec: number): boolean {
 
   if (cipherSecondHalfTransitionStage === "countdown") {
     runCipherTransitionStepWorkSafe(cipherLiveTransitionSupervisorKind + "_supervisor_countdown", false);
+    tickRuntimeBotStagedSpawning(nowSec, cipherLiveTransitionSupervisorKind + "_supervisor_countdown");
     if (remaining <= 0) completeCipherTransitionSupervisor(nowSec);
     return true;
   }
@@ -20831,6 +21342,7 @@ function beginCipherSecondHalfSupervisor(
   cipherSuddenDeathTransitionActive = false;
   cipherSecondHalfTransitionStage = "intermission";
   clearCipherLivePhaseTransitionRuntimeState("second_half_supervisor_enter", true, true);
+  clearRuntimeBotState(true);
   cipherSecondHalfTransitionStage = "intermission";
   cipherTransitionUndeployCursor = 0;
   mod.SetSpawnMode(mod.SpawnModes.Deploy);
@@ -20885,6 +21397,7 @@ function beginCipherSuddenDeathSupervisor(nowSec: number): void {
   cipherSecondHalfTransitionActive = false;
   cipherSecondHalfTransitionStage = "intermission";
   clearCipherLivePhaseTransitionRuntimeState("sudden_death_supervisor_enter", true, true);
+  clearRuntimeBotState(true);
   cipherSecondHalfTransitionStage = "intermission";
   cipherTransitionUndeployCursor = 0;
   liveClockStarted = false;
@@ -21102,6 +21615,8 @@ function countCipherSuddenDeathLivesRemaining(team: mod.Team): number {
   let count = 0;
   serverPlayers.forEach((sp) => {
     if (!sp || !mod.IsPlayerValid(sp.player)) return;
+    if (isCipherRuntimeBotPlayerId(sp.id)) return;
+    if (isBotBackfillPlayerSafe(sp.player)) return;
     if (!mod.Equals(mod.GetTeam(sp.player), team)) return;
     if (cipherSuddenDeathEliminatedByPlayerId[sp.id] === true) return;
     count += 1;
@@ -23797,6 +24312,7 @@ function InitializePreLive(): void {
     resetCipherSuddenDeathState();
     resetCipherSpawnRoutingState();
     preliveTeamSanityWarnedByPlayerId = {};
+    resetRuntimeBotStagedSpawnSchedule();
 
     if (!validatePreLivePlayerTeamsFromEngine()) {
       initOk = false;
@@ -23960,6 +24476,7 @@ function InitializeLive(): void {
     repairCipherKeyHudCachesForAllPlayers(true);
     UpdateBombCarrierUiForAllPlayers(undefined, true);
     refreshBombNoticeUiForAllPlayers(undefined, true);
+    startRuntimeBotLiveStartSettle("half1", "InitializeLive");
     requestLiveBotSpawnsForAllBots("InitializeLive");
     emitLiveTransitionCheckpoint("live_init_players_unlocked");
 
@@ -25498,6 +26015,7 @@ function OngoingGlobal_Inner(): void {
 
     processTransitionSpawnQueue("prelive_countdown");
     processCipherSpawnJobs("prelive_countdown");
+    tickRuntimeBotStagedSpawning(nowSec, "prelive_countdown");
 
     if (mod.Modulo(phaseTickCount, TICK_RATE) === 0) {
       countDown -= 1;
@@ -25528,6 +26046,8 @@ function OngoingGlobal_Inner(): void {
       }
       return;
     }
+
+    runQueuedCipherTransitionReconcile(nowSec);
 
     if (cipherSecondHalfTransitionActive || cipherSuddenDeathTransitionActive) {
       tickCipherLiveTransitionSupervisor(nowSec);
@@ -25841,6 +26361,7 @@ function Mode_OnPlayerJoinGame(eventPlayer: mod.Player): void {
       }
     }
 
+    requestCipherTransitionReconcile("OnPlayerJoinGame");
     refreshCipherKeyPlayerSnapshots("OnPlayerJoinGame");
   } catch (err) {
     LogRuntimeError("OnPlayerJoinGame", err);
@@ -25891,7 +26412,7 @@ function Mode_OnPlayerLeaveGame(eventNumber: number): void {
       updateCipherSuddenDeathAliveHudForAllPlayers();
       const winner = resolveCipherSuddenDeathEliminationWinner();
       if (!mod.Equals(winner, teamNeutral)) {
-        enterPostmatchFromLive(winner);
+        scheduleCipherSuddenDeathPostmatch(winner, "player_leave");
       }
     }
 
@@ -25960,6 +26481,7 @@ function Mode_OnPlayerLeaveGame(eventNumber: number): void {
   } catch (err) {
     LogRuntimeError("OnPlayerLeaveGame", err);
   } finally {
+    requestCipherTransitionReconcile("OnPlayerLeaveGame");
     refreshCipherKeyPlayerSnapshots("OnPlayerLeaveGame");
   }
 }
@@ -25983,6 +26505,16 @@ async function Mode_OnPlayerDeployed(eventPlayer: mod.Player): Promise<void> {
     applyPhaseInputRestrictionsForPlayer(eventPlayer);
     // Reset damage spacing state on deploy
     dmgSpreadClearForPlayer(eventPlayer);
+
+    if (deployedIsBot && deployedRuntimeBotSlot) {
+      handleRuntimeBotDeployedForCurrentPhase(
+        eventPlayer,
+        playerId,
+        deployedRuntimeBotSlot,
+        "OnPlayerDeployed_RuntimeBot"
+      );
+      return;
+    }
   
     if (gameStatus === 0) {
       const pPrematch = serverPlayers.get(playerId);
@@ -26047,7 +26579,7 @@ async function Mode_OnPlayerDeployed(eventPlayer: mod.Player): Promise<void> {
 
     const liveRedeploySeconds = isCipherSuddenDeathActive() ? 9999 : REDEPLOY_TIME;
 
-    p.team = deployedIsBot && deployedRuntimeBotSlot ? deployedRuntimeBotSlot.desiredTeam : team;
+    p.team = team;
     p.isDeployed = true;
 
     if (isCipherSuddenDeathActive() && cipherSuddenDeathEliminatedByPlayerId[playerId] === true) {
@@ -26062,35 +26594,6 @@ async function Mode_OnPlayerDeployed(eventPlayer: mod.Player): Promise<void> {
       return;
     }
 
-    if (deployedIsBot) {
-      configureRuntimeBotCombat(eventPlayer);
-
-      try {
-        mod.SetRedeployTime(eventPlayer, liveRedeploySeconds);
-      } catch (_errRedeploy) {}
-
-      // Runtime bots are gameplay actors only.
-      // Do not give them admin widgets, live HUD widgets, transition UI, or safe-spawn recycle logic.
-      clearCipherKeyHudCacheForPlayer(playerId);
-      clearQueuedSafeSpawnStateForPlayer(playerId);
-      invalidateCipherRespawnRouteJobForPlayer(playerId);
-
-      safeSpawnForcedRedeploys[playerId] = 0;
-      safeSpawnForcedUndeploy[playerId] = false;
-      safeSpawnUnsafePending[playerId] = false;
-      safeSpawnPendingCheck[playerId] = false;
-      hqDesyncForcedRedeploys[playerId] = 0;
-
-      p.isFirstDeploy();
-
-      botObjectiveNextThinkAtSec = 0;
-      return;
-    }
-
-    queueCipherAdminInteractSpawnForPlayer(playerId, "OnPlayerDeployed_Live");
-    repairCipherKeyHudCacheForPlayer(p, true);
-    updateCipherSuddenDeathAliveHudForPlayer(p);
-
     if (isCipherLiveTransitionActive()) {
       if (handleCipherTransitionDeployedPlayer(playerId, eventPlayer, "OnPlayerDeployed_Transition")) {
         queueCipherAdminInteractSpawnForPlayer(playerId, "OnPlayerDeployed_Transition");
@@ -26098,16 +26601,9 @@ async function Mode_OnPlayerDeployed(eventPlayer: mod.Player): Promise<void> {
       return;
     }
 
-        queueCipherAdminInteractSpawnForPlayer(playerId, "OnPlayerDeployed_Live");
-        repairCipherKeyHudCacheForPlayer(p, true);
-        updateCipherSuddenDeathAliveHudForPlayer(p);
-
-        if (isCipherLiveTransitionActive()) {
-          if (handleCipherTransitionDeployedPlayer(playerId, eventPlayer, "OnPlayerDeployed_Transition")) {
-            queueCipherAdminInteractSpawnForPlayer(playerId, "OnPlayerDeployed_Transition");
-          }
-          return;
-        }
+    queueCipherAdminInteractSpawnForPlayer(playerId, "OnPlayerDeployed_Live");
+    repairCipherKeyHudCacheForPlayer(p, true);
+    updateCipherSuddenDeathAliveHudForPlayer(p);
 
     applyPrematch889HealthForPlayer(playerId);
     recordLastLiveHqSpawnSourceFromDeploy(eventPlayer, playerId);
@@ -26153,6 +26649,7 @@ async function Mode_OnPlayerDeployed(eventPlayer: mod.Player): Promise<void> {
   } catch (err) {
     LogRuntimeError("OnPlayerDeployed", err);
   } finally {
+    requestCipherTransitionReconcile("OnPlayerDeployed");
     refreshCipherKeyPlayerSnapshots("OnPlayerDeployed");
   }
 }
@@ -26192,6 +26689,20 @@ async function Mode_OnPlayerUndeploy(eventPlayer: mod.Player): Promise<void> {
     UpdateDeployObjectiveTimerUiForPlayer(p);
     updateCipherSuddenDeathAliveHudForAllPlayers();
 
+    if (undeployedIsBot && (gameStatus === 2 || (gameStatus === 3 && (cipherSecondHalfTransitionActive || cipherSuddenDeathTransitionActive)))) {
+      const slot = getRuntimeBotSlotForPlayerId(id);
+      if (slot && !slot.retired) {
+        clearRuntimeBotPlayerBinding(slot, true);
+        slot.nextSpawnAtSec = getCurrentSchedulerNowSeconds() + CIPHER_RUNTIME_BOT_RESPAWN_DELAY_SECONDS;
+        runtimeBotStagedSpawnNextTick = 0;
+      }
+      clearCipherKeyHudCacheForPlayer(id);
+      clearQueuedSafeSpawnStateForPlayer(id);
+      invalidateCipherRespawnRouteJobForPlayer(id);
+      requestCipherTransitionReconcile("OnPlayerUndeploy_RuntimeBotTransition");
+      return;
+    }
+
     if (gameStatus === 3 && (cipherSecondHalfTransitionActive || cipherSuddenDeathTransitionActive)) {
       if (cipherSecondHalfTransitionStage === "deploy") {
         setCipherSecondHalfDeployFreezeForPlayer(eventPlayer, false, "transition_deploy_undeploy");
@@ -26215,6 +26726,7 @@ async function Mode_OnPlayerUndeploy(eventPlayer: mod.Player): Promise<void> {
 
     if (
       isCipherSuddenDeathActive() &&
+      !isCipherLiveStartSettling() &&
       wasDeployed &&
       safeSpawnForcedUndeploy[id] !== true &&
       getCurrentSchedulerNowSeconds() >= cipherSuddenDeathUndeployIgnoreUntilSec
@@ -26241,12 +26753,24 @@ async function Mode_OnPlayerUndeploy(eventPlayer: mod.Player): Promise<void> {
     }
 
     if (gameStatus === 3 && undeployedIsBot) {
+      const nowSec = getCurrentSchedulerNowSeconds();
+      const trackedReviveWindowUntilSec = runtimeBotRespawnAfterSecByPlayerId[id];
+      const reviveWindowUntilSec = trackedReviveWindowUntilSec ?? 0;
+      const fallbackRespawnDelaySeconds = isForcedSafeSpawnFlowAtUndeploy
+        ? CIPHER_RUNTIME_BOT_RESPAWN_DELAY_SECONDS
+        : trackedReviveWindowUntilSec !== undefined
+          ? CIPHER_RUNTIME_BOT_RESPAWN_DELAY_SECONDS
+          : CIPHER_RUNTIME_BOT_MANDOWN_REVIVE_WINDOW_SECONDS;
+      const respawnDelaySeconds =
+        reviveWindowUntilSec > nowSec
+          ? reviveWindowUntilSec - nowSec
+          : fallbackRespawnDelaySeconds;
       safeSpawnForcedRedeploys[id] = 0;
       safeSpawnForcedUndeploy[id] = false;
       safeSpawnUnsafePending[id] = false;
       safeSpawnPendingCheck[id] = false;
       hqDesyncForcedRedeploys[id] = 0;
-      requestLiveBotSpawnForPlayerId(id, "OnPlayerUndeploy_Live", CIPHER_RUNTIME_BOT_RESPAWN_DELAY_SECONDS);
+      requestLiveBotSpawnForPlayerId(id, "OnPlayerUndeploy_Live", respawnDelaySeconds);
       p.addDeath();
       return;
     }
@@ -26272,6 +26796,7 @@ async function Mode_OnPlayerUndeploy(eventPlayer: mod.Player): Promise<void> {
   } catch (err) {
     LogRuntimeError("OnPlayerUndeploy", err);
   } finally {
+    requestCipherTransitionReconcile("OnPlayerUndeploy");
     refreshCipherKeyPlayerSnapshots("OnPlayerUndeploy");
   }
 }
@@ -26940,9 +27465,13 @@ function Mode_OnMandown(eventPlayer: mod.Player, _eventOtherPlayer: mod.Player):
     clearAllObjectiveAreaTriggerStateForPlayer(playerId);
     clearCipherPresenceForPlayer(playerId);
 
-    if (isCipherSuddenDeathActive()) {
+    if (isCipherSuddenDeathActive() && !isCipherLiveStartSettling()) {
       consumeCipherSuddenDeathLife(playerId, "mandown");
       return;
+    }
+
+    if (getRuntimeBotSlotForPlayerId(playerId)) {
+      markRuntimeBotSlotForRespawn(playerId, CIPHER_RUNTIME_BOT_MANDOWN_REVIVE_WINDOW_SECONDS);
     }
 
     // If the key carrier goes mandown in normal live play, drop the key safely after this event stack.
@@ -26954,6 +27483,7 @@ function Mode_OnMandown(eventPlayer: mod.Player, _eventOtherPlayer: mod.Player):
 
     UpdateObjectiveCaptureInteractionState();
     botObjectiveNextThinkAtSec = 0;
+    requestCipherTransitionReconcile("OnMandown");
   }
 
   if (!isPrematchOutside889(playerId)) return;
@@ -26975,11 +27505,14 @@ function Mode_OnRevived(eventPlayer: mod.Player, _eventOtherPlayer: mod.Player):
 
   if (gameStatus !== 3) return;
 
+  handleRuntimeBotRevivedForPlayer(playerId, eventPlayer, "Mode_OnRevived");
+
   const p = serverPlayers.get(playerId);
   if (!p) return;
 
   startRestrictedCountdownIfNeeded(p);
   UpdateObjectiveCaptureInteractionState();
+  requestCipherTransitionReconcile("OnRevived");
 }
 
 
@@ -27011,7 +27544,7 @@ function Mode_OnPlayerDied(
   clearCipherPresenceForPlayer(playerId);
   cancelObjectiveCaptureAttemptsForPlayer(playerId);
 
-  if (isCipherSuddenDeathActive()) {
+  if (isCipherSuddenDeathActive() && !isCipherLiveStartSettling()) {
     consumeCipherSuddenDeathLife(playerId, "death");
     return;
   }
@@ -27037,6 +27570,7 @@ function Mode_OnPlayerDied(
   }
 
   botObjectiveNextThinkAtSec = 0;
+  requestCipherTransitionReconcile("OnPlayerDied");
 }
 
 function Mode_OnPlayerEarnedKill(
@@ -27292,6 +27826,7 @@ function Mode_OnAIMoveToFailed(eventPlayer: mod.Player): void {
   const playerId = getPlayerIdSafe(eventPlayer);
   if (playerId === undefined) return;
   if (!getRuntimeBotSlotForPlayerId(playerId)) return;
+  if (isRuntimeBotPhaseLocked(playerId)) return;
 
   const nowSec = getCurrentSchedulerNowSeconds();
 
@@ -27307,6 +27842,7 @@ function Mode_OnAIMoveToSucceeded(eventPlayer: mod.Player): void {
   const playerId = getPlayerIdSafe(eventPlayer);
   if (playerId === undefined) return;
   if (!getRuntimeBotSlotForPlayerId(playerId)) return;
+  if (isRuntimeBotPhaseLocked(playerId)) return;
 
   const nowSec = getCurrentSchedulerNowSeconds();
 

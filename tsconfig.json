@@ -22,5 +22,10 @@
         "useDefineForClassFields": true,
         "verbatimModuleSyntax": true
     },
-    "include": ["src/**/*.ts", ".yalc/**/*.ts"]
+    "include": ["src/**/*.ts", ".yalc/**/*.ts"],
+    "exclude": [
+        "src/squad-obliteration/zipline-runtime.ts",
+        "src/squad-obliteration/zipline-module.ts",
+        "src/squad-obliteration/config/zipline.ts"
+    ]
 }
