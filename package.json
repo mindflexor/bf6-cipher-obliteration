@@ -12,7 +12,7 @@
         "update": "node scripts/update.js",
         "refresh-ai": "node scripts/generate-ai-context.js",
         "typecheck": "tsc --noEmit",
-        "build": "bf6-portal-bundler --entrypoint ./src/index.ts --outDir ./dist && node scripts/minify-all-spatials.js",
+        "build": "bf6-portal-bundler --entrypoint ./src/index.ts --outDir ./dist && node scripts/slim-bundle.cjs && node scripts/minify-all-spatials.js",
         "validate-authored-spatial": "node scripts/validate-authored-spatial.js --input spatials/MF_Contaminated_CO.spatial.json",
         "export-thumbnail": "node scripts/export-thumbnail.js",
         "minify-spatials": "node scripts/minify-all-spatials.js",

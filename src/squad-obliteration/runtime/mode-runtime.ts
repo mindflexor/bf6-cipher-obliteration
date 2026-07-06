@@ -35,7 +35,6 @@ import { RULES } from '../config/rules.ts';
 import { SPAWN_ROUTING_CONFIG } from '../config/spawn-routing.ts';
 import { WORLD_IDS } from '../config/world-ids.ts';
 import { modlib } from '../utils/mod-compat.ts';
-import { PerformanceStats } from 'bf6-portal-utils/performance-stats/index.ts';
 import { Timers } from 'bf6-portal-utils/timers/index.ts';
 
 /* =================================================================================================
@@ -71,11 +70,11 @@ const CIPHER_RUNTIME_BOT_TEAM1_SPAWNER_ID = 8085;
 const CIPHER_RUNTIME_BOT_TEAM2_SPAWNER_ID = 8086;
 const CIPHER_RUNTIME_BOT_REVIVE_SCAN_RADIUS_METERS = 8.0;
 const CIPHER_RUNTIME_BOT_REVIVE_FORCE_RADIUS_METERS = 2.5;
-const CIPHER_RUNTIME_BOT_REVIVE_ASSIGNMENT_SECONDS = 0.8;
+const CIPHER_RUNTIME_BOT_REVIVE_ASSIGNMENT_SECONDS = 3.0;
 const CIPHER_RUNTIME_BOT_ENEMY_SCAN_RADIUS_METERS = 55.0;
 const CIPHER_RUNTIME_BOT_TARGET_REFRESH_SECONDS = 0.75;
 const CIPHER_RUNTIME_BOT_STAGED_SPAWN_INTERVAL_TICKS = TICK_RATE;
-const CIPHER_RUNTIME_BOT_LOCK_REAPPLY_INTERVAL_TICKS = mod.Max(1, mod.Floor(0.25 * TICK_RATE));
+const CIPHER_RUNTIME_BOT_LOCK_REAPPLY_INTERVAL_TICKS = TICK_RATE;
 const CIPHER_TRANSITION_LIVE_START_SETTLE_SECONDS = 2.0;
 
 // Bot objective controller timing.
@@ -4315,6 +4314,12 @@ function isCipherRuntimeBotPlayer(player: mod.Player): boolean {
   return playerId !== undefined && isCipherRuntimeBotPlayerId(playerId);
 }
 
+function shouldSkipHumanInputRestrictionsForPlayer(player: mod.Player): boolean {
+  const playerId = getPlayerIdSafe(player);
+  if (playerId !== undefined && isCipherRuntimeBotPlayerId(playerId)) return true;
+  return isBotBackfillPlayerSafe(player);
+}
+
 function clearRuntimeBotPlayerBinding(slot: RuntimeBotSlot, releaseOldPlayerId: boolean): void {
   const oldPlayerId = slot.playerId;
   if (oldPlayerId !== undefined) {
@@ -4370,28 +4375,33 @@ function isRuntimeBotPhaseLocked(playerId: number): boolean {
 
 function applyRuntimeBotPhaseLockForPlayer(player: mod.Player, playerId: number, _source: string): void {
   if (!mod.IsPlayerValid(player)) return;
+
   runtimeBotPhaseLockedByPlayerId[playerId] = true;
   clearBotObjectiveStateForPlayer(playerId);
+
+  // Runtime bots are not human clients. Do not use Portal input restrictions on AI.
   configureRuntimeBotLocked(player);
-  try {
-    clearCipherLiveInputRestrictionsForPlayer(player);
-  } catch (_errClearInputs) {}
+
+  const sp = serverPlayers.get(playerId);
+  if (!sp || !sp.isDeployed) return;
+
   try {
     mod.SetPlayerMovementSpeedMultiplier(player, 0);
   } catch (_errSpeed) {}
-  for (let i = 0; i < CIPHER_DEPLOY_READY_FREEZE_INPUTS.length; i++) {
-    try {
-      mod.EnableInputRestriction(player, CIPHER_DEPLOY_READY_FREEZE_INPUTS[i], true);
-    } catch (_errInput) {}
-  }
 }
 
 function releaseRuntimeBotPhaseLockForPlayer(player: mod.Player, playerId: number, _source: string): void {
   if (!mod.IsPlayerValid(player)) return;
+
   delete runtimeBotPhaseLockedByPlayerId[playerId];
-  try {
-    clearCipherLiveInputRestrictionsForPlayer(player);
-  } catch (_errClearInputs) {}
+
+  const sp = serverPlayers.get(playerId);
+  if (sp && sp.isDeployed) {
+    try {
+      mod.SetPlayerMovementSpeedMultiplier(player, 1);
+    } catch (_errSpeed) {}
+  }
+
   configureRuntimeBotCombat(player);
 }
 
@@ -4609,7 +4619,7 @@ function resolveAuthoredRuntimeBotSpawnerByObjId(
     const spawner = mod.GetSpawner(spawnerObjId);
     runtimeBotAuthoredSpawnerByObjId[spawnerObjId] = spawner;
     try {
-      mod.AISetUnspawnOnDead(spawner, true);
+      mod.AISetUnspawnOnDead(spawner, false);
     } catch (_errUnspawnOnDead) {}
     try {
       mod.SetUnspawnDelayInSeconds(spawner, CIPHER_RUNTIME_BOT_UNSPAWN_DELAY_SECONDS);
@@ -5166,11 +5176,13 @@ function handleRuntimeBotDeployedForCurrentPhase(
   } catch (_errRedeploy) {}
 
   if (gameStatus === 2 || isCipherLiveTransitionActive() || shouldRuntimeBotsBePhaseLocked()) {
-    routeRuntimeBotToCipherSpawnAnchor(eventPlayer, playerId, source);
     applyRuntimeBotPhaseLockForPlayer(eventPlayer, playerId, source);
-  } else {
-    releaseRuntimeBotPhaseLockForPlayer(eventPlayer, playerId, source);
+    botObjectiveNextThinkAtSec = 0;
+    requestCipherTransitionReconcile(source + "_bot_locked_no_route");
+    return;
   }
+
+  releaseRuntimeBotPhaseLockForPlayer(eventPlayer, playerId, source);
 
   sp.isFirstDeploy();
   botObjectiveNextThinkAtSec = 0;
@@ -11678,6 +11690,10 @@ function requestTransitionSpawn(playerId: number, source: string): void {
   const sp = serverPlayers.get(playerId);
   if (!sp) return;
   if (!mod.IsPlayerValid(sp.player)) return;
+  if (isCipherRuntimeBotPlayerId(playerId) || isBotBackfillPlayerSafe(sp.player)) {
+    clearTransitionSpawnStateForPlayer(playerId);
+    return;
+  }
 
   const team = mod.GetTeam(sp.player);
   if (!mod.Equals(team, team1) && !mod.Equals(team, team2)) return;
@@ -11749,6 +11765,10 @@ function processTransitionSpawnQueue(source: string): void {
     requestedCount += 1;
 
     if (!mod.IsPlayerValid(sp.player)) return;
+    if (isCipherRuntimeBotPlayerId(playerId) || isBotBackfillPlayerSafe(sp.player)) {
+      clearTransitionSpawnStateForPlayer(playerId);
+      return;
+    }
 
     if (sp.isDeployed) {
       handleCipherTransitionDeployedPlayer(playerId, sp.player, source + "_deployed");
@@ -19927,7 +19947,7 @@ function isRequiredSecondHalfDeployPlayer(p: Player): boolean {
   if (isCipherRuntimeBotPlayerId(p.id)) return false;
   const team = mod.GetTeam(p.player);
   if (!mod.Equals(team, team1) && !mod.Equals(team, team2)) return false;
-  if (isBotBackfillPlayer(p.player)) return false;
+  if (isBotBackfillPlayerSafe(p.player)) return false;
   return true;
 }
 
@@ -19946,10 +19966,18 @@ function resetCipherSecondHalfDeployTracking(): void {
 
 function clearCipherLiveInputRestrictionsForPlayer(player: mod.Player): void {
   if (!mod.IsPlayerValid(player)) return;
-  mod.SetPlayerMovementSpeedMultiplier(player, 1);
-  mod.EnableAllInputRestrictions(player, false);
+  if (shouldSkipHumanInputRestrictionsForPlayer(player)) return;
+
+  try {
+    mod.SetPlayerMovementSpeedMultiplier(player, 1);
+  } catch (_errSpeed) {}
+  try {
+    mod.EnableAllInputRestrictions(player, false);
+  } catch (_errAllInputs) {}
   for (let i = 0; i < CIPHER_TRANSITION_LIVE_INPUT_CLEAR_INPUTS.length; i++) {
-    mod.EnableInputRestriction(player, CIPHER_TRANSITION_LIVE_INPUT_CLEAR_INPUTS[i], false);
+    try {
+      mod.EnableInputRestriction(player, CIPHER_TRANSITION_LIVE_INPUT_CLEAR_INPUTS[i], false);
+    } catch (_errInput) {}
   }
 }
 
@@ -19960,6 +19988,10 @@ function setCipherSecondHalfDeployFreezeForPlayer(
 ): void {
   if (!mod.IsPlayerValid(player)) return;
   const playerId = modlib.getPlayerId(player);
+  if (shouldSkipHumanInputRestrictionsForPlayer(player)) {
+    if (!frozen) delete cipherSecondHalfFrozenByPlayerId[playerId];
+    return;
+  }
 
   if (!frozen) {
     delete cipherSecondHalfFrozenByPlayerId[playerId];
@@ -19972,7 +20004,9 @@ function setCipherSecondHalfDeployFreezeForPlayer(
   cipherSecondHalfFrozenByPlayerId[playerId] = true;
 
   clearCipherLiveInputRestrictionsForPlayer(player);
-  mod.SetPlayerMovementSpeedMultiplier(player, 0);
+  try {
+    mod.SetPlayerMovementSpeedMultiplier(player, 0);
+  } catch (_errSpeed) {}
 
   const inputs =
     cipherSecondHalfTransitionStage === "intermission"
@@ -19980,14 +20014,20 @@ function setCipherSecondHalfDeployFreezeForPlayer(
       : CIPHER_DEPLOY_READY_FREEZE_INPUTS;
 
   for (let i = 0; i < inputs.length; i++) {
-    mod.EnableInputRestriction(player, inputs[i], true);
+    try {
+      mod.EnableInputRestriction(player, inputs[i], true);
+    } catch (_errInput) {}
   }
 }
 
 function clearCipherSecondHalfDeployFreezeForAllPlayers(): void {
   serverPlayers.forEach((p) => {
     if (!p || !mod.IsPlayerValid(p.player)) return;
-    setCipherSecondHalfDeployFreezeForPlayer(p.player, false, "clear_second_half_freeze");
+    try {
+      setCipherSecondHalfDeployFreezeForPlayer(p.player, false, "clear_second_half_freeze");
+    } catch (err) {
+      LogRuntimeError("TransitionClearFreeze/" + String(p.id), err);
+    }
   });
   cipherSecondHalfFrozenByPlayerId = {};
 }
@@ -20023,7 +20063,11 @@ function hardUnlockCipherLiveInputsForAllPlayers(_source: string): void {
   cipherSecondHalfFrozenByPlayerId = {};
   serverPlayers.forEach((p) => {
     if (!p || !mod.IsPlayerValid(p.player)) return;
-    clearCipherLiveInputRestrictionsForPlayer(p.player);
+    try {
+      clearCipherLiveInputRestrictionsForPlayer(p.player);
+    } catch (err) {
+      LogRuntimeError("TransitionHardUnlock/" + String(p.id), err);
+    }
   });
 }
 
@@ -20052,21 +20096,49 @@ function clearCipherLivePhaseTransitionRuntimeState(
   resetBombRuntime: boolean,
   preserveDeployRestoreCache: boolean = false
 ): void {
-  resetTransitionSpawnQueueState(false);
-  clearCipherSpawnJobQueues();
-  cancelAllCipherRespawnRouteJobs();
-  clearCipherSecondHalfDeployFreezeForAllPlayers();
-  hardUnlockCipherLiveInputsForAllPlayers(source);
+  try {
+    resetTransitionSpawnQueueState(false);
+  } catch (err) {
+    LogRuntimeError("TransitionRuntimeClear/spawnQueue/" + source, err);
+  }
+  try {
+    clearCipherSpawnJobQueues();
+  } catch (err) {
+    LogRuntimeError("TransitionRuntimeClear/spawnJobs/" + source, err);
+  }
+  try {
+    cancelAllCipherRespawnRouteJobs();
+  } catch (err) {
+    LogRuntimeError("TransitionRuntimeClear/respawnRoute/" + source, err);
+  }
+  try {
+    clearCipherSecondHalfDeployFreezeForAllPlayers();
+  } catch (err) {
+    LogRuntimeError("TransitionRuntimeClear/freeze/" + source, err);
+  }
+  try {
+    hardUnlockCipherLiveInputsForAllPlayers(source);
+  } catch (err) {
+    LogRuntimeError("TransitionRuntimeClear/inputUnlock/" + source, err);
+  }
   cipherLiveStartSettleToken += 1;
   cipherLiveStartSettlingStage = "none";
   cipherLiveStartSettlingUntilSec = 0;
   cipherPhaseTransitionUndeployIgnoreUntilSec = 0;
   cipherSuddenDeathUndeployIgnoreUntilSec = 0;
   if (resetDeployTracking) {
-    resetCipherSecondHalfDeployTracking();
+    try {
+      resetCipherSecondHalfDeployTracking();
+    } catch (err) {
+      LogRuntimeError("TransitionRuntimeClear/deployTracking/" + source, err);
+    }
   }
   if (resetBombRuntime) {
-    resetBombCarrierRuntimeState(true, preserveDeployRestoreCache);
+    try {
+      resetBombCarrierRuntimeState(true, preserveDeployRestoreCache);
+    } catch (err) {
+      LogRuntimeError("TransitionRuntimeClear/bombRuntime/" + source, err);
+    }
   }
 }
 
@@ -20693,25 +20765,68 @@ function verifyCipherTransitionPlayersUndeployed(source: string): void {
 
 function enterCipherSecondHalfDeploySupervisorStage(nowSec: number): void {
   cipherSecondHalfForceDeployIssuedForTransitionToken = 0;
-  clearCipherSecondHalfDeployFreezeForAllPlayers();
-  if (cipherLiveTransitionSupervisorKind === "suddenDeath") {
-    prepareCipherSuddenDeathForLive("sudden_death_supervisor_deploy");
-  } else {
-    prepareCipherHalfForLive(2, "second_half_supervisor_deploy", 0);
+  startCipherTransitionSupervisorStage("deploy", CIPHER_SECOND_HALF_DEPLOY_PHASE_SECONDS, nowSec);
+
+  try {
+    clearCipherSecondHalfDeployFreezeForAllPlayers();
+  } catch (err) {
+    LogRuntimeError("TransitionDeployStage/clearFreeze", err);
   }
-  applyCipherSecondHalfHqSpawns(cipherLiveTransitionSupervisorKind + "_supervisor_deploy");
-  mod.SetSpawnMode(mod.SpawnModes.Deploy);
+
+  try {
+    if (cipherLiveTransitionSupervisorKind === "suddenDeath") {
+      prepareCipherSuddenDeathForLive("sudden_death_supervisor_deploy");
+    } else {
+      prepareCipherHalfForLive(2, "second_half_supervisor_deploy", 0);
+    }
+  } catch (err) {
+    if (cipherLiveTransitionSupervisorKind === "suddenDeath") {
+      cipherCurrentHalf = 2;
+      cipherMatchStage = "suddenDeath";
+    } else {
+      cipherCurrentHalf = 2;
+      cipherMatchStage = "half2";
+    }
+    LogRuntimeError("TransitionDeployStage/prepareLive", err);
+  }
+
+  try {
+    applyCipherSecondHalfHqSpawns(cipherLiveTransitionSupervisorKind + "_supervisor_deploy");
+  } catch (err) {
+    LogRuntimeError("TransitionDeployStage/hqSpawns", err);
+  }
+  try {
+    mod.SetSpawnMode(mod.SpawnModes.Deploy);
+  } catch (err) {
+    LogRuntimeError("TransitionDeployStage/spawnMode", err);
+  }
   serverPlayers.forEach((p) => {
-    mod.SetRedeployTime(p.player, 0);
-    p.setCapturePoint(null);
-    clearCipherSecondHalfDeployReadyForPlayer(p.id, true);
+    if (!p || !mod.IsPlayerValid(p.player)) return;
+    try {
+      mod.SetRedeployTime(p.player, 0);
+      p.setCapturePoint(null);
+      clearCipherSecondHalfDeployReadyForPlayer(p.id, true);
+    } catch (err) {
+      LogRuntimeError("TransitionDeployStage/playerPrep/" + String(p.id), err);
+    }
   });
-  mod.UndeployAllPlayers();
-  applyCipherSecondHalfHqSpawns(cipherLiveTransitionSupervisorKind + "_supervisor_deploy_after_undeploy");
+  try {
+    mod.UndeployAllPlayers();
+  } catch (err) {
+    LogRuntimeError("TransitionDeployStage/undeployAll", err);
+  }
+  try {
+    applyCipherSecondHalfHqSpawns(cipherLiveTransitionSupervisorKind + "_supervisor_deploy_after_undeploy");
+  } catch (err) {
+    LogRuntimeError("TransitionDeployStage/hqAfterUndeploy", err);
+  }
   markCipherSecondHalfDeployRequiredPlayers();
   resetRuntimeBotStagedSpawnSchedule();
-  startCipherTransitionSupervisorStage("deploy", CIPHER_SECOND_HALF_DEPLOY_PHASE_SECONDS, nowSec);
-  tickRuntimeBotStagedSpawning(nowSec, cipherLiveTransitionSupervisorKind + "_supervisor_deploy_enter");
+  try {
+    tickRuntimeBotStagedSpawning(nowSec, cipherLiveTransitionSupervisorKind + "_supervisor_deploy_enter");
+  } catch (err) {
+    LogRuntimeError("TransitionDeployStage/botStagedSpawn", err);
+  }
   runCipherTransitionStepWorkSafe(cipherLiveTransitionSupervisorKind + "_supervisor_deploy_enter", false);
 }
 
@@ -20721,9 +20836,17 @@ function enterCipherTransitionCountdownSupervisorStage(
 ): void {
   startCipherTransitionSupervisorStage("countdown", CIPHER_SECOND_HALF_FINAL_COUNTDOWN_SECONDS, nowSec);
   if (cipherLiveTransitionSupervisorKind === "secondHalf" || cipherLiveTransitionSupervisorKind === "suddenDeath") {
-    applyCipherSecondHalfHqSpawns(cipherLiveTransitionSupervisorKind + "_supervisor_countdown_enter");
+    try {
+      applyCipherSecondHalfHqSpawns(cipherLiveTransitionSupervisorKind + "_supervisor_countdown_enter");
+    } catch (err) {
+      LogRuntimeError("TransitionCountdownStage/hqSpawns", err);
+    }
     if (forceMissingSecondHalfPlayers) {
-      forceDeployMissingCipherSecondHalfPlayersOnce(cipherLiveTransitionSupervisorKind + "_supervisor_countdown_enter");
+      try {
+        forceDeployMissingCipherSecondHalfPlayersOnce(cipherLiveTransitionSupervisorKind + "_supervisor_countdown_enter");
+      } catch (err) {
+        LogRuntimeError("TransitionCountdownStage/forceDeploy", err);
+      }
     }
   }
   runCipherTransitionStepWorkSafe(cipherLiveTransitionSupervisorKind + "_supervisor_countdown_enter", false);
@@ -21275,7 +21398,40 @@ function completeCipherTransitionSupervisor(nowSec: number): void {
   }
 }
 
-function tickCipherLiveTransitionSupervisor(nowSec: number): boolean {
+function recoverCipherTransitionSupervisorTickFailure(
+  nowSec: number,
+  failedStage: CipherSecondHalfTransitionStage,
+  err: any
+): void {
+  LogRuntimeError(
+    "TransitionSupervisor/tick/" + cipherLiveTransitionSupervisorKind + "/" + failedStage,
+    err
+  );
+
+  try {
+    if (failedStage === "intermission") {
+      enterCipherSecondHalfDeploySupervisorStage(nowSec);
+      return;
+    }
+
+    if (failedStage === "deploy") {
+      enterCipherTransitionCountdownSupervisorStage(nowSec, true);
+      return;
+    }
+
+    if (failedStage === "countdown" || failedStage === "finalizing") {
+      forceFinishCipherTransitionFinalizer(nowSec, "tick_failure");
+    }
+  } catch (recoverErr) {
+    LogRuntimeError(
+      "TransitionSupervisor/recover/" + cipherLiveTransitionSupervisorKind + "/" + failedStage,
+      recoverErr
+    );
+    forceFinishCipherTransitionFinalizer(nowSec, "recover_failure");
+  }
+}
+
+function tickCipherLiveTransitionSupervisorUnsafe(nowSec: number): boolean {
   if (cipherLiveTransitionSupervisorKind === "none") return false;
 
   if (gameStatus !== 3 || !isCipherTransitionSupervisorCurrent()) {
@@ -21323,6 +21479,16 @@ function tickCipherLiveTransitionSupervisor(nowSec: number): boolean {
   return true;
 }
 
+function tickCipherLiveTransitionSupervisor(nowSec: number): boolean {
+  const failedStage = cipherSecondHalfTransitionStage;
+  try {
+    return tickCipherLiveTransitionSupervisorUnsafe(nowSec);
+  } catch (err) {
+    recoverCipherTransitionSupervisorTickFailure(nowSec, failedStage, err);
+    return true;
+  }
+}
+
 function beginCipherSecondHalfSupervisor(
   nowSec: number,
   reason: CipherHalfTransitionReason = "scoreCap"
@@ -21342,10 +21508,18 @@ function beginCipherSecondHalfSupervisor(
   cipherSuddenDeathTransitionActive = false;
   cipherSecondHalfTransitionStage = "intermission";
   clearCipherLivePhaseTransitionRuntimeState("second_half_supervisor_enter", true, true);
-  clearRuntimeBotState(true);
+  try {
+    clearRuntimeBotState(true);
+  } catch (err) {
+    LogRuntimeError("SecondHalfSupervisor/clearRuntimeBots", err);
+  }
   cipherSecondHalfTransitionStage = "intermission";
   cipherTransitionUndeployCursor = 0;
-  mod.SetSpawnMode(mod.SpawnModes.Deploy);
+  try {
+    mod.SetSpawnMode(mod.SpawnModes.Deploy);
+  } catch (err) {
+    LogRuntimeError("SecondHalfSupervisor/spawnMode", err);
+  }
   serverPlayers.forEach((p) => {
     if (!p || !mod.IsPlayerValid(p.player)) return;
     try {
@@ -21356,10 +21530,18 @@ function beginCipherSecondHalfSupervisor(
   });
   liveClockStarted = false;
   liveClockTimeoutHoldActive = false;
-  clearAllCipherNodeRebootState("second_half_supervisor_enter", true);
-  HideAllObjectiveHoldProgressUi();
-  HideAllDeployObjectiveTimerUi();
-  clearBombNoticeState();
+  try {
+    clearAllCipherNodeRebootState("second_half_supervisor_enter", true);
+  } catch (err) {
+    LogRuntimeError("SecondHalfSupervisor/nodeCleanup", err);
+  }
+  try {
+    HideAllObjectiveHoldProgressUi();
+    HideAllDeployObjectiveTimerUi();
+    clearBombNoticeState();
+  } catch (err) {
+    LogRuntimeError("SecondHalfSupervisor/hideLiveUi", err);
+  }
   cipherPhaseTransitionUndeployIgnoreUntilSec =
     nowSec +
     CIPHER_HALFTIME_INTERMISSION_SECONDS +
@@ -21374,7 +21556,11 @@ function beginCipherSecondHalfSupervisor(
   cipherTransitionSubtitleFallback = "SWITCHING SIDES";
   cipherTransitionStartsTitleKey = (mod.stringkeys as any).CipherSecondHalfStarts;
   cipherTransitionStartsTitleFallback = "SECOND HALF STARTS IN";
-  SetCountdownOverlayVisible(false);
+  try {
+    SetCountdownOverlayVisible(false);
+  } catch (err) {
+    LogRuntimeError("SecondHalfSupervisor/countdownOverlay", err);
+  }
 
   try {
     showCipherPhaseNoticeForAllPlayers(reasonKey, reasonFallback, 3);
@@ -21397,15 +21583,27 @@ function beginCipherSuddenDeathSupervisor(nowSec: number): void {
   cipherSecondHalfTransitionActive = false;
   cipherSecondHalfTransitionStage = "intermission";
   clearCipherLivePhaseTransitionRuntimeState("sudden_death_supervisor_enter", true, true);
-  clearRuntimeBotState(true);
+  try {
+    clearRuntimeBotState(true);
+  } catch (err) {
+    LogRuntimeError("SuddenDeathSupervisor/clearRuntimeBots", err);
+  }
   cipherSecondHalfTransitionStage = "intermission";
   cipherTransitionUndeployCursor = 0;
   liveClockStarted = false;
   liveClockTimeoutHoldActive = false;
-  clearAllCipherNodeRebootState("sudden_death_supervisor_enter", true);
-  HideAllObjectiveHoldProgressUi();
-  HideAllDeployObjectiveTimerUi();
-  clearBombNoticeState();
+  try {
+    clearAllCipherNodeRebootState("sudden_death_supervisor_enter", true);
+  } catch (err) {
+    LogRuntimeError("SuddenDeathSupervisor/nodeCleanup", err);
+  }
+  try {
+    HideAllObjectiveHoldProgressUi();
+    HideAllDeployObjectiveTimerUi();
+    clearBombNoticeState();
+  } catch (err) {
+    LogRuntimeError("SuddenDeathSupervisor/hideLiveUi", err);
+  }
   try {
     showCipherPhaseNoticeForAllPlayers((mod.stringkeys as any).CipherSuddenDeathOneLife, "SUDDEN DEATH - ONE LIFE", 5);
   } catch (err) {
@@ -21425,7 +21623,11 @@ function beginCipherSuddenDeathSupervisor(nowSec: number): void {
     CIPHER_SECOND_HALF_FORCE_DEPLOY_SETTLE_SECONDS +
     2;
   cipherPhaseTransitionUndeployIgnoreUntilSec = cipherSuddenDeathUndeployIgnoreUntilSec;
-  mod.SetSpawnMode(mod.SpawnModes.Deploy);
+  try {
+    mod.SetSpawnMode(mod.SpawnModes.Deploy);
+  } catch (err) {
+    LogRuntimeError("SuddenDeathSupervisor/spawnMode", err);
+  }
   serverPlayers.forEach((p) => {
     if (!p || !mod.IsPlayerValid(p.player)) return;
     try {
@@ -22777,12 +22979,9 @@ class Player {
   }
 }
 
-let performanceStatsLoggingInitialized = false;
-
 function initializePerformanceStatsLoggingOnce(): void {
-  if (performanceStatsLoggingInitialized) return;
-  performanceStatsLoggingInitialized = true;
-  PerformanceStats.setLogging((text) => console.log(text), PerformanceStats.LogLevel.Warning);
+  // Disabled to keep Portal bundle.ts under the hard file-size limit.
+  // Cipher Obliteration does not require bf6-portal-utils/performance-stats at runtime.
 }
 
 /* ----------------------------------------
@@ -23006,6 +23205,11 @@ function applyPhaseInputRestrictionsForPlayer(player: mod.Player): void {
   if (!mod.IsPlayerValid(player)) return;
 
   const playerId = modlib.getPlayerId(player);
+
+  // Runtime bots and AI backfill are not human clients.
+  // Bot countdown locking is handled by applyRuntimeBotPhaseLockForPlayer().
+  if (shouldSkipHumanInputRestrictionsForPlayer(player)) return;
+
   const isPrematch = gameStatus === 0;
   const isRedeployCountdown = gameStatus === 1;
   const isPreLive = gameStatus === 2;
@@ -23042,6 +23246,9 @@ function applyPhaseInputRestrictionsForPlayer(player: mod.Player): void {
 
 /* Utility wrapper (keeps old call sites readable) */
 function setReadyPhaseProtectionForPlayer(player: mod.Player, enabled: boolean): void {
+  if (!mod.IsPlayerValid(player)) return;
+  if (shouldSkipHumanInputRestrictionsForPlayer(player)) return;
+
   if (!enabled) {
     mod.EnableAllInputRestrictions(player, false);
     
@@ -24883,6 +25090,8 @@ function setPostmatchRestrictedInputsForPlayer(
   restricted: boolean
 ): void {
   if (!mod.IsPlayerValid(player)) return;
+  if (shouldSkipHumanInputRestrictionsForPlayer(player)) return;
+
   for (let i = 0; i < inputs.length; i++) {
     mod.EnableInputRestriction(player, inputs[i], restricted);
   }
@@ -24890,6 +25099,8 @@ function setPostmatchRestrictedInputsForPlayer(
 
 function applyPostmatchShowcaseMovementLockForPlayer(player: mod.Player): void {
   if (!mod.IsPlayerValid(player)) return;
+  if (shouldSkipHumanInputRestrictionsForPlayer(player)) return;
+
   clearCipherLiveInputRestrictionsForPlayer(player);
   mod.EnableInputRestriction(player, mod.RestrictedInputs.MoveForwardBack, true);
   mod.EnableInputRestriction(player, mod.RestrictedInputs.MoveLeftRight, true);
@@ -24897,12 +25108,15 @@ function applyPostmatchShowcaseMovementLockForPlayer(player: mod.Player): void {
 
 function applyPostmatchLosingInputLockForPlayer(player: mod.Player): void {
   if (!mod.IsPlayerValid(player)) return;
+  if (shouldSkipHumanInputRestrictionsForPlayer(player)) return;
+
   clearCipherLiveInputRestrictionsForPlayer(player);
   setPostmatchRestrictedInputsForPlayer(player, POSTMATCH_LOSING_TEAM_RESTRICTED_INPUTS, true);
 }
 
 function applyPostmatchInputStateForPlayer(player: mod.Player): void {
   if (!mod.IsPlayerValid(player)) return;
+  if (shouldSkipHumanInputRestrictionsForPlayer(player)) return;
   if (gameStatus !== 4) return;
 
   const team = mod.GetTeam(player);
@@ -24915,6 +25129,8 @@ function applyPostmatchInputStateForPlayer(player: mod.Player): void {
 
 function clearPostmatchShowcaseMovementLockForPlayer(player: mod.Player): void {
   if (!mod.IsPlayerValid(player)) return;
+  if (shouldSkipHumanInputRestrictionsForPlayer(player)) return;
+
   try {
     mod.EnableInputRestriction(player, mod.RestrictedInputs.MoveForwardBack, false);
     mod.EnableInputRestriction(player, mod.RestrictedInputs.MoveLeftRight, false);
@@ -26492,6 +26708,7 @@ async function Mode_OnPlayerDeployed(eventPlayer: mod.Player): Promise<void> {
     const team = mod.GetTeam(eventPlayer);
     const deployedRuntimeBotSlot = getRuntimeBotSlotForPlayerId(playerId);
     const deployedIsBot = deployedRuntimeBotSlot !== undefined;
+    const deployedSkipsHumanFlow = deployedIsBot || shouldSkipHumanInputRestrictionsForPlayer(eventPlayer);
     delete botLiveSpawnRequestedByPlayerId[playerId];
     delete botLiveSpawnNextAttemptAtSecByPlayerId[playerId];
     cancelPendingRestrictedLethalConfirmForPlayer(playerId);
@@ -26502,7 +26719,10 @@ async function Mode_OnPlayerDeployed(eventPlayer: mod.Player): Promise<void> {
     clearCipherPresenceForPlayer(playerId);
     cancelObjectiveCaptureAttemptsForPlayer(playerId);
 
-    applyPhaseInputRestrictionsForPlayer(eventPlayer);
+    if (!deployedSkipsHumanFlow) {
+      applyPhaseInputRestrictionsForPlayer(eventPlayer);
+    }
+
     // Reset damage spacing state on deploy
     dmgSpreadClearForPlayer(eventPlayer);
 
@@ -26513,6 +26733,21 @@ async function Mode_OnPlayerDeployed(eventPlayer: mod.Player): Promise<void> {
         deployedRuntimeBotSlot,
         "OnPlayerDeployed_RuntimeBot"
       );
+      return;
+    }
+
+    if (deployedSkipsHumanFlow) {
+      const pAi = serverPlayers.get(playerId);
+      if (pAi) {
+        pAi.player = eventPlayer;
+        pAi.team = team;
+        pAi.isDeployed = true;
+      }
+      clearCipherKeyHudCacheForPlayer(playerId);
+      clearBotObjectiveStateForPlayer(playerId);
+      clearQueuedSafeSpawnStateForPlayer(playerId);
+      invalidateCipherRespawnRouteJobForPlayer(playerId);
+      clearTransitionSpawnStateForPlayer(playerId);
       return;
     }
   
