@@ -6,7 +6,6 @@ import { WORLD_IDS, type WorldIdsConfig } from '../config/world-ids.ts';
 import { RULES } from '../config/rules.ts';
 import { SPAWN_ROUTING_CONFIG } from '../config/spawn-routing.ts';
 import { UI_CONFIG } from '../config/ui.ts';
-import { ZIPLINE_CONFIG } from '../config/zipline.ts';
 import { CapturePointState } from './capture-point-state.ts';
 import { createRuntimeState, type RuntimeState } from './runtime-state.ts';
 
@@ -19,7 +18,6 @@ export interface ModeContext {
     audio: typeof AUDIO_CONFIG;
     ui: typeof UI_CONFIG;
     spawnRouting: typeof SPAWN_ROUTING_CONFIG;
-    zipline: typeof ZIPLINE_CONFIG;
     objectives: {
         definitions: typeof SQUAD_OBJECTIVE_CONFIGS;
         routingCapturePointIds: typeof SQUAD_ROUTING_CAPTURE_POINT_IDS;
@@ -45,7 +43,6 @@ export function createModeContext(): ModeContext {
         audio: AUDIO_CONFIG,
         ui: UI_CONFIG,
         spawnRouting: SPAWN_ROUTING_CONFIG,
-        zipline: ZIPLINE_CONFIG,
         objectives: {
             definitions: SQUAD_OBJECTIVE_CONFIGS,
             routingCapturePointIds: SQUAD_ROUTING_CAPTURE_POINT_IDS,
