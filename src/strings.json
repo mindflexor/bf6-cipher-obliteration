@@ -146,8 +146,6 @@
     "CipherObjectiveDisabled": "Node {} overloaded",
     "CipherObjectiveDisabledEnemy": "Enemy node {} overloaded",
     "CipherSuddenDeathAliveTitle": "SUDDEN DEATH",
-    "CipherSuddenDeathFriendlyAlive": "FRIENDLIES {}",
-    "CipherSuddenDeathEnemyAlive": "ENEMIES {}",
     "CipherSuddenDeathFriendlyLabel": "ALLY",
     "CipherSuddenDeathEnemyLabel": "ENEMY",
     "CipherSuddenDeathAliveDot": "●",
