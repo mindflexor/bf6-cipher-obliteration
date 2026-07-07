@@ -6,10 +6,10 @@ export const BOMB_CONFIG = {
     // Overload-style cipher key spawning uses exactly three center anchors.
     anchorObjectIds: [3101, 3102, 3103],
     quadBikeSpawnObjectId: 0,
-    liveStartInitialSpawnDelaySeconds: 15,
+    liveStartInitialSpawnDelaySeconds: 20,
     objectiveDestroyRespawnDelaySeconds: 0,
-    cipherKeyDeliveryRespawnDelaySeconds: 15,
-    playerDroppedRelocationDelaySeconds: 30,
+    cipherKeyDeliveryRespawnDelaySeconds: 20,
+    playerDroppedRelocationDelaySeconds: 20,
     playerDroppedExplosionRespawnDelaySeconds: 5,
     playerDroppedExplosionDamageRadiusMeters: 0,
     playerDroppedExplosionDamage: 0,

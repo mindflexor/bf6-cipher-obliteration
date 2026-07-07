@@ -328,6 +328,7 @@ const CIPHER_TRANSITION_FINALIZER_WATCHDOG_SECONDS = 8;
 const CIPHER_TRANSITION_PREDEPLOY_SETTLE_MS = 250;
 const CIPHER_TRANSITION_PREDEPLOY_STAGE_SECONDS = 10;
 const CIPHER_TRANSITION_HUMAN_UNDEPLOY_WORK_PER_TICK = 1;
+const CIPHER_TRANSITION_DEPLOY_RECONCILE_PLAYERS_PER_TICK = 4;
 const CIPHER_TRANSITION_BOT_UNSPAWN_WORK_PER_TICK = 1;
 const CIPHER_TRANSITION_OBJECTIVE_EVENT_SUPPRESS_SECONDS = 0.35;
 
@@ -366,6 +367,7 @@ let cipherTransitionDeployGateToken = 0;
 let cipherTransitionDeployLastRemainingSeconds = CIPHER_SECOND_HALF_DEPLOY_PHASE_SECONDS;
 let cipherTransitionDeployAdvanceIssuedForTransitionToken = 0;
 let cipherTransitionDeployAllReadySinceTick = -1;
+let cipherTransitionDeployReconcileCursor = 0;
 let cipherTransitionDeployLastHudStateKey = "";
 let cipherSecondHalfFrozenByPlayerId: { [playerId: number]: boolean } = {};
 let cipherTransitionTeleportedByPlayerId: { [playerId: number]: boolean } = {};
@@ -19698,6 +19700,7 @@ function resetCipherSecondHalfDeployPlayerTracking(): void {
   cipherTransitionDeploySeenByPlayerId = {};
   cipherTransitionTeleportedByPlayerId = {};
   cipherTransitionDeployAllReadySinceTick = -1;
+  cipherTransitionDeployReconcileCursor = 0;
   cipherTransitionDeployLastHudStateKey = "";
 }
 
@@ -19721,6 +19724,7 @@ function resetCipherTransitionDeployGateState(): void {
   cipherTransitionDeployLastRemainingSeconds = CIPHER_SECOND_HALF_DEPLOY_PHASE_SECONDS;
   cipherTransitionDeployAdvanceIssuedForTransitionToken = 0;
   cipherTransitionDeployAllReadySinceTick = -1;
+  cipherTransitionDeployReconcileCursor = 0;
   cipherTransitionDeployLastHudStateKey = "";
 }
 
@@ -19748,7 +19752,7 @@ function updateCipherTransitionDeployGateFromRemaining(remainingSeconds: number,
   if (cipherTransitionDeployGateOpen || cipherTransitionDeployLastRemainingSeconds > 29) return;
 
   cipherTransitionDeployGateOpen = true;
-  refreshCipherTransitionHudForCurrentState();
+  reconcileCipherTransitionDeployReadiness(source + "_gate_open", true);
 }
 
 function clearCipherLiveInputRestrictionsForPlayer(player: mod.Player): void {
@@ -19985,6 +19989,92 @@ function markCipherSecondHalfDeployRequiredPlayers(): void {
   });
 }
 
+
+function refreshCipherTransitionDeployRequiredRoster(source: string): void {
+  if (cipherSecondHalfTransitionStage !== "deploy" && cipherSecondHalfTransitionStage !== "countdown") return;
+
+  const presentRequiredIds: { [playerId: number]: boolean } = {};
+  serverPlayers.forEach((p) => {
+    if (!isRequiredSecondHalfDeployPlayer(p)) return;
+    presentRequiredIds[p.id] = true;
+    cipherSecondHalfDeployRequiredByPlayerId[p.id] = true;
+  });
+
+  for (const key in cipherSecondHalfDeployRequiredByPlayerId) {
+    const playerId = Number(key);
+    if (presentRequiredIds[playerId] === true) continue;
+    delete cipherSecondHalfDeployRequiredByPlayerId[playerId];
+    delete cipherSecondHalfDeployReadyByPlayerId[playerId];
+    delete cipherTransitionDeploySeenByPlayerId[playerId];
+    delete cipherTransitionTeleportedByPlayerId[playerId];
+  }
+
+  void source;
+}
+
+function reconcileCipherTransitionDeployReadiness(source: string, forceRefreshHud: boolean = false): void {
+  if (cipherSecondHalfTransitionStage !== "deploy" && cipherSecondHalfTransitionStage !== "countdown") return;
+
+  refreshCipherTransitionDeployRequiredRoster(source);
+  if (!isCipherTransitionDeployGateOpen()) {
+    if (forceRefreshHud) refreshCipherTransitionHudForCurrentState();
+    return;
+  }
+
+  const requiredIds: number[] = [];
+  for (const key in cipherSecondHalfDeployRequiredByPlayerId) {
+    const playerId = Number(key);
+    const sp = serverPlayers.get(playerId);
+    if (!sp || !isRequiredSecondHalfDeployPlayer(sp)) {
+      delete cipherSecondHalfDeployRequiredByPlayerId[playerId];
+      delete cipherSecondHalfDeployReadyByPlayerId[playerId];
+      delete cipherTransitionDeploySeenByPlayerId[playerId];
+      delete cipherTransitionTeleportedByPlayerId[playerId];
+      continue;
+    }
+    requiredIds.push(playerId);
+  }
+
+  if (requiredIds.length <= 0) {
+    cipherTransitionDeployReconcileCursor = 0;
+    if (forceRefreshHud) refreshCipherTransitionHudForCurrentState();
+    return;
+  }
+
+  if (cipherTransitionDeployReconcileCursor >= requiredIds.length) cipherTransitionDeployReconcileCursor = 0;
+
+  let processed = 0;
+  while (processed < CIPHER_TRANSITION_DEPLOY_RECONCILE_PLAYERS_PER_TICK && requiredIds.length > 0) {
+    const index = cipherTransitionDeployReconcileCursor % requiredIds.length;
+    const playerId = requiredIds[index];
+    cipherTransitionDeployReconcileCursor = (index + 1) % requiredIds.length;
+    processed += 1;
+
+    if (cipherSecondHalfDeployReadyByPlayerId[playerId] === true) continue;
+
+    const sp = serverPlayers.get(playerId);
+    if (!sp || !mod.IsPlayerValid(sp.player)) continue;
+
+    const deployedByScript = sp.isDeployed === true;
+    const deployedByEngine = deployedByScript || isEnginePlayerCurrentlyDeployedForTransition(sp.player);
+    if (!deployedByEngine) continue;
+
+    sp.isDeployed = true;
+    cipherTransitionDeploySeenByPlayerId[playerId] = true;
+    setCipherSecondHalfDeployFreezeForPlayer(sp.player, true, source + "_freeze");
+
+    if (cipherTransitionTeleportedByPlayerId[playerId] === true) {
+      markCipherSecondHalfDeployReadyForPlayer(playerId, sp.player, true);
+      continue;
+    }
+
+    requestCipherSpawnAnchorForPlayer(playerId, true);
+    requestCipherSpawnTeleportForPlayer(playerId, true);
+  }
+
+  if (forceRefreshHud) refreshCipherTransitionHudForCurrentState();
+}
+
 function markCipherSecondHalfDeployRequiredForPlayer(p: Player): void {
   if (cipherSecondHalfTransitionStage !== "deploy" && cipherSecondHalfTransitionStage !== "countdown") return;
   if (!isRequiredSecondHalfDeployPlayer(p)) return;
@@ -20088,6 +20178,7 @@ function tryAdvanceCipherDeployStageIfReady(
   const remaining = getCipherTransitionSupervisorRemainingSeconds(nowSec);
   updateCipherTransitionDeployGateFromRemaining(remaining, source + "_gate");
   if (!isCipherTransitionDeployGateOpen()) return false;
+  reconcileCipherTransitionDeployReadiness(source + "_reconcile_ready");
 
   const counts = getCipherDeployCounts();
   const allReady = counts.required > 0 && counts.ready >= counts.required;
@@ -20225,6 +20316,12 @@ function runCipherTransitionStepWorkSafe(source: string, forceDeployMissingPlaye
   }
 
   try {
+    reconcileCipherTransitionDeployReadiness(source + "_pre_spawn");
+  } catch (err) {
+    LogRuntimeError("TransitionStep/reconcileDeployPre/" + source, err);
+  }
+
+  try {
     processTransitionSpawnQueue(source);
   } catch (err) {
     LogRuntimeError("TransitionStep/processTransitionSpawnQueue/" + source, err);
@@ -20234,6 +20331,12 @@ function runCipherTransitionStepWorkSafe(source: string, forceDeployMissingPlaye
     processCipherSpawnJobs(source);
   } catch (err) {
     LogRuntimeError("TransitionStep/processCipherSpawnJobs/" + source, err);
+  }
+
+  try {
+    reconcileCipherTransitionDeployReadiness(source + "_post_spawn");
+  } catch (err) {
+    LogRuntimeError("TransitionStep/reconcileDeployPost/" + source, err);
   }
 
   try {
@@ -20941,6 +21044,7 @@ function enterCipherSecondHalfDeploySupervisorStage(nowSec: number): void {
 
   try {
     markCipherSecondHalfDeployRequiredPlayers();
+    refreshCipherTransitionDeployRequiredRoster("deploy_stage_enter");
   } catch (err) {
     LogRuntimeError("TransitionDeployStage/markRequired", err);
     resetCipherSecondHalfDeployPlayerTracking();
@@ -27134,8 +27238,9 @@ async function Mode_OnPlayerDeployed(eventPlayer: mod.Player): Promise<void> {
 
     p.team = team;
     if (isCipherLiveTransitionActive()) {
-      if (isCipherTransitionDeployGateOpen()) {
+      if (cipherSecondHalfTransitionStage === "deploy" || cipherSecondHalfTransitionStage === "countdown") {
         cipherTransitionDeploySeenByPlayerId[playerId] = true;
+        markCipherSecondHalfDeployRequiredForPlayer(p);
       }
       if (handleCipherTransitionDeployedPlayer(playerId, eventPlayer, "OnPlayerDeployed_Transition")) {
         queueCipherAdminInteractSpawnForPlayer(playerId, "OnPlayerDeployed_Transition");
