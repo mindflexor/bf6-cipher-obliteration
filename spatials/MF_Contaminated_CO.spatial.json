@@ -5995,6 +5995,214 @@
             "id": "SQO Components/SpawnAnchors/Objective_SW_Team2/Side_West/Variant_South/Anchor_4325"
         },
         {
+            "name": "Anchor_1511",
+            "ObjId": 1511,
+            "type": "FiringRange_MatDecal_01",
+            "right": {
+                "x": 1,
+                "y": 0,
+                "z": 0
+            },
+            "up": {
+                "x": 0,
+                "y": 1,
+                "z": 0
+            },
+            "front": {
+                "x": 0,
+                "y": 0,
+                "z": 1
+            },
+            "position": {
+                "x": -218.46478,
+                "y": 334.7881,
+                "z": -334.2406
+            },
+            "id": "SQO Components/FirstDeployAnchors/North/Anchor_1511"
+        },
+        {
+            "name": "Anchor_1512",
+            "ObjId": 1512,
+            "type": "FiringRange_MatDecal_01",
+            "right": {
+                "x": 1,
+                "y": 0,
+                "z": 0
+            },
+            "up": {
+                "x": 0,
+                "y": 1,
+                "z": 0
+            },
+            "front": {
+                "x": 0,
+                "y": 0,
+                "z": 1
+            },
+            "position": {
+                "x": -212.46478,
+                "y": 334.7881,
+                "z": -334.2406
+            },
+            "id": "SQO Components/FirstDeployAnchors/North/Anchor_1512"
+        },
+        {
+            "name": "Anchor_1513",
+            "ObjId": 1513,
+            "type": "FiringRange_MatDecal_01",
+            "right": {
+                "x": 1,
+                "y": 0,
+                "z": 0
+            },
+            "up": {
+                "x": 0,
+                "y": 1,
+                "z": 0
+            },
+            "front": {
+                "x": 0,
+                "y": 0,
+                "z": 1
+            },
+            "position": {
+                "x": -218.46478,
+                "y": 334.7881,
+                "z": -328.2406
+            },
+            "id": "SQO Components/FirstDeployAnchors/North/Anchor_1513"
+        },
+        {
+            "name": "Anchor_1514",
+            "ObjId": 1514,
+            "type": "FiringRange_MatDecal_01",
+            "right": {
+                "x": 1,
+                "y": 0,
+                "z": 0
+            },
+            "up": {
+                "x": 0,
+                "y": 1,
+                "z": 0
+            },
+            "front": {
+                "x": 0,
+                "y": 0,
+                "z": 1
+            },
+            "position": {
+                "x": -212.46478,
+                "y": 334.7881,
+                "z": -328.2406
+            },
+            "id": "SQO Components/FirstDeployAnchors/North/Anchor_1514"
+        },
+        {
+            "name": "Anchor_3511",
+            "ObjId": 3511,
+            "type": "FiringRange_MatDecal_01",
+            "right": {
+                "x": 1,
+                "y": 0,
+                "z": 0
+            },
+            "up": {
+                "x": 0,
+                "y": 1,
+                "z": 0
+            },
+            "front": {
+                "x": 0,
+                "y": 0,
+                "z": 1
+            },
+            "position": {
+                "x": -87.91603,
+                "y": 331.5602,
+                "z": -168.08615
+            },
+            "id": "SQO Components/FirstDeployAnchors/South/Anchor_3511"
+        },
+        {
+            "name": "Anchor_3512",
+            "ObjId": 3512,
+            "type": "FiringRange_MatDecal_01",
+            "right": {
+                "x": 1,
+                "y": 0,
+                "z": 0
+            },
+            "up": {
+                "x": 0,
+                "y": 1,
+                "z": 0
+            },
+            "front": {
+                "x": 0,
+                "y": 0,
+                "z": 1
+            },
+            "position": {
+                "x": -81.91603,
+                "y": 331.5602,
+                "z": -168.08615
+            },
+            "id": "SQO Components/FirstDeployAnchors/South/Anchor_3512"
+        },
+        {
+            "name": "Anchor_3513",
+            "ObjId": 3513,
+            "type": "FiringRange_MatDecal_01",
+            "right": {
+                "x": 1,
+                "y": 0,
+                "z": 0
+            },
+            "up": {
+                "x": 0,
+                "y": 1,
+                "z": 0
+            },
+            "front": {
+                "x": 0,
+                "y": 0,
+                "z": 1
+            },
+            "position": {
+                "x": -87.91603,
+                "y": 331.5602,
+                "z": -162.08615
+            },
+            "id": "SQO Components/FirstDeployAnchors/South/Anchor_3513"
+        },
+        {
+            "name": "Anchor_3514",
+            "ObjId": 3514,
+            "type": "FiringRange_MatDecal_01",
+            "right": {
+                "x": 1,
+                "y": 0,
+                "z": 0
+            },
+            "up": {
+                "x": 0,
+                "y": 1,
+                "z": 0
+            },
+            "front": {
+                "x": 0,
+                "y": 0,
+                "z": 1
+            },
+            "position": {
+                "x": -81.91603,
+                "y": 331.5602,
+                "z": -162.08615
+            },
+            "id": "SQO Components/FirstDeployAnchors/South/Anchor_3514"
+        },
+        {
             "name": "Postmatch_Object_Spawn",
             "ObjId": 4747,
             "type": "FiringRange_MatDecal_01",

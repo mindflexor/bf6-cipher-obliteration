@@ -42,6 +42,10 @@ export interface WorldIdsConfig {
         team2Switch: number;
         team2Ready: number;
     };
+    firstDeployAnchors: {
+        north: number[];
+        south: number[];
+    };
 }
 
 const WORLD_CP_A_ID = 201;
@@ -123,5 +127,9 @@ export const WORLD_IDS: WorldIdsConfig = {
         team1Ready: 5002,
         team2Switch: 5003,
         team2Ready: 5004,
+    },
+    firstDeployAnchors: {
+        north: [1511, 1512, 1513, 1514],
+        south: [3511, 3512, 3513, 3514],
     },
 };

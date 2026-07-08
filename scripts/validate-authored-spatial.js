@@ -14,6 +14,10 @@ const EXPECTED_SPAWN_ANCHOR_IDS = [
     3411, 3412, 3413, 3414, 3415, 3421, 3422, 3423, 3424, 3425,
     4311, 4312, 4313, 4314, 4315, 4321, 4322, 4323, 4324, 4325,
 ];
+const EXPECTED_FIRST_DEPLOY_ANCHOR_IDS = [
+    1511, 1512, 1513, 1514,
+    3511, 3512, 3513, 3514,
+];
 const EXPECTED_POSTMATCH_OBJECTS = [
     { id: 4747, type: 'FiringRange_MatDecal_01', label: 'Postmatch runtime spawn parent' },
     { id: 4646, type: 'FixedCamera', label: 'Postmatch fixed camera' },
@@ -194,6 +198,7 @@ validateObjectIds(EXPECTED_OBJECTIVE_COUNTER_WORLD_ICON_IDS, 'WorldIcon', 'Objec
 validateObjectIds(EXPECTED_LIVE_HQ_IDS, 'HQ_PlayerSpawner', 'Live HQ');
 validateObjectIds(EXPECTED_PRESENCE_TRIGGER_IDS, 'AreaTrigger', 'Presence-grid trigger');
 validateObjectIds(EXPECTED_SPAWN_ANCHOR_IDS, undefined, 'Spawn anchor');
+validateObjectIds(EXPECTED_FIRST_DEPLOY_ANCHOR_IDS, 'FiringRange_MatDecal_01', 'First-deploy spawn anchor');
 for (const expected of EXPECTED_POSTMATCH_OBJECTS) {
     validateObjectIds([expected.id], expected.type, expected.label);
 }
