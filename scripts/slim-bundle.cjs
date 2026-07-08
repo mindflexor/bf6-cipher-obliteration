@@ -266,7 +266,86 @@ function stripCommentsOutsideStrings(input) {
   return out;
 }
 
-const slimmed = stripCommentsOutsideStrings(original);
+function stripCodeLineIndentation(input) {
+  let out = "";
+  let i = 0;
+  let state = "code";
+  let atLineStart = true;
+
+  while (i < input.length) {
+    const ch = input[i];
+
+    if (state === "singleQuote") {
+      out += ch;
+
+      if (ch === "\\") {
+        if (i + 1 < input.length) {
+          out += input[i + 1];
+          i += 2;
+          continue;
+        }
+      }
+
+      if (ch === "'") state = "code";
+      i += 1;
+      continue;
+    }
+
+    if (state === "doubleQuote") {
+      out += ch;
+
+      if (ch === "\\") {
+        if (i + 1 < input.length) {
+          out += input[i + 1];
+          i += 2;
+          continue;
+        }
+      }
+
+      if (ch === '"') state = "code";
+      i += 1;
+      continue;
+    }
+
+    if (state === "template") {
+      out += ch;
+
+      if (ch === "\\") {
+        if (i + 1 < input.length) {
+          out += input[i + 1];
+          i += 2;
+          continue;
+        }
+      }
+
+      if (ch === "`") state = "code";
+      i += 1;
+      continue;
+    }
+
+    if (atLineStart && (ch === " " || ch === "\t")) {
+      i += 1;
+      continue;
+    }
+
+    out += ch;
+
+    if (ch === "\n" || ch === "\r") {
+      atLineStart = true;
+    } else {
+      atLineStart = false;
+      if (ch === "'") state = "singleQuote";
+      else if (ch === '"') state = "doubleQuote";
+      else if (ch === "`") state = "template";
+    }
+
+    i += 1;
+  }
+
+  return out;
+}
+
+const slimmed = stripCodeLineIndentation(stripCommentsOutsideStrings(original));
 
 fs.writeFileSync(bundlePath, slimmed, "utf8");
 
