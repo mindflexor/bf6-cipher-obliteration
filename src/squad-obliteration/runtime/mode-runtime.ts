@@ -2400,9 +2400,9 @@ function clearBombBaseRuntimeWorldIcon(): void {
   }
   if (bombBaseRuntimeWorldIconObject) {
     unspawnObjectSafe(bombBaseRuntimeWorldIconObject, "base world icon object", false);
-  } else if (bombBaseRuntimeWorldIconHandle) {
-    unspawnObjectSafe(bombBaseRuntimeWorldIconHandle as unknown, "base world icon handle", false);
   }
+  // Do not try to unspawn a WorldIcon handle as an Object. Some Portal runtime icon
+  // handles cannot be resolved back to SpatialObject safely; disabling + clearing is enough.
   bombBaseRuntimeWorldIconObject = undefined;
   bombBaseRuntimeWorldIconHandle = undefined;
 }
@@ -2602,10 +2602,8 @@ function clearDroppedBombRuntimeObjects(): void {
 
   if (bombDroppedWorldIconObject) {
     unspawnObjectSafe(bombDroppedWorldIconObject, "dropped world icon object", false);
-  } else if (bombDroppedWorldIconHandle) {
-    unspawnObjectSafe(bombDroppedWorldIconHandle as unknown, "dropped world icon handle", false);
   }
-
+  // Same safety rule as base icon: never unspawn a raw WorldIcon handle as an Object.
   bombDroppedWorldIconObject = undefined;
   bombDroppedWorldIconHandle = undefined;
   if (bombCarrierPlayerId === undefined) {
@@ -6304,7 +6302,9 @@ function assignBombCarrierFromDelta(
     "assignBombCarrierFromDelta",
     {
       force: true,
-      rebuildHud: true,
+      // Do not rebuild live HUD during a key pickup. Rebuilding UI widgets while the
+      // carrier/native-bomb state is changing can crash Portal, especially with multiple players.
+      rebuildHud: false,
       refreshBombNotice: true,
       refreshNextKey: true,
       updateCarrierHud: true,
@@ -6314,7 +6314,7 @@ function assignBombCarrierFromDelta(
       syncHybridSurface: true,
       pickupNoticeTeamId,
     },
-    1
+    2
   );
   clearBotObjectiveAssignments();
 }
@@ -6437,6 +6437,65 @@ function getSafeCipherCarrierDropPosition(playerId: number, override?: mod.Vecto
   return undefined;
 }
 
+function completeDisconnectedBombCarrierDrop(
+  playerId: number,
+  cachedDropPosition: mod.Vector | undefined,
+  cachedCarrierTeam: mod.Team
+): void {
+  if (gameStatus !== 3) return;
+  if (bombCarrierPlayerId !== playerId) return;
+
+  const dropPos = isValidCipherDropPosition(cachedDropPosition) ? cachedDropPosition : undefined;
+
+  forceReleaseCipherNativeBombCarrier("disconnect_drop");
+  clearBombCarrierState();
+  clearBotObjectiveAssignments();
+  cancelObjectiveCaptureAttemptsForPlayer(playerId);
+  setBombBaseAvailabilityState(false);
+  clearBombBaseRuntimeLootSpawner();
+  invalidateBombReturnToBaseTimer();
+
+  if (!dropPos) {
+    clearDroppedBombRuntimeObjects();
+    bombDroppedSourceKind = "none";
+    invalidateDeferredBombSpawnTimer();
+    refreshCipherKeyUiAndIconsImmediately("disconnect_drop_no_position");
+    scheduleDeferredBombRespawnAfterDelay(0, "disconnect_carrier_drop_no_position", "new_location_found", true);
+    botObjectiveNextThinkAtSec = 0;
+    return;
+  }
+
+  if (!spawnDroppedBombAtPosition(dropPos)) {
+    clearCipherNativeMinimapBomb("disconnect_drop_spawn_failed");
+    clearDroppedBombRuntimeObjects();
+    bombDroppedSourceKind = "none";
+    invalidateDeferredBombSpawnTimer();
+    refreshCipherKeyUiAndIconsImmediately("disconnect_drop_fallback");
+    scheduleDeferredBombRespawnAfterDelay(0, "disconnect_carrier_drop_fallback_dynamic", "new_location_found", true);
+    botObjectiveNextThinkAtSec = 0;
+    return;
+  }
+
+  bombDroppedSourceKind = "carrier_drop";
+  bombDroppedPickupAnchorPosition = dropPos;
+  bombDroppedLastCarrierPlayerId = playerId;
+  const dropNowSec = getCurrentSchedulerNowSeconds();
+  bombDroppedLastCarrierBlockedUntilSec =
+    dropNowSec + BOMB_DROPPED_RECLAIM_PREVIOUS_CARRIER_COOLDOWN_SECONDS;
+  bombDroppedReclaimBlockedUntilSec = dropNowSec + 1.25;
+
+  setBombPickupTriggerEnabled(false);
+
+  const nativeDropPos = getCipherNativeMinimapBombPosition(dropPos);
+  if (nativeDropPos) {
+    spawnCipherNativeBombAtPosition(nativeDropPos, cachedCarrierTeam, "disconnect_carrier_drop_native_bomb");
+  }
+
+  refreshCipherKeyUiAndIconsImmediately("disconnect_carrier_drop");
+  scheduleBombReturnToBaseAfterDelay();
+  botObjectiveNextThinkAtSec = 0;
+}
+
 function scheduleBombCarrierDropAfterCombatEvent(
   playerId: number,
   reason: DeferredBombCarrierDropReason,
@@ -6450,6 +6509,11 @@ function scheduleBombCarrierDropAfterCombatEvent(
   clearDeferredBombCarrierDropTimer();
 
   const cachedDropPosition = getSafeCipherCarrierDropPosition(playerId, dropPositionOverride);
+  const cachedCarrier = serverPlayers.get(playerId);
+  let cachedCarrierTeam = getCipherKeyTeamSnapshot(playerId) ?? cachedCarrier?.team ?? teamNeutral;
+  if (!mod.Equals(cachedCarrierTeam, team1) && !mod.Equals(cachedCarrierTeam, team2)) {
+    cachedCarrierTeam = teamNeutral;
+  }
 
   // Do not drop the key directly inside OnMandown/OnPlayerDied/OnPlayerUndeploy.
   // Those event stacks are high-risk because they are already mutating soldier/combat state.
@@ -6461,6 +6525,11 @@ function scheduleBombCarrierDropAfterCombatEvent(
     if (bombCarrierPlayerId !== playerId) return;
 
     try {
+      if (reason === "disconnect") {
+        completeDisconnectedBombCarrierDrop(playerId, cachedDropPosition, cachedCarrierTeam);
+        return;
+      }
+
       const finalDropPosition = getSafeCipherCarrierDropPosition(playerId, cachedDropPosition);
 
       if (!finalDropPosition) {
@@ -9283,13 +9352,18 @@ function addCipherScore(attackingTeam: mod.Team): boolean {
   const scoreIndex = getCipherTeamScoreIndex(attackingTeam);
   if (scoreIndex < 0) return false;
 
-  if (cipherMatchStage !== "suddenDeath") {
+  const currentTotalScore = serverScores[scoreIndex] ?? 0;
+
+  if (cipherMatchStage === "half1") {
     const currentHalfScore = cipherHalfScores[scoreIndex] ?? 0;
     if (currentHalfScore >= HALF_SCORE_CAP) return false;
     cipherHalfScores[scoreIndex] = currentHalfScore + 1;
+  } else if (cipherMatchStage === "half2") {
+    if (currentTotalScore >= WIN_SCORE) return false;
+    cipherHalfScores[scoreIndex] = (cipherHalfScores[scoreIndex] ?? 0) + 1;
   }
 
-  serverScores[scoreIndex] = (serverScores[scoreIndex] ?? 0) + 1;
+  serverScores[scoreIndex] = currentTotalScore + 1;
   return true;
 }
 
@@ -9301,16 +9375,13 @@ function resolveCipherDeliveryOutcome(scoringTeam: mod.Team): CipherDeliveryOutc
 
   const scoreIndex = getCipherTeamScoreIndex(scoringTeam);
   if (scoreIndex < 0) return "continue";
-  const halfCapReached = cipherHalfScores[scoreIndex] >= HALF_SCORE_CAP;
 
   if (cipherMatchStage === "half1") {
+    const halfCapReached = cipherHalfScores[scoreIndex] >= HALF_SCORE_CAP;
     return halfCapReached ? "halftime" : "continue";
   }
 
   if (cipherMatchStage === "half2") {
-    if (halfCapReached) {
-      return mod.Equals(getCipherLeadingTeamFromTotalScores(), teamNeutral) ? "suddenDeath" : "postmatch";
-    }
     return getCipherTeamTotalScore(scoringTeam) >= WIN_SCORE ? "postmatch" : "continue";
   }
 
@@ -15812,7 +15883,7 @@ function repairCipherKeyHudCachesForAllPlayers(allowRebuild: boolean = true): vo
   }
 }
 
-function repairDirtyCipherKeyHudCaches(maxRepairs: number = 2): void {
+function repairDirtyCipherKeyHudCaches(maxRepairs: number = 2, allowRebuild: boolean = false): void {
   if (maxRepairs <= 0) return;
 
   let repaired = 0;
@@ -15820,7 +15891,7 @@ function repairDirtyCipherKeyHudCaches(maxRepairs: number = 2): void {
   for (let i = 0; i < players.length; i++) {
     const p = players[i];
     if (cipherKeyHudDirtyByPlayerId[p.id] !== true && cipherKeyHudReadyByPlayerId[p.id] === true) continue;
-    repairCipherKeyHudCacheForPlayer(p, true);
+    repairCipherKeyHudCacheForPlayer(p, allowRebuild);
     repaired += 1;
     if (repaired >= maxRepairs) return;
   }
@@ -16457,7 +16528,8 @@ function refreshCipherKeyUiAndIconsImmediately(reason: string): void {
     reason,
     {
       force: true,
-      rebuildHud: true,
+      // Lightweight refresh only. HUD rebuilds must be explicit phase/join jobs, not key-event jobs.
+      rebuildHud: false,
       refreshBombNotice: true,
       refreshNextKey: true,
       updateCarrierHud: true,
@@ -20763,6 +20835,7 @@ function consumeCipherSuddenDeathLife(playerId: number, source: string): void {
 
   cipherSuddenDeathEliminatedByPlayerId[playerId] = true;
   playerInMandownByPlayerId[playerId] = true;
+  recordScoreboardDeathForPlayer(sp);
 
   try {
     mod.SetRedeployTime(sp.player, 9999);
@@ -20978,6 +21051,225 @@ function _tmpPlayerToCpIdClear(): void {
 
 const serverPlayers = new Map<number, Player>();
 const disconnectedPlayers: Player[] = [];
+let playerJoinSettleTokenCounter = 0;
+let playerJoinSettleTokenByPlayerId: { [playerId: number]: number | undefined } = {};
+let cipherSuddenDeathJoinAliveExemptByPlayerId: { [playerId: number]: boolean | undefined } = {};
+let cipherSuddenDeathJoinCleanupQueuedByPlayerId: { [playerId: number]: boolean | undefined } = {};
+
+function resetPlayerSessionRefsForJoin(p: Player, preserveActiveLiveState: boolean): void {
+  if (!preserveActiveLiveState) {
+    p.isDeployed = false;
+    p.setCapturePoint(null);
+  }
+
+  p.friendlyCapWidget = null as any;
+  p.enemyCapWidget = null as any;
+  p.progressBarWidget = null as any;
+  p.friendlyScoreWidget = null as any;
+  p.opponentScoreWidget = null as any;
+  p.friendlyScorePadWidget = null as any;
+  p.opponentScorePadWidget = null as any;
+  p.bombCarrierTextWidget = null as any;
+  p.bombNoticeContainerWidget = null as any;
+  p.bombNoticeLeftAccentWidget = null as any;
+  p.bombNoticeRightAccentWidget = null as any;
+  p.bombNoticeTextWidget = null as any;
+  p.bombNoticeDetailWidget = null as any;
+  p.nextKeyUnlockContainerWidget = null as any;
+  p.nextKeyUnlockTextWidget = null as any;
+  p.bombCarrierUiLastVisible = false;
+  p.bombCarrierUiLastVersion = -1;
+  p.bombCarrierUiLastAlphaBucket = -1;
+  p.bombNoticeUiLastStateKey = "";
+  p.nextKeyUnlockHudLastStateKey = "";
+  p.objectiveHoldRootWidget = null as any;
+  p.objectiveHoldContainerWidget = null as any;
+  p.objectiveHoldFillArmingWidget = null as any;
+  p.objectiveHoldFillDisarmingWidget = null as any;
+  p.objectiveHoldTextArmingWidget = null as any;
+  p.objectiveHoldTextDisarmingWidget = null as any;
+  p.deployObjectiveTimerRootWidget = null as any;
+  p.deployObjectiveTimerPanelWidget = null as any;
+  p.deployObjectiveTimerLaneFillWidget = null as any;
+  p.deployObjectiveTimerLaneTextWidget = null as any;
+  p.deployObjectiveTimerLaneOutlineTopWidget = null as any;
+  p.deployObjectiveTimerLaneOutlineBottomWidget = null as any;
+  p.deployObjectiveTimerLaneOutlineLeftWidget = null as any;
+  p.deployObjectiveTimerLaneOutlineRightWidget = null as any;
+  p.deployObjectiveTimerTitleWidget = null as any;
+  p.deployObjectiveTimerValueWidget = null as any;
+  p.deployObjectiveTimerLastShownCpId = undefined;
+  p.deployObjectiveTimerLastShownRemainingSeconds = -1;
+  p.cipherTransitionRootWidget = null as any;
+  p.cipherTransitionPanelWidget = null as any;
+  p.cipherTransitionTitleWidget = null as any;
+  p.cipherTransitionSubtitleWidget = null as any;
+  p.cipherTransitionProgressWidget = null as any;
+  p.cipherTransitionTimerWidget = null as any;
+  p.cipherSuddenDeathAliveRootWidget = null as any;
+  p.cipherSuddenDeathAlivePanelWidget = null as any;
+  p.cipherSuddenDeathAliveTitleWidget = null as any;
+  p.cipherSuddenDeathFriendlyAliveWidget = null as any;
+  p.cipherSuddenDeathEnemyAliveWidget = null as any;
+  p.cipherSuddenDeathFriendlyAliveSlotWidgets = [];
+  p.cipherSuddenDeathEnemyAliveSlotWidgets = [];
+  p.flagWidget = {} as any;
+  p.activeFlagContainerWidget = null as any;
+  p.activeFlagFriendlyWidget = null as any;
+  p.activeFlagEnemyWidget = null as any;
+  p.activeFlagWidget = null as any;
+
+  clearLiveHudQueueForPlayer(p.id);
+  clearPhasePlayerOperationsForPlayer(p.id);
+  clearTransitionSpawnStateForPlayer(p.id);
+  delete postmatchShowcaseCameraAppliedByPlayerId[p.id];
+  liveHudBuiltByPlayerId[p.id] = false;
+  markCipherKeyHudDirtyForPlayer(p.id);
+}
+
+function rememberDisconnectedPlayer(p: Player): void {
+  for (let i = disconnectedPlayers.length - 1; i >= 0; i--) {
+    if (disconnectedPlayers[i].id === p.id) disconnectedPlayers.splice(i, 1);
+  }
+
+  disconnectedPlayers.push(p);
+}
+
+function clearJoinSettleStateForPlayer(playerId: number): void {
+  delete playerJoinSettleTokenByPlayerId[playerId];
+  delete cipherSuddenDeathJoinAliveExemptByPlayerId[playerId];
+  delete cipherSuddenDeathJoinCleanupQueuedByPlayerId[playerId];
+}
+
+function beginPlayerJoinSettleToken(playerId: number): number {
+  playerJoinSettleTokenCounter += 1;
+  playerJoinSettleTokenByPlayerId[playerId] = playerJoinSettleTokenCounter;
+  return playerJoinSettleTokenCounter;
+}
+
+function schedulePlayerJoinSettle(playerId: number, source: string, delayMs: number, token?: number): number {
+  const activeToken = token ?? beginPlayerJoinSettleToken(playerId);
+
+  Timers.setTimeout(() => {
+    if (playerJoinSettleTokenByPlayerId[playerId] !== activeToken) return;
+
+    const p = getValidHumanPlayerById(playerId);
+    if (!p) return;
+
+    try {
+      settleJoinedPlayerForCurrentPhase(p, source + "_" + String(delayMs));
+    } catch (err) {
+      LogRuntimeError("JoinSettle/" + source + "/" + String(delayMs) + "/" + String(playerId), err);
+    }
+  }, delayMs);
+
+  return activeToken;
+}
+
+function schedulePlayerJoinSettleSequence(playerId: number, source: string): void {
+  const token = beginPlayerJoinSettleToken(playerId);
+  schedulePlayerJoinSettle(playerId, source, 100, token);
+  schedulePlayerJoinSettle(playerId, source, 500, token);
+  schedulePlayerJoinSettle(playerId, source, 1200, token);
+}
+
+function settleJoinedPlayerForCurrentPhase(p: Player, source: string): void {
+  if (!p || !mod.IsPlayerValid(p.player)) return;
+
+  p.setTeam();
+
+  if (gameStatus !== 3) {
+    buildRestrictedAreaUiForPlayer(p);
+  }
+
+  if (prematchHealthInside889ByPlayerId[p.id] === undefined) {
+    prematchHealthInside889ByPlayerId[p.id] = false;
+  }
+
+  delete prematchHealthAppliedMaxByPlayerId[p.id];
+  assignCipherAdminFromJoiningPlayerIfNeeded(p.player);
+
+  if (gameStatus === 0 || gameStatus === -1) {
+    applyPrematch889HealthForPlayer(p.id);
+    replacePrematchReadyText(p.id, p.player);
+    refreshPrematchReadyStateUi();
+    applyPhaseInputRestrictionsForPlayer(p.player);
+    return;
+  }
+
+  if (gameStatus === 1) {
+    applyPhaseInputRestrictionsForPlayer(p.player);
+    applyPrematch889HealthForPlayer(p.id);
+    stripLoadoutToMeleeOnly(p.player);
+    return;
+  }
+
+  if (gameStatus === 2) {
+    applyPhaseInputRestrictionsForPlayer(p.player);
+    applyPrematch889HealthForPlayer(p.id);
+    requestTransitionSpawn(p.id, "join_settle_prelive/" + source);
+    return;
+  }
+
+  if (gameStatus === 4) {
+    SafeSetWidgetVisibleByName("PostMatchContainer", true);
+    preparePostmatchPlayerState(p, "join_settle/" + source);
+    const slot = findPostmatchShowcaseSlotForPlayerId(p.id);
+    if (slot) applyPostmatchShowcaseSlot(slot);
+    return;
+  }
+
+  if (gameStatus !== 3) return;
+
+  p.updateScoreboard();
+  queueLiveHudBuild(p.id, "join_settle/" + source, "urgent", 1);
+  repairCipherKeyHudCacheForPlayer(p, false);
+  updateCipherSuddenDeathAliveHudForPlayer(p);
+
+  if (cipherSecondHalfTransitionActive || cipherSuddenDeathTransitionActive) {
+    try {
+      mod.SetRedeployTime(p.player, 0);
+    } catch (errRedeploy) {
+      LogRuntimeError("JoinSettle/transitionRedeploy/" + source + "/" + String(p.id), errRedeploy);
+    }
+
+    if (cipherSecondHalfTransitionStage === "deploy" || cipherSecondHalfTransitionStage === "countdown") {
+      markCipherSecondHalfDeployRequiredForPlayer(p);
+    } else {
+      requestTransitionSpawn(p.id, "join_settle_live_transition/" + source);
+    }
+    return;
+  }
+
+  if (isCipherSuddenDeathActive()) {
+    try {
+      mod.SetRedeployTime(p.player, 9999);
+    } catch (errRedeploy) {
+      LogRuntimeError("JoinSettle/suddenDeathRedeploy/" + source + "/" + String(p.id), errRedeploy);
+    }
+
+    if (cipherSuddenDeathJoinAliveExemptByPlayerId[p.id] !== true) {
+      cipherSuddenDeathEliminatedByPlayerId[p.id] = true;
+      playerInMandownByPlayerId[p.id] = true;
+      if (cipherSuddenDeathJoinCleanupQueuedByPlayerId[p.id] !== true) {
+        cipherSuddenDeathJoinCleanupQueuedByPlayerId[p.id] = true;
+        scheduleCipherSuddenDeathEliminatedPlayerCleanup(p.id, "join_settle_sudden_death");
+      }
+    }
+
+    updateCipherSuddenDeathAliveHudForAllPlayers();
+    return;
+  }
+
+  try {
+    mod.SetRedeployTime(p.player, REDEPLOY_TIME);
+    clearCipherLiveInputRestrictionsForPlayer(p.player);
+  } catch (errLiveJoinSetup) {
+    LogRuntimeError("JoinSettle/liveSetup/" + source + "/" + String(p.id), errLiveJoinSetup);
+  }
+
+  runtimeBotNextReconcileAtSec = 0;
+}
 
 let cipherKeyActivePlayerIdsSnapshot: number[] = [];
 let cipherKeyPlayerByIdSnapshot: { [playerId: number]: Player | undefined } = {};
@@ -21194,7 +21486,10 @@ function runCipherKeyUiRefreshJob(item: CipherKeyUiRefreshQueueItem): void {
   }
 
   if (flags.rebuildHud === true) {
-    queueLiveHudBuildForAll("key_ui_refresh/" + item.reason, "normal", 1);
+    // Safety: key UI refresh jobs are allowed to update existing widgets, but they must not
+    // delete/recreate the whole live HUD. Full rebuilds during pickup/delivery are the
+    // crash pattern. Missing HUDs are handled by explicit live-start/join build jobs.
+    repairDirtyCipherKeyHudCaches(1, false);
   }
 
   if (flags.refreshBombNotice === true) {
@@ -21311,7 +21606,9 @@ function processLiveHudQueues(): void {
     builds += 1;
   }
 
-  repairDirtyCipherKeyHudCaches(LIVE_HUD_REPAIRS_PER_TICK);
+  // Do not perform opportunistic live-HUD rebuilds from the 30 Hz live loop.
+  // Full HUD rebuilds happen only through queued live-start/join jobs above.
+  repairDirtyCipherKeyHudCaches(LIVE_HUD_REPAIRS_PER_TICK, false);
 }
 
 function getPhasePlayerOperationQueueKey(playerId: number, kind: PhasePlayerOperationKind): string {
@@ -21425,6 +21722,7 @@ let restrictedAreaCountdownToken: { [playerId: number]: number } = {};
 let restrictedAreaActiveTriggersByPlayerId: { [playerId: number]: { [triggerId: number]: boolean } } = {};
 let playerOutsideCombatBoundaryByPlayerId: { [playerId: number]: boolean } = {};
 let playerInMandownByPlayerId: { [playerId: number]: boolean } = {};
+let scoreboardDeathCountedByPlayerId: { [playerId: number]: boolean } = {};
 let restrictedAreaFeedbackSuppressedByPlayerId: { [playerId: number]: boolean } = {};
 let restrictedAreaPendingLethalConfirmTokenByPlayerId: { [playerId: number]: number } = {};
 let restrictedAreaPendingLethalConfirmTimerByPlayerId: { [playerId: number]: number | undefined } = {};
@@ -21433,6 +21731,18 @@ let objectiveAreaLastEnteredTriggerByPlayerId: { [playerId: number]: number | un
 
 let restrictedAreaRootWidgetByPlayerId: { [playerId: number]: mod.UIWidget } = {};
 let restrictedAreaCounterWidgetByPlayerId: { [playerId: number]: mod.UIWidget } = {};
+
+function clearScoreboardDeathCountForPlayerLife(playerId: number): void {
+  delete scoreboardDeathCountedByPlayerId[playerId];
+}
+
+function recordScoreboardDeathForPlayer(p: Player): boolean {
+  if (scoreboardDeathCountedByPlayerId[p.id] === true) return false;
+  p.addDeath();
+  scoreboardDeathCountedByPlayerId[p.id] = true;
+  p.updateScoreboard();
+  return true;
+}
 
 function isRestrictedAreaTriggerId(triggerId: number): boolean {
   return RESTRICTED_AREA_TRIGGER_IDS.indexOf(triggerId) >= 0;
@@ -23144,6 +23454,11 @@ function ResetRoundGameplayState(): void {
   postmatchWinnerTeam = teamNeutral;
   objectiveAreaActiveTriggersByPlayerId = {};
   objectiveAreaLastEnteredTriggerByPlayerId = {};
+  playerInMandownByPlayerId = {};
+  scoreboardDeathCountedByPlayerId = {};
+  playerJoinSettleTokenByPlayerId = {};
+  cipherSuddenDeathJoinAliveExemptByPlayerId = {};
+  cipherSuddenDeathJoinCleanupQueuedByPlayerId = {};
 
   // Clear per-round caches related to capture tick audio and capture credit (if you added it)
   lastCaptureTickAt = {};
@@ -25634,15 +25949,30 @@ function Mode_OnPlayerJoinGame(eventPlayer: mod.Player): void {
     }
 
     let player: Player | undefined;
+    let preserveActiveLiveState = false;
+    let joinSettleSource = "join_new";
 
     // IMPORTANT:
     // This event can be triggered multiple times for the same player.
     // If we already know the player, do NOT announce "joined" again.
     const existing = serverPlayers.get(joiningId);
     if (existing) {
+      preserveActiveLiveState =
+        gameStatus === 3 &&
+        existing.isDeployed === true &&
+        mod.IsPlayerValid(existing.player) &&
+        isPlayerAliveSafe(existing.player);
+      if (
+        preserveActiveLiveState &&
+        cipherMatchStage === "suddenDeath" &&
+        cipherSuddenDeathEliminatedByPlayerId[joiningId] !== true
+      ) {
+        cipherSuddenDeathJoinAliveExemptByPlayerId[joiningId] = true;
+      }
       existing.player = eventPlayer;
       existing.setTeam();
       player = existing;
+      joinSettleSource = "join_existing";
     } else {
       // Reconnect detection should be based on playerId, not objId.
       for (let i = 0; i < disconnectedPlayers.length; i++) {
@@ -25656,6 +25986,7 @@ function Mode_OnPlayerJoinGame(eventPlayer: mod.Player): void {
           );
           disconnectedPlayers.splice(i, 1);
           player = p;
+          joinSettleSource = "join_reconnect";
           break;
         }
       }
@@ -25668,67 +25999,21 @@ function Mode_OnPlayerJoinGame(eventPlayer: mod.Player): void {
           mod.Message(mod.stringkeys.PlayerJoined, newPlayer.player, newPlayer.id)
         );
         player = newPlayer;
+        joinSettleSource = "join_first_time";
       }
     }
 
-    if (player && gameStatus !== 3) {
-      buildRestrictedAreaUiForPlayer(player);
-    }
-
-    if (prematchHealthInside889ByPlayerId[joiningId] === undefined) {
-      prematchHealthInside889ByPlayerId[joiningId] = false;
-    }
-
-    delete prematchHealthAppliedMaxByPlayerId[joiningId];
-
-    if (gameStatus === 0) {
-      applyPrematch889HealthForPlayer(joiningId);
-    }
-
-    applyPhaseInputRestrictionsForPlayer(eventPlayer);
-    assignCipherAdminFromJoiningPlayerIfNeeded(eventPlayer);
-
-    if (gameStatus === 1) {
-      stripLoadoutToMeleeOnly(eventPlayer);
-    }
-
-    if (gameStatus === 0 || gameStatus === -1) {
-      if (player) replacePrematchReadyText(player.id, eventPlayer);
-      refreshPrematchReadyStateUi();
-    } else if (gameStatus === 3) {
-      SafeSetWidgetVisibleByName("LiveContainer", true);
-      HideSharedTicketBarFills();
-
-      if (player) {
-        try {
-          mod.SetRedeployTime(player.player, REDEPLOY_TIME);
-          clearCipherLiveInputRestrictionsForPlayer(player.player);
-        } catch (errLiveJoinSetup) {
-          LogRuntimeError("OnPlayerJoinGame/live_setup/" + String(player.id), errLiveJoinSetup);
-        }
-        queueLiveHudBuild(player.id, "OnPlayerJoinGame_live", "urgent", 1);
+    if (player) {
+      resetPlayerSessionRefsForJoin(player, preserveActiveLiveState);
+      if (
+        gameStatus === 3 &&
+        cipherMatchStage === "suddenDeath" &&
+        cipherSuddenDeathJoinAliveExemptByPlayerId[player.id] !== true
+      ) {
+        cipherSuddenDeathEliminatedByPlayerId[player.id] = true;
+        playerInMandownByPlayerId[player.id] = true;
       }
-
-      if (player && (cipherSecondHalfTransitionActive || cipherSuddenDeathTransitionActive)) {
-        if (cipherSecondHalfTransitionStage === "deploy") {
-          markCipherSecondHalfDeployRequiredForPlayer(player);
-        } else {
-          requestTransitionSpawn(player.id, "join_live_phase_transition");
-        }
-      }
-
-      runtimeBotNextReconcileAtSec = 0;
-    } else if (gameStatus === 2 && player) {
-      requestTransitionSpawn(player.id, "join_prelive");
-    } else if (gameStatus === 4) {
-      SafeSetWidgetVisibleByName("PostMatchContainer", true);
-      applyPostmatchInputStateForPlayer(eventPlayer);
-      schedulePostmatchCameraForPlayerAfterSettle(eventPlayer, "OnPlayerJoinGame_postmatch");
-
-      if (player) {
-        const slot = findPostmatchShowcaseSlotForPlayerId(player.id);
-        if (slot) applyPostmatchShowcaseSlot(slot);
-      }
+      schedulePlayerJoinSettleSequence(player.id, joinSettleSource);
     }
 
     requestCipherTransitionReconcile("OnPlayerJoinGame");
@@ -25748,6 +26033,7 @@ function Mode_OnPlayerLeaveGame(eventNumber: number): void {
     if (!leaving) return;
     const leavingRuntimeSlot = getRuntimeBotSlotForPlayerId(leaving.id);
     const leavingIsRuntimeBot = leavingRuntimeSlot !== undefined || runtimeBotReleasedPlayerId[leaving.id] === true;
+    clearJoinSettleStateForPlayer(leaving.id);
     cleanupRestrictedAreaUiForPlayer(leaving.id);
     clearLiveHudQueueForPlayer(leaving.id);
     clearPhasePlayerOperationsForPlayer(leaving.id);
@@ -25772,7 +26058,7 @@ function Mode_OnPlayerLeaveGame(eventNumber: number): void {
 
     cancelObjectiveCaptureAttemptsForPlayer(leaving.id);
 
-    if (!leavingIsRuntimeBot) disconnectedPlayers.push(leaving);
+    if (!leavingIsRuntimeBot) rememberDisconnectedPlayer(leaving);
     serverPlayers.delete(leaving.id);
     ensureCipherAdminAssigned();
 
@@ -25846,7 +26132,7 @@ function Mode_OnPlayerLeaveGame(eventNumber: number): void {
     invalidateCipherRespawnRouteJobForPlayer(leaving.id);
 
     if (gameStatus === 3 && !leavingIsRuntimeBot) {
-      leaving.addDeath();
+      recordScoreboardDeathForPlayer(leaving);
 
       const cp = leaving.getCapturePoint();
       if (cp) {
@@ -25868,6 +26154,12 @@ function Mode_OnPlayerLeaveGame(eventNumber: number): void {
 async function Mode_OnPlayerDeployed(eventPlayer: mod.Player): Promise<void> {
   try {
     const playerId = modlib.getPlayerId(eventPlayer);
+    const deployingIsSuddenDeathEliminated =
+      isCipherSuddenDeathActive() && cipherSuddenDeathEliminatedByPlayerId[playerId] === true;
+    if (!deployingIsSuddenDeathEliminated) {
+      clearScoreboardDeathCountForPlayerLife(playerId);
+      delete playerInMandownByPlayerId[playerId];
+    }
     const team = mod.GetTeam(eventPlayer);
     const deployedRuntimeBotSlot = getRuntimeBotSlotForPlayerId(playerId);
     const deployedIsBot = deployedRuntimeBotSlot !== undefined;
@@ -26003,6 +26295,7 @@ async function Mode_OnPlayerDeployed(eventPlayer: mod.Player): Promise<void> {
     p.isDeployed = true;
 
     if (isCipherSuddenDeathActive() && cipherSuddenDeathEliminatedByPlayerId[playerId] === true) {
+      playerInMandownByPlayerId[playerId] = true;
       try {
         mod.SetRedeployTime(eventPlayer, 9999);
       } catch (_errRedeploy) {}
@@ -26202,7 +26495,7 @@ async function Mode_OnPlayerUndeploy(eventPlayer: mod.Player): Promise<void> {
       safeSpawnPendingCheck[id] = false;
       hqDesyncForcedRedeploys[id] = 0;
       requestLiveBotSpawnForPlayerId(id, "OnPlayerUndeploy_Live", respawnDelaySeconds);
-      p.addDeath();
+      recordScoreboardDeathForPlayer(p);
       return;
     }
 
@@ -26222,7 +26515,7 @@ async function Mode_OnPlayerUndeploy(eventPlayer: mod.Player): Promise<void> {
 
     if (gameStatus === 3) {
       startCipherRespawnRouteJobForPlayer(id, wasDeployed, "OnPlayerUndeploy_Live");
-      p.addDeath();
+      recordScoreboardDeathForPlayer(p);
     }
   } catch (err) {
     LogRuntimeError("OnPlayerUndeploy", err);
@@ -26885,6 +27178,9 @@ function Mode_OnMandown(eventPlayer: mod.Player, _eventOtherPlayer: mod.Player):
     if (playerId === undefined) return;
 
     if (gameStatus === 3) {
+      if (playerInMandownByPlayerId[playerId] !== true) {
+        clearScoreboardDeathCountForPlayerLife(playerId);
+      }
       playerInMandownByPlayerId[playerId] = true;
       cancelObjectiveCaptureAttemptsForPlayer(playerId);
       deactivateRestrictedAreaFeedbackForPlayer(playerId, true);
@@ -26932,6 +27228,7 @@ function Mode_OnRevived(eventPlayer: mod.Player, _eventOtherPlayer: mod.Player):
     }
 
     delete playerInMandownByPlayerId[playerId];
+    clearScoreboardDeathCountForPlayerLife(playerId);
     clearRestrictedAreaFeedbackSuppressionForPlayer(playerId);
 
     if (gameStatus !== 3) return;
@@ -26964,6 +27261,9 @@ function Mode_OnPlayerDied(
 
     if (gameStatus !== 3) return;
 
+    if (playerInMandownByPlayerId[playerId] !== true) {
+      clearScoreboardDeathCountForPlayerLife(playerId);
+    }
     playerInMandownByPlayerId[playerId] = true;
     deactivateRestrictedAreaFeedbackForPlayer(playerId, true);
 
@@ -27020,11 +27320,12 @@ function Mode_OnPlayerEarnedKill(
   if (killer) {
     killer.addKill();
     killer.addScore(100);
+    killer.updateScoreboard();
   }
 
   const victim = serverPlayers.get(victimId);
   if (victim) {
-    victim.addDeath();
+    recordScoreboardDeathForPlayer(victim);
   }
 }
 
@@ -27036,6 +27337,7 @@ function Mode_OnPlayerEarnedKillAssist(eventPlayer: mod.Player, eventOtherPlayer
 
   // Assist score remains, but the old assists stat slot is now Armed.
   p.addScore(50);
+  p.updateScoreboard();
 }
 
 /* =================================================================================================
