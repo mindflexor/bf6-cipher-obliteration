@@ -308,8 +308,10 @@ const CIPHER_TRANSITION_FINALIZER_WATCHDOG_SECONDS = 8;
 const CIPHER_TRANSITION_PREDEPLOY_SETTLE_MS = 250;
 const CIPHER_TRANSITION_PREDEPLOY_STAGE_SECONDS = 10;
 const CIPHER_TRANSITION_HUMAN_UNDEPLOY_WORK_PER_TICK = 1;
-const CIPHER_TRANSITION_DEPLOY_RECONCILE_PLAYERS_PER_TICK = 16;
-const CIPHER_TRANSITION_FORCE_DEPLOY_PLAYERS_PER_TICK = 4;
+const CIPHER_TRANSITION_DEPLOY_RECONCILE_PLAYERS_PER_TICK = 4;
+const CIPHER_TRANSITION_DEPLOY_ACK_PLAYERS_PER_TICK = 4;
+const CIPHER_TRANSITION_DEPLOY_READY_RECHECK_DELAY_TICKS = 8;
+const CIPHER_TRANSITION_FORCE_DEPLOY_PLAYERS_PER_TICK = 1;
 const CIPHER_TRANSITION_CLOCK_FALLBACK_STALE_MS = 150;
 const CIPHER_TRANSITION_BOT_UNSPAWN_WORK_PER_TICK = 1;
 const CIPHER_TRANSITION_OBJECTIVE_EVENT_SUPPRESS_SECONDS = 0.35;
@@ -380,6 +382,9 @@ let cipherTransitionDeployReconcileCursor = 0;
 let cipherTransitionDeployLastHudStateKey = "";
 let cipherTransitionForceDeployQueue: number[] = [];
 let cipherTransitionForceDeployQueueToken = 0;
+let cipherTransitionDeployAckQueue: { playerId: number; sessionToken: number | undefined; reason: string; queuedAtTick: number }[] = [];
+let cipherTransitionDeployAckQueuedByPlayerId: { [playerId: number]: boolean } = {};
+let cipherTransitionDeployReadyRecheckDueTick = -1;
 let cipherTransitionDeployCountdownRequestAtMs = 0;
 let cipherSecondHalfFrozenByPlayerId: { [playerId: number]: boolean } = {};
 let cipherTransitionTeleportedByPlayerId: { [playerId: number]: boolean } = {};
@@ -17291,6 +17296,8 @@ function setCipherTransitionHudVisibleForPlayer(p: Player, visible: boolean): vo
 }
 
 function getCipherDeployCounts(): { ready: number; required: number } {
+  pruneCipherTransitionDeployTracking("deploy_counts");
+
   let required = 0;
   let ready = 0;
 
@@ -18021,6 +18028,9 @@ function resetCipherSecondHalfDeployPlayerTracking(): void {
   cipherTransitionDeployReconcileCursor = 0;
   cipherTransitionDeployLastHudStateKey = "";
   cipherTransitionForceDeployQueue = [];
+  cipherTransitionDeployAckQueue = [];
+  cipherTransitionDeployAckQueuedByPlayerId = {};
+  cipherTransitionDeployReadyRecheckDueTick = -1;
   cipherTransitionDeployCountdownRequestAtMs = 0;
 }
 
@@ -18048,6 +18058,9 @@ function resetCipherTransitionDeployGateState(): void {
   cipherTransitionDeployReconcileCursor = 0;
   cipherTransitionDeployLastHudStateKey = "";
   cipherTransitionForceDeployQueue = [];
+  cipherTransitionDeployAckQueue = [];
+  cipherTransitionDeployAckQueuedByPlayerId = {};
+  cipherTransitionDeployReadyRecheckDueTick = -1;
   cipherTransitionDeployCountdownRequestAtMs = 0;
 }
 
@@ -18317,6 +18330,8 @@ function markCipherSecondHalfDeployRequiredPlayers(): void {
 function refreshCipherTransitionDeployRequiredRoster(source: string): void {
   if (cipherSecondHalfTransitionStage !== "deploy" && cipherSecondHalfTransitionStage !== "countdown") return;
 
+  pruneCipherTransitionDeployTracking(source + "_pre");
+
   const presentRequiredIds: { [playerId: number]: boolean } = {};
   serverPlayers.forEach((p) => {
     if (!isRequiredSecondHalfDeployPlayer(p)) return;
@@ -18435,11 +18450,8 @@ function markCipherSecondHalfDeployReadyForPlayer(playerId: number, player: mod.
     const nowSec = getCurrentSchedulerNowSeconds();
     const remaining = getCipherTransitionSupervisorRemainingSeconds(nowSec);
     refreshCipherTransitionSupervisorSecond(remaining, true);
-    if (shouldCipherDeployAdvanceToCountdownNow()) {
-      hardEnterCipherDeployCountdownStageNow(nowSec, false, "mark_ready_" + String(playerId) + "_direct");
-    } else {
-      tryAdvanceCipherDeployStageIfReady("mark_ready_" + String(playerId), nowSec, false);
-    }
+    scheduleCipherTransitionDeployReadyRecheck("mark_ready_" + String(playerId));
+    requestCipherTransitionReconcile("mark_ready_" + String(playerId));
   } else {
     refreshCipherTransitionHudForCurrentState();
   }
@@ -18595,6 +18607,10 @@ function tryAdvanceCipherDeployStageIfReady(
 
   const counts = getCipherDeployCounts();
   const allReady = counts.required > 0 && counts.ready >= counts.required;
+  if (counts.required <= 0 && allowForcedExpiry && remaining <= 0) {
+    return tryEnterCipherDeployCountdownStageOnce(nowSec, true, source + "_expired_empty_roster");
+  }
+
   if (allReady) {
     if (cipherTransitionDeployAllReadySinceTick < 0) {
       cipherTransitionDeployAllReadySinceTick = serverTickCount;
@@ -18617,6 +18633,7 @@ function getCipherSecondHalfForceDeployToken(): number {
 
 function queueMissingCipherTransitionForceDeployPlayers(source: string): void {
   if (!isCipherLiveTransitionActive()) return;
+  pruneCipherTransitionDeployTracking(source + "_queue_missing");
 
   const transitionToken = getCipherSecondHalfForceDeployToken();
   if (transitionToken <= 0) return;
@@ -18648,8 +18665,14 @@ function queueMissingCipherTransitionForceDeployPlayers(source: string): void {
       return;
     }
 
-    if (cipherTransitionDeploySeenByPlayerId[p.id] === true && p.isDeployed === true) {
-      handleCipherTransitionDeployedPlayer(p.id, p.player, source + "_deploy_ack_seen");
+    if (cipherTransitionDeployAckQueuedByPlayerId[p.id] === true) {
+      return;
+    }
+
+    if (cipherTransitionDeploySeenByPlayerId[p.id] === true) {
+      // The player already sent a native deploy acknowledgement.
+      // Let the deploy-ack queue process the heavier setup work instead of
+      // issuing another DeployPlayer call into the same burst.
       return;
     }
 
@@ -18662,6 +18685,7 @@ function queueMissingCipherTransitionForceDeployPlayers(source: string): void {
 function processCipherTransitionForceDeployQueue(source: string): void {
   if (!isCipherLiveTransitionActive()) return;
   if (cipherSecondHalfTransitionStage !== "deploy" && cipherSecondHalfTransitionStage !== "countdown") return;
+  pruneCipherTransitionDeployTracking(source + "_process_force");
   if (cipherTransitionForceDeployQueue.length <= 0) return;
 
   const transitionToken = getCipherSecondHalfForceDeployToken();
@@ -18693,8 +18717,13 @@ function processCipherTransitionForceDeployQueue(source: string): void {
 
     cipherSecondHalfDeployRequiredByPlayerId[playerId] = true;
 
-    if (cipherTransitionDeploySeenByPlayerId[playerId] === true && p.isDeployed === true) {
-      handleCipherTransitionDeployedPlayer(playerId, p.player, source + "_deploy_ack_seen");
+    if (cipherTransitionDeployAckQueuedByPlayerId[playerId] === true) {
+      continue;
+    }
+
+    if (cipherTransitionDeploySeenByPlayerId[playerId] === true) {
+      // Native deploy already happened or is in-flight. Do not force another
+      // deploy call for this player during the same burst.
       continue;
     }
 
@@ -19073,6 +19102,9 @@ function clearCipherTransitionSupervisorState(): void {
   cipherLiveTransitionSupervisorLastShownSeconds = -1;
   cipherTransitionForceDeployQueue = [];
   cipherTransitionForceDeployQueueToken = 0;
+  cipherTransitionDeployAckQueue = [];
+  cipherTransitionDeployAckQueuedByPlayerId = {};
+  cipherTransitionDeployReadyRecheckDueTick = -1;
   cipherTransitionDeployCountdownRequestAtMs = 0;
   resetCipherTransitionDeployGateState();
 }
@@ -19227,6 +19259,117 @@ function refreshCipherTransitionSupervisorSecond(remainingSeconds: number, force
       remainingSeconds <= 3 ? 0.85 : 0.6
     );
   }
+}
+
+function scheduleCipherTransitionDeployReadyRecheck(_source: string, delayTicks: number = CIPHER_TRANSITION_DEPLOY_READY_RECHECK_DELAY_TICKS): void {
+  if (cipherSecondHalfTransitionStage !== "deploy" && cipherSecondHalfTransitionStage !== "countdown") return;
+  cipherTransitionDeployReadyRecheckDueTick = serverTickCount + mod.Max(1, delayTicks);
+}
+
+function queueCipherTransitionDeployAck(playerId: number, reason: string): void {
+  if (!isCipherLiveTransitionActive()) return;
+  if (cipherSecondHalfTransitionStage !== "deploy" && cipherSecondHalfTransitionStage !== "countdown") return;
+
+  const sp = serverPlayers.get(playerId);
+  if (!sp || !mod.IsPlayerValid(sp.player)) return;
+  if (!isRequiredSecondHalfDeployPlayer(sp)) return;
+
+  cipherTransitionDeploySeenByPlayerId[playerId] = true;
+  cipherSecondHalfDeployRequiredByPlayerId[playerId] = true;
+
+  if (cipherTransitionDeployAckQueuedByPlayerId[playerId] === true) {
+    scheduleCipherTransitionDeployReadyRecheck(reason + "_refresh");
+    requestCipherTransitionReconcile(reason + "_refresh");
+    return;
+  }
+
+  cipherTransitionDeployAckQueuedByPlayerId[playerId] = true;
+  cipherTransitionDeployAckQueue.push({
+    playerId,
+    sessionToken: playerSessionTokenByPlayerId[playerId],
+    reason,
+    queuedAtTick: serverTickCount,
+  });
+  scheduleCipherTransitionDeployReadyRecheck(reason + "_enqueue");
+  requestCipherTransitionReconcile(reason + "_enqueue");
+}
+
+function runCipherTransitionDeployReadyRecheckIfDue(nowSec: number, source: string): void {
+  if (cipherTransitionDeployReadyRecheckDueTick < 0) return;
+  if (serverTickCount < cipherTransitionDeployReadyRecheckDueTick) return;
+  cipherTransitionDeployReadyRecheckDueTick = -1;
+
+  if (!isCipherLiveTransitionActive()) return;
+  if (cipherSecondHalfTransitionStage !== "deploy" && cipherSecondHalfTransitionStage !== "countdown") return;
+
+  if (cipherSecondHalfTransitionStage === "deploy") {
+    const remaining = getCipherTransitionSupervisorRemainingSeconds(nowSec);
+    refreshCipherTransitionSupervisorSecond(remaining, true);
+    if (tryAdvanceCipherDeployStageIfReady(source, nowSec, remaining <= 0)) return;
+  } else {
+    refreshCipherTransitionHudForCurrentState();
+  }
+
+  requestCipherTransitionReconcile(source + "_reconcile");
+}
+
+function processCipherTransitionDeployAckQueue(nowSec: number, source: string): void {
+  if (!isCipherLiveTransitionActive()) {
+    cipherTransitionDeployAckQueue = [];
+    cipherTransitionDeployAckQueuedByPlayerId = {};
+    cipherTransitionDeployReadyRecheckDueTick = -1;
+    return;
+  }
+
+  if (cipherSecondHalfTransitionStage !== "deploy" && cipherSecondHalfTransitionStage !== "countdown") {
+    if (cipherTransitionDeployAckQueue.length > 0) {
+      cipherTransitionDeployAckQueue = [];
+      cipherTransitionDeployAckQueuedByPlayerId = {};
+    }
+    cipherTransitionDeployReadyRecheckDueTick = -1;
+    return;
+  }
+
+  pruneCipherTransitionDeployTracking(source + "_prune");
+
+  let processed = 0;
+  let processedAny = false;
+  while (cipherTransitionDeployAckQueue.length > 0 && processed < CIPHER_TRANSITION_DEPLOY_ACK_PLAYERS_PER_TICK) {
+    const item = cipherTransitionDeployAckQueue.shift();
+    if (!item) continue;
+    delete cipherTransitionDeployAckQueuedByPlayerId[item.playerId];
+
+    if (!isCurrentPlayerSession(item.playerId, item.sessionToken)) continue;
+
+    const sp = serverPlayers.get(item.playerId);
+    if (!sp || !mod.IsPlayerValid(sp.player) || !isRequiredSecondHalfDeployPlayer(sp)) continue;
+
+    processed += 1;
+
+    const handled = handleCipherTransitionDeployedPlayer(
+      item.playerId,
+      sp.player,
+      item.reason + "_queued"
+    );
+
+    if (!handled) {
+      const ageTicks = serverTickCount - item.queuedAtTick;
+      if (ageTicks < 15 && cipherTransitionDeployAckQueuedByPlayerId[item.playerId] !== true) {
+        cipherTransitionDeployAckQueuedByPlayerId[item.playerId] = true;
+        cipherTransitionDeployAckQueue.push(item);
+      }
+      continue;
+    }
+
+    processedAny = true;
+    scheduleCipherTransitionDeployReadyRecheck(source + "_handled", 1);
+  }
+
+  if (processedAny) {
+    requestCipherTransitionReconcile(source + "_processed");
+  }
+
+  runCipherTransitionDeployReadyRecheckIfDue(nowSec, source + "_ready_recheck");
 }
 
 function requestCipherTransitionReconcile(reason: string): void {
@@ -21053,8 +21196,28 @@ const serverPlayers = new Map<number, Player>();
 const disconnectedPlayers: Player[] = [];
 let playerJoinSettleTokenCounter = 0;
 let playerJoinSettleTokenByPlayerId: { [playerId: number]: number | undefined } = {};
+let playerSessionTokenCounter = 0;
+let playerSessionTokenByPlayerId: { [playerId: number]: number | undefined } = {};
+let playerDisconnectedAtTickByPlayerId: { [playerId: number]: number | undefined } = {};
 let cipherSuddenDeathJoinAliveExemptByPlayerId: { [playerId: number]: boolean | undefined } = {};
 let cipherSuddenDeathJoinCleanupQueuedByPlayerId: { [playerId: number]: boolean | undefined } = {};
+
+function beginPlayerSessionForJoin(playerId: number): number {
+  playerSessionTokenCounter += 1;
+  playerSessionTokenByPlayerId[playerId] = playerSessionTokenCounter;
+  delete playerDisconnectedAtTickByPlayerId[playerId];
+  return playerSessionTokenCounter;
+}
+
+function invalidatePlayerSessionForDisconnect(playerId: number): void {
+  playerSessionTokenCounter += 1;
+  playerSessionTokenByPlayerId[playerId] = playerSessionTokenCounter;
+  playerDisconnectedAtTickByPlayerId[playerId] = serverTickCount;
+}
+
+function isCurrentPlayerSession(playerId: number, token: number | undefined): boolean {
+  return token !== undefined && playerSessionTokenByPlayerId[playerId] === token;
+}
 
 function resetPlayerSessionRefsForJoin(p: Player, preserveActiveLiveState: boolean): void {
   if (!preserveActiveLiveState) {
@@ -21141,6 +21304,60 @@ function clearJoinSettleStateForPlayer(playerId: number): void {
   delete cipherSuddenDeathJoinCleanupQueuedByPlayerId[playerId];
 }
 
+function clearCipherTransitionStateForPlayer(playerId: number, source: string): void {
+  delete cipherSecondHalfDeployRequiredByPlayerId[playerId];
+  delete cipherSecondHalfDeployReadyByPlayerId[playerId];
+  delete cipherTransitionDeploySeenByPlayerId[playerId];
+  delete cipherTransitionTeleportedByPlayerId[playerId];
+  delete cipherSecondHalfFrozenByPlayerId[playerId];
+  delete cipherSuddenDeathForcedUndeployTokenByPlayerId[playerId];
+  delete transitionSpawnRequestedByPlayerId[playerId];
+  delete transitionSpawnLastAttemptTickByPlayerId[playerId];
+  delete transitionSpawnInFlightByPlayerId[playerId];
+  cipherTransitionForceDeployQueue = cipherTransitionForceDeployQueue.filter((queuedId) => queuedId !== playerId);
+  if (cipherTransitionDeployAckQueue.length > 0) {
+    cipherTransitionDeployAckQueue = cipherTransitionDeployAckQueue.filter((item) => item.playerId !== playerId);
+  }
+  delete cipherTransitionDeployAckQueuedByPlayerId[playerId];
+  clearPhasePlayerOperationsForPlayer(playerId);
+  clearLiveHudQueueForPlayer(playerId);
+  void source;
+}
+
+function pruneCipherTransitionDeployTracking(source: string): void {
+  if (cipherSecondHalfTransitionStage !== "deploy" && cipherSecondHalfTransitionStage !== "countdown") return;
+
+  for (const key in cipherSecondHalfDeployRequiredByPlayerId) {
+    const playerId = Number(key);
+    const sp = serverPlayers.get(playerId);
+    if (sp && isRequiredSecondHalfDeployPlayer(sp)) continue;
+
+    clearCipherTransitionStateForPlayer(playerId, source + "_stale_required");
+  }
+
+  for (const key in cipherSecondHalfDeployReadyByPlayerId) {
+    const playerId = Number(key);
+    if (cipherSecondHalfDeployRequiredByPlayerId[playerId] === true) continue;
+    clearCipherTransitionStateForPlayer(playerId, source + "_stale_ready");
+  }
+
+  if (cipherTransitionForceDeployQueue.length > 0) {
+    cipherTransitionForceDeployQueue = cipherTransitionForceDeployQueue.filter((playerId) => {
+      const sp = serverPlayers.get(playerId);
+      return !!sp && isRequiredSecondHalfDeployPlayer(sp);
+    });
+  }
+
+  if (cipherTransitionDeployAckQueue.length > 0) {
+    cipherTransitionDeployAckQueue = cipherTransitionDeployAckQueue.filter((item) => {
+      const sp = serverPlayers.get(item.playerId);
+      const keep = !!sp && isRequiredSecondHalfDeployPlayer(sp) && isCurrentPlayerSession(item.playerId, item.sessionToken);
+      if (!keep) delete cipherTransitionDeployAckQueuedByPlayerId[item.playerId];
+      return keep;
+    });
+  }
+}
+
 function beginPlayerJoinSettleToken(playerId: number): number {
   playerJoinSettleTokenCounter += 1;
   playerJoinSettleTokenByPlayerId[playerId] = playerJoinSettleTokenCounter;
@@ -21149,9 +21366,11 @@ function beginPlayerJoinSettleToken(playerId: number): number {
 
 function schedulePlayerJoinSettle(playerId: number, source: string, delayMs: number, token?: number): number {
   const activeToken = token ?? beginPlayerJoinSettleToken(playerId);
+  const activeSessionToken = playerSessionTokenByPlayerId[playerId];
 
   Timers.setTimeout(() => {
     if (playerJoinSettleTokenByPlayerId[playerId] !== activeToken) return;
+    if (!isCurrentPlayerSession(playerId, activeSessionToken)) return;
 
     const p = getValidHumanPlayerById(playerId);
     if (!p) return;
@@ -21235,6 +21454,8 @@ function settleJoinedPlayerForCurrentPhase(p: Player, source: string): void {
 
     if (cipherSecondHalfTransitionStage === "deploy" || cipherSecondHalfTransitionStage === "countdown") {
       markCipherSecondHalfDeployRequiredForPlayer(p);
+      refreshCipherTransitionDeployRequiredRoster("join_settle_transition/" + source);
+      refreshCipherTransitionHudForCurrentState();
     } else {
       requestTransitionSpawn(p.id, "join_settle_live_transition/" + source);
     }
@@ -21369,6 +21590,19 @@ function isValidHumanPlayerState(p: Player | undefined): p is Player {
 function getValidHumanPlayerById(playerId: number): Player | undefined {
   const p = serverPlayers.get(playerId);
   return isValidHumanPlayerState(p) ? p : undefined;
+}
+
+function isCurrentEventPlayerReference(playerId: number, eventPlayer: mod.Player): boolean {
+  const current = serverPlayers.get(playerId);
+  if (!current) return false;
+
+  try {
+    if (!mod.IsPlayerValid(eventPlayer)) return false;
+    if (!mod.IsPlayerValid(current.player)) return false;
+    return mod.GetObjId(current.player) === mod.GetObjId(eventPlayer);
+  } catch (_err) {
+    return false;
+  }
 }
 
 function getValidHumanPlayersSnapshot(): Player[] {
@@ -25745,6 +25979,7 @@ function OngoingGlobal_Inner(): void {
     processLiveHudQueues();
     processCipherKeyUiRefreshQueue();
     runCipherLiveKeyWatchdog(nowSec, "live_tick");
+    processCipherTransitionDeployAckQueue(nowSec, "live_tick");
     runQueuedCipherTransitionReconcile(nowSec);
 
     if (cipherSecondHalfTransitionActive || cipherSuddenDeathTransitionActive) {
@@ -25930,6 +26165,7 @@ function findServerPlayerByObjId(playerObjId: number): Player | undefined {
 function Mode_OnPlayerJoinGame(eventPlayer: mod.Player): void {
   try {
     const joiningId = modlib.getPlayerId(eventPlayer);
+    const joiningSessionToken = beginPlayerSessionForJoin(joiningId);
     const joiningIsAi = isBotBackfillPlayerSafe(eventPlayer);
 
     // Runtime AI bots must not be treated like human clients.
@@ -26004,6 +26240,7 @@ function Mode_OnPlayerJoinGame(eventPlayer: mod.Player): void {
     }
 
     if (player) {
+      if (!isCurrentPlayerSession(player.id, joiningSessionToken)) return;
       resetPlayerSessionRefsForJoin(player, preserveActiveLiveState);
       if (
         gameStatus === 3 &&
@@ -26012,6 +26249,10 @@ function Mode_OnPlayerJoinGame(eventPlayer: mod.Player): void {
       ) {
         cipherSuddenDeathEliminatedByPlayerId[player.id] = true;
         playerInMandownByPlayerId[player.id] = true;
+      }
+      if (isCipherLiveTransitionActive()) {
+        markCipherSecondHalfDeployRequiredForPlayer(player);
+        refreshCipherTransitionDeployRequiredRoster("OnPlayerJoinGame_joined");
       }
       schedulePlayerJoinSettleSequence(player.id, joinSettleSource);
     }
@@ -26031,6 +26272,8 @@ function Mode_OnPlayerLeaveGame(eventNumber: number): void {
     if (!leaving) leaving = serverPlayers.get(eventNumber);
 
     if (!leaving) return;
+    invalidatePlayerSessionForDisconnect(leaving.id);
+    clearCipherTransitionStateForPlayer(leaving.id, "OnPlayerLeaveGame");
     const leavingRuntimeSlot = getRuntimeBotSlotForPlayerId(leaving.id);
     const leavingIsRuntimeBot = leavingRuntimeSlot !== undefined || runtimeBotReleasedPlayerId[leaving.id] === true;
     clearJoinSettleStateForPlayer(leaving.id);
@@ -26164,6 +26407,9 @@ async function Mode_OnPlayerDeployed(eventPlayer: mod.Player): Promise<void> {
     const deployedRuntimeBotSlot = getRuntimeBotSlotForPlayerId(playerId);
     const deployedIsBot = deployedRuntimeBotSlot !== undefined;
     const deployedSkipsHumanFlow = deployedIsBot || shouldSkipHumanInputRestrictionsForPlayer(eventPlayer);
+    if (!deployedSkipsHumanFlow && serverPlayers.has(playerId) && !isCurrentEventPlayerReference(playerId, eventPlayer)) {
+      return;
+    }
     delete botLiveSpawnRequestedByPlayerId[playerId];
     delete botLiveSpawnNextAttemptAtSecByPlayerId[playerId];
     cancelPendingRestrictedLethalConfirmForPlayer(playerId);
@@ -26272,22 +26518,14 @@ async function Mode_OnPlayerDeployed(eventPlayer: mod.Player): Promise<void> {
     p.team = team;
     if (isCipherLiveTransitionActive()) {
       if (cipherSecondHalfTransitionStage === "deploy" || cipherSecondHalfTransitionStage === "countdown") {
-        cipherTransitionDeploySeenByPlayerId[playerId] = true;
-        markCipherSecondHalfDeployRequiredForPlayer(p);
+        queueCipherTransitionDeployAck(playerId, "OnPlayerDeployed_Transition");
+        queueCipherAdminInteractSpawnForPlayer(playerId, "OnPlayerDeployed_Transition");
+        return;
       }
+
       if (handleCipherTransitionDeployedPlayer(playerId, eventPlayer, "OnPlayerDeployed_Transition")) {
         queueCipherAdminInteractSpawnForPlayer(playerId, "OnPlayerDeployed_Transition");
-        const deployAdvanceNowSec = getCurrentSchedulerNowSeconds();
-        const deployAdvanceRemaining = getCipherTransitionSupervisorRemainingSeconds(deployAdvanceNowSec);
-        if (shouldCipherDeployAdvanceToCountdownNow()) {
-          hardEnterCipherDeployCountdownStageNow(deployAdvanceNowSec, false, "OnPlayerDeployed_Transition_direct");
-        } else {
-          tryAdvanceCipherDeployStageIfReady(
-            "OnPlayerDeployed_Transition",
-            deployAdvanceNowSec,
-            deployAdvanceRemaining <= 0
-          );
-        }
+        requestCipherTransitionReconcile("OnPlayerDeployed_Transition");
       }
       return;
     }
@@ -26356,6 +26594,7 @@ async function Mode_OnPlayerUndeploy(eventPlayer: mod.Player): Promise<void> {
     const id = modlib.getPlayerId(eventPlayer);
     const p = serverPlayers.get(id);
     if (!p) return;
+    if (!isCurrentEventPlayerReference(id, eventPlayer)) return;
     const wasDeployed = p.isDeployed === true;
     const undeployedIsBot = getRuntimeBotSlotForPlayerId(id) !== undefined;
     const isForcedSafeSpawnFlowAtUndeploy =
