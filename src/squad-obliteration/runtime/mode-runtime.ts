@@ -41,7 +41,7 @@ import { Timers } from 'bf6-portal-utils/timers/index.ts';
    1) CORE CONFIGURATION
 ================================================================================================= */
 
-const TICK_RATE = 30;                    // OngoingGlobal is treated as 30 ticks/sec
+const TICK_RATE = RULES.tickRate;        // OngoingGlobal is treated as configured ticks/sec
 
 const USE_ENGINE_TIME_SCHEDULER = true;
 const DEBUG_PERF_TELEMETRY = false;
@@ -141,9 +141,13 @@ const LIVE_TIMER_INTRO_VALUE_HEIGHT = 50;
 const LIVE_TIMER_INTRO_VALUE_TEXT_SIZE = 55;
 const LIVE_TIMER_INTRO_VALUE_TEXT_COLOR: [number, number, number] = [1, 0.5137, 0.3804];
 
-const COUNT_DOWN_TIME = 5;              // ready-up delay before forced undeploy into pre-live
-const PRELIVE_TIME = 15;                // seconds (pre-live freeze)
+const COUNT_DOWN_TIME = RULES.countdownTimeSeconds;              // ready-up delay before forced undeploy into pre-live
+const PRELIVE_TIME = RULES.preliveTimeSeconds;                // seconds (pre-live freeze)
 const POSTMATCH_TIME = RULES.postmatchTimeSeconds;              // seconds
+const LIVE_HUD_BUILDS_PER_TICK = 1;
+const LIVE_HUD_REPAIRS_PER_TICK = 2;
+const PHASE_PLAYER_OPS_PER_TICK = 2;
+const CIPHER_KEY_UI_REFRESHES_PER_TICK = 1;
 
 const REDEPLOY_TIME = RULES.redeployTimeSeconds; // live redeploy time
 // tickets after first live deploy
@@ -224,6 +228,13 @@ let liveClockTimeoutHoldActive = false;
 let liveTimerIntroActive = false;
 let liveTimerIntroEndsAtSec = 0;
 let liveTimerIntroDisplaySeconds: number = ROUND_TIME;
+let liveHudBuildQueue: LiveHudBuildQueueItem[] = [];
+let liveHudBuildQueuedByPlayerId: { [playerId: number]: boolean } = {};
+let phasePlayerOperationQueue: PhasePlayerOperationQueueItem[] = [];
+let phasePlayerOperationQueuedByKey: { [key: string]: boolean } = {};
+let cipherKeyUiRefreshQueue: CipherKeyUiRefreshQueueItem[] = [];
+let preliveTransitionSpawnPendingAfterUndeploy = false;
+let preliveZeroTransitionHandled = false;
 
 let initialization: boolean[] = [false, false, false, false, false];
 
@@ -255,6 +266,38 @@ type CipherTransitionWorkItem = {
   cost: CipherTransitionWorkCost;
   run: () => void;
 };
+type LiveHudQueuePriority = "normal" | "urgent";
+type LiveHudBuildQueueItem = {
+  playerId: number;
+  reason: string;
+  dueTick: number;
+  priority: LiveHudQueuePriority;
+};
+type PhasePlayerOperationKind = "deploy" | "undeploy";
+type PhasePlayerOperationQueueItem = {
+  playerId: number;
+  kind: PhasePlayerOperationKind;
+  reason: string;
+  dueTick: number;
+};
+type CipherKeyUiRefreshFlags = {
+  force?: boolean;
+  rebuildHud?: boolean;
+  refreshBombNotice?: boolean;
+  refreshNextKey?: boolean;
+  updateCarrierHud?: boolean;
+  updateScores?: boolean;
+  updateIcons?: boolean;
+  syncCarrierVisuals?: boolean;
+  syncHybridSurface?: boolean;
+  pickupNoticeTeamId?: number;
+};
+type CipherKeyUiRefreshQueueItem = {
+  reason: string;
+  dueTick: number;
+  flags: CipherKeyUiRefreshFlags;
+};
+type DeferredBombCarrierDropReason = "death" | "mandown" | "undeploy" | "disconnect";
 const CIPHER_DEFERRED_LIVE_START_KEY_DELAY_SECONDS = 0.05;
 const CIPHER_TRANSITION_NORMAL_WORK_PER_TICK = 2;
 const CIPHER_TRANSITION_HEAVY_WORK_PER_TICK = 1;
@@ -827,6 +870,11 @@ const CIPHER_NODE_REBOOT_SFX_ASSET: mod.RuntimeSpawn_Common =
   (mod.RuntimeSpawn_Common as any).SFX_GameModes_Gauntlet_Mission_Beacons_Beeping_SimpleLoop3D;
 const CIPHER_NODE_LOOP_SFX_VOLUME = 0.45;
 const CIPHER_NODE_LOOP_SFX_ATTENUATION_RANGE = 90;
+
+// Rebooting node SFX only.
+// Half volume and half distance from the old shared loop.
+const CIPHER_NODE_REBOOT_LOOP_SFX_VOLUME = 0.225;
+const CIPHER_NODE_REBOOT_LOOP_SFX_ATTENUATION_RANGE = 45;
 const CIPHER_NODE_VISUAL_REASSERT_SECONDS = 4.0;
 
 const CIPHER_NODE_POLYGON_CENTER_OFFSET_BY_CP_ID: { [cpId: number]: mod.Vector } = {
@@ -1560,7 +1608,7 @@ let visualSubtickLastOutputSec = 0;
 let visualSubtickLastPreferredSec = -1;
 let visualSubtickLastPreferredFloorSec = -1;
 let visualSubtickPreferredFloorTick = 0;
-let visualSubtickEstimatedHz = TICK_RATE;
+let visualSubtickEstimatedHz: number = TICK_RATE;
 let visualSubtickCoarseStepCount = 0;
 let visualSubtickFineStepCount = 0;
 let visualSubtickFallbackFrameCount = 0;
@@ -2324,7 +2372,8 @@ function configureBombWorldIconSafe(icon: mod.WorldIcon, enableImage: boolean): 
   try {
     mod.SetWorldIconPosition(icon, iconPos);
     mod.SetWorldIconOwner(icon, teamNeutral);
-    if (!droppedPos && enableImage) mod.SetWorldIconImage(icon, mod.WorldIconImages.Bomb);
+    // Text-only key world icon.
+    // Do not set the bomb/key image.
     mod.SetWorldIconColor(icon, droppedPos ? COLOR_FRIENDLY : COLOR_NEUTRAL);
     if (droppedPos && bombDroppedReturnDeadlineAtSec > 0) {
       const remainingSeconds = mod.Max(0, mod.Ceiling(bombDroppedReturnDeadlineAtSec - getCurrentSchedulerNowSeconds()));
@@ -2332,7 +2381,7 @@ function configureBombWorldIconSafe(icon: mod.WorldIcon, enableImage: boolean): 
     } else {
       mod.SetWorldIconText(icon, getStringMessageWithFallback((mod.stringkeys as any).BOMB, "CIPHER KEY"));
     }
-    mod.EnableWorldIconImage(icon, enableImage && !droppedPos);
+    mod.EnableWorldIconImage(icon, false);
     mod.EnableWorldIconText(icon, true);
     return true;
   } catch (err) {
@@ -5837,20 +5886,22 @@ function getBombSpawnAnnouncementMessageState(
   if (mode === "bomb_located") {
     return {
       key: (mod.stringkeys as any).BombHasBeenLocated,
-      fallbackText: "BOMB LOCATION FOUND",
+      fallbackText: "CIPHER KEY UNLOCKED",
     };
   }
 
   return {
     key: (mod.stringkeys as any).NewBombLocationFound,
-    fallbackText: "NEW BOMB LOCATION FOUND",
+    fallbackText: "NEW CIPHER KEY LOCATION UNLOCKED",
   };
 }
 
 
-function announceBombLocationForAllTeams(message: any): void {
-  modlib.ShowHighlightedGameModeMessage(message, team1);
-  modlib.ShowHighlightedGameModeMessage(message, team2);
+function announceBombLocationForAllTeams(_message: any): void {
+  // Disabled for Cipher Obliteration.
+  // The native highlighted game-mode/world popup can flash <unknown string>
+  // during half transitions and key respawns.
+  // We use the custom key-event banner instead.
 }
 
 function playBombLocationVoForAllTeams(): void {
@@ -5864,12 +5915,14 @@ function announceBombSpawnResolved(
   showHighlightMessage: boolean = true
 ): void {
   const copy = getBombSpawnAnnouncementMessageState(mode);
-  const message = getStringMessageWithFallback(copy.key, copy.fallbackText);
-  if (showHighlightMessage) {
-    announceBombLocationForAllTeams(message);
-  }
+
+  // Do not use the native highlighted game-mode/world popup.
+  // It is not needed anymore because the custom key-event banner handles this.
+  void showHighlightMessage;
+
   showBombNoticeForAllPlayers(copy.key, copy.fallbackText);
   playBombLocationVoForAllTeams();
+
   if (mode === "bomb_located") {
     playBombSpawnStingerToAll(BOMB_SPAWN_STINGER_VOLUME);
   }
@@ -6043,11 +6096,17 @@ function clearBombCarrierState(): void {
   bombCarrierPreviousEquipmentByPlayerId = {};
   bombCarrierRestoreAmmoByPlayerId = {};
   resetBombCarrierVerticalTrackingState();
-  UpdateBombCarrierUiForAllPlayers(undefined, true);
-
-  if (gameStatus === 3 && initialization[3] === true) {
-    syncLiveHybridObjectiveSurfaceState("clearBombCarrierState");
-  }
+  queueCipherKeyUiRefresh(
+    "clearBombCarrierState",
+    {
+      force: true,
+      refreshBombNotice: true,
+      updateCarrierHud: true,
+      updateIcons: true,
+      syncHybridSurface: true,
+    },
+    1
+  );
 }
 
 function clearObjectiveSuccessfulArmContext(cpId: number): void {
@@ -6209,32 +6268,19 @@ function assignBombCarrierFromDelta(
   resetBombCarrierVerticalTrackingState();
   bombCarrierUiStateVersion++;
 
-  const carrierNowSec = getCurrentSchedulerNowSeconds();
+  let pickupNoticeTeamId = 0;
   const carrierState = serverPlayers.get(playerId);
   if (carrierState && mod.IsPlayerValid(carrierState.player)) {
     const carrierTeam = getCipherKeyTeamSnapshot(playerId) ?? carrierState.team;
-    spawnBombCarrierRuntimeWorldIcons(carrierState.player, carrierNowSec, carrierTeam);
-    syncCipherCarrierVisualsNow(carrierNowSec, "assign_pickup");
-    applyBombCarrierHudStateForPlayer(
-      carrierState,
-      true,
-      getBombCarrierPulseAlpha(carrierNowSec),
-      mod.Floor(getBombCarrierPulseAlpha(carrierNowSec) * 100),
-      true
-    );
     if (mod.Equals(carrierTeam, team1) || mod.Equals(carrierTeam, team2)) {
-      showCipherKeyPickupNoticeForTeam(carrierTeam);
+      pickupNoticeTeamId = mod.Equals(carrierTeam, team1) ? 1 : 2;
     }
     const carrierPos = tryGetPlayerPositionSafe(carrierState.player);
     if (carrierPos) {
       bombCarrierTrackedY = mod.YComponentOf(carrierPos);
-      bombCarrierStableYSinceSec = carrierNowSec;
-      spawnOrMoveCipherNativeMinimapBomb(carrierPos, "carrier_assign");
-      startBombCarrierBeepLoopAtPosition(carrierPos);
+      bombCarrierStableYSinceSec = getCurrentSchedulerNowSeconds();
     }
   }
-  UpdateBombCarrierUiForAllPlayers(carrierNowSec, true);
-  refreshCipherKeyUiAndIconsImmediately("assignBombCarrierFromDelta");
 
   logBombPickupDebug(
     mod.Message(
@@ -6254,9 +6300,22 @@ function assignBombCarrierFromDelta(
   invalidateBombReturnToBaseTimer();
   bombDroppedSourceKind = "none";
 
-  if (gameStatus === 3 && initialization[3] === true) {
-    syncLiveHybridObjectiveSurfaceState("assignBombCarrierFromDelta");
-  }
+  queueCipherKeyUiRefresh(
+    "assignBombCarrierFromDelta",
+    {
+      force: true,
+      rebuildHud: true,
+      refreshBombNotice: true,
+      refreshNextKey: true,
+      updateCarrierHud: true,
+      updateScores: true,
+      updateIcons: true,
+      syncCarrierVisuals: true,
+      syncHybridSurface: true,
+      pickupNoticeTeamId,
+    },
+    1
+  );
   clearBotObjectiveAssignments();
 }
 
@@ -6380,7 +6439,7 @@ function getSafeCipherCarrierDropPosition(playerId: number, override?: mod.Vecto
 
 function scheduleBombCarrierDropAfterCombatEvent(
   playerId: number,
-  reason: "death" | "mandown" | "undeploy",
+  reason: DeferredBombCarrierDropReason,
   dropPositionOverride?: mod.Vector
 ): void {
   if (bombCarrierPlayerId === undefined) return;
@@ -6475,16 +6534,6 @@ function forceBombDropFromCarrier(playerId: number, reason: string, dropPosition
   );
 
   const dropPos = getSafeCipherCarrierDropPosition(playerId, dropPositionOverride);
-
-  if (sp && !isCipherRuntimeBotPlayerId(playerId) && mod.IsPlayerValid(sp.player)) {
-    applyBombCarrierHudStateForPlayer(
-      sp,
-      false,
-      1,
-      100,
-      true
-    );
-  }
 
   // Drop must detach the native Bomb from the carrier before script carrier state is cleared.
   // The dropped native Bomb is respawned at dropPos below after the scripted drop succeeds.
@@ -8682,6 +8731,18 @@ function updateCipherCounterWorldIcons(force: boolean = false): void {
   }
 }
 
+function forceTextOnlyWorldIcon(icon: mod.WorldIcon | undefined, textVisible: boolean = true): void {
+  if (!icon) return;
+
+  try {
+    mod.EnableWorldIconImage(icon, false);
+  } catch (_errImage) {}
+
+  try {
+    mod.EnableWorldIconText(icon, textVisible);
+  } catch (_errText) {}
+}
+
 function hideAllCipherCounterWorldIcons(): void {
   clearAllCipherCounterRuntimeWorldIcons();
   clearAllCipherNodeVisuals();
@@ -8913,17 +8974,24 @@ function hasCipherNodeVisualHandlesForMode(cpId: number, mode: CipherNodeVisualM
 
 function spawnCipherNodeLoopSfxForCp(cpId: number, asset: mod.RuntimeSpawn_Common, pos: mod.Vector): void {
   const source = spawnRuntimeSfxSourceAtPosition(asset, pos);
+
+  const isRebootLoop = asset === CIPHER_NODE_REBOOT_SFX_ASSET;
+  const volume = isRebootLoop ? CIPHER_NODE_REBOOT_LOOP_SFX_VOLUME : CIPHER_NODE_LOOP_SFX_VOLUME;
+  const range = isRebootLoop ? CIPHER_NODE_REBOOT_LOOP_SFX_ATTENUATION_RANGE : CIPHER_NODE_LOOP_SFX_ATTENUATION_RANGE;
+
   const handle = tryPlayRuntimeSfxSource3D(
     source,
-    CIPHER_NODE_LOOP_SFX_VOLUME,
+    volume,
     pos,
-    CIPHER_NODE_LOOP_SFX_ATTENUATION_RANGE
+    range
   );
+
   if (!handle) {
     if (source.object) unspawnObjectSafe(source.object, "cipher node loop sfx failed", false);
     else if (source.spawned) unspawnObjectSafe(source.spawned, "cipher node loop sfx failed", false);
     return;
   }
+
   cipherNodeLoopSfxSourceByCpId[cpId] = source;
   cipherNodeLoopSfxHandleByCpId[cpId] = handle;
 }
@@ -10139,10 +10207,10 @@ function requestTransitionSpawn(playerId: number, source: string): void {
 
 
 function requestTransitionSpawnForAllTransitionPlayers(source: string): void {
-  serverPlayers.forEach((sp) => {
-    if (!sp) return;
-    requestTransitionSpawn(sp.id, source);
-  });
+  const players = getValidHumanPlayersSnapshot();
+  for (let i = 0; i < players.length; i++) {
+    requestTransitionSpawn(players[i].id, source);
+  }
 }
 
 function processTransitionSpawnQueue(source: string): void {
@@ -10156,24 +10224,25 @@ function processTransitionSpawnQueue(source: string): void {
 
   let requestedCount = 0;
   let spawnAttemptsThisTick = 0;
+  const players = getValidHumanPlayersSnapshot();
 
-  serverPlayers.forEach((sp) => {
-    if (!sp) return;
-    if (spawnAttemptsThisTick >= CIPHER_TRANSITION_SPAWN_JOBS_PER_TICK) return;
+  for (let playerIndex = 0; playerIndex < players.length; playerIndex++) {
+    const sp = players[playerIndex];
+    if (spawnAttemptsThisTick >= CIPHER_TRANSITION_SPAWN_JOBS_PER_TICK) break;
     const playerId = sp.id;
-    if (transitionSpawnRequestedByPlayerId[playerId] !== true) return;
+    if (transitionSpawnRequestedByPlayerId[playerId] !== true) continue;
     requestedCount += 1;
 
-    if (!mod.IsPlayerValid(sp.player)) return;
+    if (!mod.IsPlayerValid(sp.player)) continue;
     if (isCipherRuntimeBotPlayerId(playerId) || isBotBackfillPlayerSafe(sp.player)) {
       clearTransitionSpawnStateForPlayer(playerId);
-      return;
+      continue;
     }
 
     if (sp.isDeployed) {
       handleCipherTransitionDeployedPlayer(playerId, sp.player, source + "_deployed");
       clearTransitionSpawnStateForPlayer(playerId);
-      return;
+      continue;
     }
 
     const lastAttemptTick = transitionSpawnLastAttemptTickByPlayerId[playerId] ?? -999999;
@@ -10187,7 +10256,7 @@ function processTransitionSpawnQueue(source: string): void {
             String(playerId) + "/" + source + "/" + getTransitionSpawnQueueSnapshot()
           )
         );
-        return;
+        continue;
       }
 
       transitionSpawnInFlightByPlayerId[playerId] = false;
@@ -10214,7 +10283,7 @@ function processTransitionSpawnQueue(source: string): void {
           String(playerId) + "/" + source + "/" + getTransitionSpawnQueueSnapshot()
         )
       );
-      return;
+      continue;
     }
 
     const team = mod.GetTeam(sp.player);
@@ -10243,7 +10312,7 @@ function processTransitionSpawnQueue(source: string): void {
           String(playerId) + "/" + source + "/" + String(spawnerObjId) + "/" + getTransitionSpawnQueueSnapshot()
         )
       );
-      return;
+      continue;
     }
 
     transitionSpawnInFlightByPlayerId[playerId] = true;
@@ -10267,18 +10336,18 @@ function processTransitionSpawnQueue(source: string): void {
         )
       );
     }
-  });
+  }
 
   let undeployedCount = 0;
   let undeployedRequestedCount = 0;
-  serverPlayers.forEach((sp) => {
-    if (!sp) return;
-    if (sp.isDeployed) return;
+  for (let i = 0; i < players.length; i++) {
+    const sp = players[i];
+    if (sp.isDeployed) continue;
     undeployedCount += 1;
     if (transitionSpawnRequestedByPlayerId[sp.id] === true) {
       undeployedRequestedCount += 1;
     }
-  });
+  }
 
   if (requestedCount <= 0 && undeployedCount > 0 && undeployedRequestedCount <= 0) {
     warnTransitionSpawnOnce(
@@ -10293,18 +10362,19 @@ function processTransitionSpawnQueue(source: string): void {
 
 function validatePreLivePlayerTeamsFromEngine(): boolean {
   let valid = true;
+  const players = getValidHumanPlayersSnapshot();
 
-  serverPlayers.forEach((sp) => {
-    if (!sp) return;
-    if (!mod.IsPlayerValid(sp.player)) return;
+  for (let i = 0; i < players.length; i++) {
+    const sp = players[i];
+    if (!mod.IsPlayerValid(sp.player)) continue;
 
     const team = mod.GetTeam(sp.player);
     sp.setTeam();
 
-    if (mod.Equals(team, team1) || mod.Equals(team, team2)) return;
+    if (mod.Equals(team, team1) || mod.Equals(team, team2)) continue;
     valid = false;
 
-    if (preliveTeamSanityWarnedByPlayerId[sp.id] === true) return;
+    if (preliveTeamSanityWarnedByPlayerId[sp.id] === true) continue;
     preliveTeamSanityWarnedByPlayerId[sp.id] = true;
 
     warnTransitionSpawnOnce(
@@ -10316,11 +10386,11 @@ function validatePreLivePlayerTeamsFromEngine(): boolean {
           String(modlib.getTeamId(team)) +
           "/" +
           String(gameStatus) +
-          "/" +
-          getInitializationFlagSummary()
+        "/" +
+        getInitializationFlagSummary()
       )
     );
-  });
+  }
 
   return valid;
 }
@@ -12775,6 +12845,8 @@ function getTopHudFlagContainerWidgetName(lane: TopHudLane): string {
 }
 
 function setLiveScorePanelVisible(visible: boolean): void {
+  // Always hide the old/shared Squad Obliteration HUD.
+  // Cipher uses per-player widgets now.
   const rootHudWidgets = [
     "BG_Score_Container",
     "Container_A",
@@ -12783,6 +12855,8 @@ function setLiveScorePanelVisible(visible: boolean): void {
     "Container_D",
     "friendlyscore",
     "enemyscore",
+    "matchtime",
+    "LiveTimerIntroContainer",
   ];
 
   for (let i = 0; i < rootHudWidgets.length; i++) {
@@ -12791,53 +12865,128 @@ function setLiveScorePanelVisible(visible: boolean): void {
     SafeSetWidgetVisibleHandle(widget, false);
   }
 
+  // Hard hide everything when leaving live/postmatch/prelive/countdown.
+  if (!visible) {
+    hideCipherLiveHudForAllPlayersHard();
+    return;
+  }
+
   serverPlayers.forEach((p) => {
+    if (!p) return;
+
     const playerId = p.id;
-    const perPlayerWidgets = [
+
+    // Core live score HUD.
+    // These should show during live.
+    const coreLiveHudWidgets = [
       getPlayerLiveHudRootWidgetName(playerId),
+
       CIPHER_LIVE_PANEL_WIDGET_NAME_PREFIX + playerId,
+
+      CIPHER_LIVE_TIME_BOX_WIDGET_NAME_PREFIX + playerId,
+      CIPHER_LIVE_TIME_TEXT_WIDGET_NAME_PREFIX + playerId,
+
       CIPHER_FRIENDLY_SCORE_BOX_WIDGET_NAME_PREFIX + playerId,
       CIPHER_ENEMY_SCORE_BOX_WIDGET_NAME_PREFIX + playerId,
       CIPHER_FRIENDLY_SCORE_TEXT_WIDGET_NAME_PREFIX + playerId,
       CIPHER_ENEMY_SCORE_TEXT_WIDGET_NAME_PREFIX + playerId,
-      CIPHER_LIVE_TIME_BOX_WIDGET_NAME_PREFIX + playerId,
-      CIPHER_LIVE_TIME_TEXT_WIDGET_NAME_PREFIX + playerId,
+
+      CIPHER_LIVE_STATUS_CONTAINER_WIDGET_NAME_PREFIX + playerId,
       CIPHER_LIVE_STATUS_WIDGET_NAME_PREFIX + playerId,
-      CIPHER_LIVE_CARRIER_STATUS_WIDGET_NAME_PREFIX + playerId,
+
       CIPHER_FRIENDLY_PROGRESS_BG_WIDGET_NAME_PREFIX + playerId,
-      CIPHER_FRIENDLY_PROGRESS_FILL_WIDGET_NAME_PREFIX + playerId,
       CIPHER_ENEMY_PROGRESS_BG_WIDGET_NAME_PREFIX + playerId,
-      CIPHER_ENEMY_PROGRESS_FILL_WIDGET_NAME_PREFIX + playerId,
-      BOMB_NOTICE_CONTAINER_WIDGET_NAME_PREFIX + playerId,
-      BOMB_NOTICE_WIDGET_NAME_PREFIX + playerId,
-      BOMB_NOTICE_LEFT_ACCENT_WIDGET_NAME_PREFIX + playerId,
-      BOMB_NOTICE_RIGHT_ACCENT_WIDGET_NAME_PREFIX + playerId,
-      BOMB_NOTICE_DETAIL_WIDGET_NAME_PREFIX + playerId,
-      BOMB_NOTICE_PLAYER_CONTAINER_WIDGET_NAME_PREFIX + playerId,
-      BOMB_NOTICE_PLAYER_TEXT_WIDGET_NAME_PREFIX + playerId,
     ];
 
-    for (let i = 0; i < perPlayerWidgets.length; i++) {
-      const widget = mod.FindUIWidgetWithName(perPlayerWidgets[i]);
-      if (!widget) continue;
-      if (visible && (
-        perPlayerWidgets[i] === CIPHER_LIVE_CARRIER_STATUS_WIDGET_NAME_PREFIX + playerId ||
-        perPlayerWidgets[i] === BOMB_NOTICE_CONTAINER_WIDGET_NAME_PREFIX + playerId ||
-        perPlayerWidgets[i] === BOMB_NOTICE_WIDGET_NAME_PREFIX + playerId ||
-        perPlayerWidgets[i] === BOMB_NOTICE_LEFT_ACCENT_WIDGET_NAME_PREFIX + playerId ||
-        perPlayerWidgets[i] === BOMB_NOTICE_RIGHT_ACCENT_WIDGET_NAME_PREFIX + playerId ||
-        perPlayerWidgets[i] === BOMB_NOTICE_DETAIL_WIDGET_NAME_PREFIX + playerId ||
-        perPlayerWidgets[i] === BOMB_NOTICE_PLAYER_CONTAINER_WIDGET_NAME_PREFIX + playerId ||
-        perPlayerWidgets[i] === BOMB_NOTICE_PLAYER_TEXT_WIDGET_NAME_PREFIX + playerId
-      )) continue;
-      SafeSetWidgetVisibleHandle(widget, visible);
+    for (let i = 0; i < coreLiveHudWidgets.length; i++) {
+      const widget = SafeFindWidget(coreLiveHudWidgets[i]);
+      SafeSetWidgetVisibleHandle(widget, true);
     }
+
+    // Runtime-controlled widgets are NOT force-shown here.
+    // Their own systems decide when to show:
+    // - carrier text
+    // - ticker fills
+    // - key event banner
+    // - dropped key banner
+    // - next key unlock countdown
+    UpdateTopTicketBarsForPlayer(p);
   });
 
-  if (visible) {
-    UpdateBombCarrierUiForAllPlayers();
-    refreshBombNoticeUiForAllPlayers();
+  SetUITime();
+  UpdateBombCarrierUiForAllPlayers();
+  refreshBombNoticeUiForAllPlayers();
+  refreshNextKeyUnlockHudForAllPlayers(undefined, true);
+}
+
+function forceHideCipherLiveHudForPlayer(p: Player): void {
+  const playerId = p.id;
+
+  const widgets = [
+    getPlayerLiveHudRootWidgetName(playerId),
+
+    CIPHER_LIVE_PANEL_WIDGET_NAME_PREFIX + playerId,
+
+    CIPHER_LIVE_TIME_BOX_WIDGET_NAME_PREFIX + playerId,
+    CIPHER_LIVE_TIME_TEXT_WIDGET_NAME_PREFIX + playerId,
+
+    CIPHER_FRIENDLY_SCORE_BOX_WIDGET_NAME_PREFIX + playerId,
+    CIPHER_ENEMY_SCORE_BOX_WIDGET_NAME_PREFIX + playerId,
+    CIPHER_FRIENDLY_SCORE_TEXT_WIDGET_NAME_PREFIX + playerId,
+    CIPHER_ENEMY_SCORE_TEXT_WIDGET_NAME_PREFIX + playerId,
+
+    CIPHER_LIVE_STATUS_CONTAINER_WIDGET_NAME_PREFIX + playerId,
+    CIPHER_LIVE_STATUS_WIDGET_NAME_PREFIX + playerId,
+    CIPHER_LIVE_CARRIER_STATUS_WIDGET_NAME_PREFIX + playerId,
+
+    CIPHER_FRIENDLY_PROGRESS_BG_WIDGET_NAME_PREFIX + playerId,
+    CIPHER_FRIENDLY_PROGRESS_FILL_WIDGET_NAME_PREFIX + playerId,
+    CIPHER_ENEMY_PROGRESS_BG_WIDGET_NAME_PREFIX + playerId,
+    CIPHER_ENEMY_PROGRESS_FILL_WIDGET_NAME_PREFIX + playerId,
+
+    BOMB_NOTICE_CONTAINER_WIDGET_NAME_PREFIX + playerId,
+    BOMB_NOTICE_WIDGET_NAME_PREFIX + playerId,
+    BOMB_NOTICE_LEFT_ACCENT_WIDGET_NAME_PREFIX + playerId,
+    BOMB_NOTICE_RIGHT_ACCENT_WIDGET_NAME_PREFIX + playerId,
+    BOMB_NOTICE_DROPPED_OUTLINE_WIDGET_NAME_PREFIX + playerId,
+    BOMB_NOTICE_DETAIL_WIDGET_NAME_PREFIX + playerId,
+    BOMB_NOTICE_PLAYER_CONTAINER_WIDGET_NAME_PREFIX + playerId,
+    BOMB_NOTICE_PLAYER_TEXT_WIDGET_NAME_PREFIX + playerId,
+
+    NEXT_KEY_UNLOCK_CONTAINER_WIDGET_NAME_PREFIX + playerId,
+    NEXT_KEY_UNLOCK_WIDGET_NAME_PREFIX + playerId,
+  ];
+
+  for (let i = 0; i < widgets.length; i++) {
+    const widget = mod.FindUIWidgetWithName(widgets[i]);
+    if (!widget) continue;
+    SafeSetWidgetVisibleHandle(widget, false);
   }
+
+  // These are the stubborn fill containers that were surviving into postmatch.
+  // Hide them by visibility AND alpha.
+  const fillWidgets = [
+    CIPHER_FRIENDLY_PROGRESS_FILL_WIDGET_NAME_PREFIX + playerId,
+    CIPHER_ENEMY_PROGRESS_FILL_WIDGET_NAME_PREFIX + playerId,
+  ];
+
+  for (let i = 0; i < fillWidgets.length; i++) {
+    const widget = mod.FindUIWidgetWithName(fillWidgets[i]);
+    if (!widget) continue;
+    SafeSetWidgetVisibleHandle(widget, false);
+    try { mod.SetUIWidgetBgAlpha(widget, 0); } catch (_errAlpha) {}
+  }
+}
+
+function hideCipherLiveHudForAllPlayersHard(): void {
+  serverPlayers.forEach((p) => {
+    if (!p) return;
+    forceHideCipherLiveHudForPlayer(p);
+  });
+}
+
+function hideCipherLiveHudForAllPlayers(): void {
+  hideCipherLiveHudForAllPlayersHard();
 }
 
 /* -----------------------------------------------------------------------------------------------
@@ -13567,32 +13716,55 @@ const CIPHER_FRIENDLY_PROGRESS_BG_WIDGET_NAME_PREFIX = "Container_FRIENDLY_TICKE
 const CIPHER_FRIENDLY_PROGRESS_FILL_WIDGET_NAME_PREFIX = "Container_FRIENDLY_TICKER_FILL_";
 const CIPHER_ENEMY_PROGRESS_BG_WIDGET_NAME_PREFIX = "Container_ENEMY_TICKER_BG_";
 const CIPHER_ENEMY_PROGRESS_FILL_WIDGET_NAME_PREFIX = "Container_ENEMY_TICKER_FILL_";
-const CIPHER_LIVE_PANEL_POS = mod.CreateVector(-700, -446, 0);
+// -------------------------------------------------------------------------------------------------
+// Cipher live HUD positions
+// Score panel stays TopLeft.
+// Event banner and next-key countdown use Center anchor with X = 0.
+// -------------------------------------------------------------------------------------------------
+
+// -------------------------------------------------------------------------------------------------
+// Score panel nudged down a little.
+// Old top was 42. New top is 60.
+// -------------------------------------------------------------------------------------------------
+
+const CIPHER_LIVE_PANEL_POS = mod.CreateVector(42, 60, 0);
 const CIPHER_LIVE_PANEL_SIZE = mod.CreateVector(268, 104, 0);
-const CIPHER_SCORE_BOX_POS = mod.CreateVector(-88, -24, 0);
-const CIPHER_ENEMY_SCORE_BOX_POS = mod.CreateVector(-88, 22, 0);
+
+const CIPHER_SCORE_BOX_POS = mod.CreateVector(54, 69, 0);
+const CIPHER_ENEMY_SCORE_BOX_POS = mod.CreateVector(54, 115, 0);
 const CIPHER_SCORE_BOX_SIZE = mod.CreateVector(68, 38, 0);
-const CIPHER_LIVE_TIME_BOX_POS = mod.CreateVector(-88, -64, 0);
-const CIPHER_LIVE_TIME_BOX_SIZE = mod.CreateVector(68, 38, 0);
+
+const CIPHER_LIVE_TIME_BOX_POS = mod.CreateVector(36, 17, 0);
+const CIPHER_LIVE_TIME_BOX_SIZE = mod.CreateVector(100, 50, 0);
+const CIPHER_LIVE_TIME_TEXT_POS = mod.CreateVector(36, 17, 0);
 const CIPHER_LIVE_TIME_TEXT_SIZE = mod.CreateVector(100, 50, 0);
-const CIPHER_LIVE_STATUS_POS = mod.CreateVector(-4, -64, 0);
+const CIPHER_LIVE_TIME_TEXT_FONT_SIZE = 24;
+
+const CIPHER_LIVE_STATUS_POS = mod.CreateVector(122, 23, 0);
 const CIPHER_LIVE_STATUS_SIZE = mod.CreateVector(100, 50, 0);
-const CIPHER_FRIENDLY_PROGRESS_POS = mod.CreateVector(40, -24, 0);
-const CIPHER_ENEMY_PROGRESS_POS = mod.CreateVector(40, 22, 0);
+
+const CIPHER_FRIENDLY_PROGRESS_POS = mod.CreateVector(122, 77, 0);
+const CIPHER_ENEMY_PROGRESS_POS = mod.CreateVector(122, 123, 0);
+
 const CIPHER_SCORE_PROGRESS_WIDTH = 188;
 const CIPHER_SCORE_PROGRESS_HEIGHT = 22;
-const CIPHER_SCORE_PROGRESS_SIZE = mod.CreateVector(CIPHER_SCORE_PROGRESS_WIDTH, CIPHER_SCORE_PROGRESS_HEIGHT, 0);
 const CIPHER_SCORE_TICKER_CAP = 8;
-const CIPHER_LIVE_CARRIER_STATUS_POS = mod.CreateVector(-8, 80, 0);
+
+const CIPHER_LIVE_CARRIER_STATUS_POS = mod.CreateVector(34, 140, 0);
 const CIPHER_LIVE_CARRIER_STATUS_SIZE = mod.CreateVector(276, 50, 0);
+
 const CIPHER_SCORE_TEXT_SIZE = 24;
 const CIPHER_STATUS_TEXT_SIZE = 20;
-const CIPHER_CARRIER_STATUS_TEXT_SIZE = 18;
+
+// Half size from 18. This fixes "YOU ARE CARRYING KEY" being too big.
+const CIPHER_CARRIER_STATUS_TEXT_SIZE = 9;
+
 const BOMB_CARRIER_WIDGET_NAME_PREFIX = CIPHER_LIVE_CARRIER_STATUS_WIDGET_NAME_PREFIX;
 const BOMB_CARRIER_WIDGET_POS = CIPHER_LIVE_CARRIER_STATUS_POS;
 const BOMB_CARRIER_WIDGET_SIZE = CIPHER_LIVE_CARRIER_STATUS_SIZE;
 const BOMB_CARRIER_WIDGET_BG_COLOR = CIPHER_UI_PANEL_BG_COLOR;
 const BOMB_CARRIER_WIDGET_TEXT_COLOR = mod.CreateVector(1, 1, 1);
+
 const BOMB_NOTICE_CONTAINER_WIDGET_NAME_PREFIX = "Container_KEY_EVENT_BANNER_";
 const BOMB_NOTICE_LEFT_ACCENT_WIDGET_NAME_PREFIX = "Container_OUTLINE_";
 const BOMB_NOTICE_RIGHT_ACCENT_WIDGET_NAME_PREFIX = "Container_DROPPED_KEY_";
@@ -13601,30 +13773,47 @@ const BOMB_NOTICE_WIDGET_NAME_PREFIX = "Text_KEY_EVENT_TEXT_";
 const BOMB_NOTICE_DETAIL_WIDGET_NAME_PREFIX = "Text_DROPPED_KEY_";
 const BOMB_NOTICE_PLAYER_CONTAINER_WIDGET_NAME_PREFIX = "Container_PLAYER_NAME_";
 const BOMB_NOTICE_PLAYER_TEXT_WIDGET_NAME_PREFIX = "Text_PLAYER_NAME_";
-const BOMB_NOTICE_WIDGET_POS = mod.CreateVector(0, -348, 0);
-const BOMB_NOTICE_OUTLINE_POS = mod.CreateVector(0, 0, 0);
-const BOMB_NOTICE_TEXT_POS = mod.CreateVector(0, 0, 0);
+
+// Center event banner.
+// X = 0 means true screen center.
+// Y is raised higher than before.
+const CIPHER_EVENT_BANNER_CENTER_Y = -382;
+// This is the "NEXT KEY UNLOCKS IN 00:17" countdown banner.
+// More negative Y = higher on screen.
+const CIPHER_NEXT_KEY_BANNER_CENTER_Y = CIPHER_EVENT_BANNER_CENTER_Y - 75;
+
+const BOMB_NOTICE_WIDGET_POS = mod.CreateVector(0, CIPHER_EVENT_BANNER_CENTER_Y, 0);
+const BOMB_NOTICE_OUTLINE_POS = BOMB_NOTICE_WIDGET_POS;
+const BOMB_NOTICE_TEXT_POS = BOMB_NOTICE_WIDGET_POS;
+
 const BOMB_NOTICE_CONTAINER_SIZE = mod.CreateVector(464, 72, 0);
-const BOMB_NOTICE_WIDGET_SIZE = mod.CreateVector(298, 50, 0);
-const BOMB_DROPPED_NOTICE_POS = mod.CreateVector(-759, -236, 0);
+const BOMB_NOTICE_WIDGET_SIZE = mod.CreateVector(430, 50, 0);
+
+// Left-side dropped-key banner.
+const BOMB_DROPPED_NOTICE_POS = mod.CreateVector(42, 276, 0);
 const BOMB_DROPPED_NOTICE_SIZE = mod.CreateVector(318, 56, 0);
-const BOMB_DROPPED_NOTICE_TEXT_POS = mod.CreateVector(0, 0, 0);
+const BOMB_DROPPED_NOTICE_TEXT_POS = mod.CreateVector(70, 279, 0);
 const BOMB_DROPPED_NOTICE_TEXT_SIZE_VECTOR = mod.CreateVector(262, 50, 0);
-const BOMB_DROPPED_PLAYER_CONTAINER_POS = mod.CreateVector(-74, -46, 0);
+const BOMB_DROPPED_PLAYER_CONTAINER_POS = mod.CreateVector(41, 242, 0);
 const BOMB_DROPPED_PLAYER_CONTAINER_SIZE = mod.CreateVector(172, 32, 0);
-const BOMB_DROPPED_PLAYER_TEXT_POS = mod.CreateVector(0, -9, 0);
+const BOMB_DROPPED_PLAYER_TEXT_POS = mod.CreateVector(41, 233, 0);
 const BOMB_DROPPED_PLAYER_TEXT_SIZE_VECTOR = mod.CreateVector(100, 50, 0);
+
 const BOMB_NOTICE_WIDGET_BG_COLOR = CIPHER_UI_PANEL_BG_COLOR;
 const BOMB_NOTICE_WIDGET_TEXT_COLOR = mod.CreateVector(1, 1, 1);
 const BOMB_NOTICE_WIDGET_TEXT_SIZE = 30;
 const BOMB_NOTICE_DETAIL_TEXT_SIZE = 24;
 const BOMB_NOTICE_PLAYER_TEXT_SIZE = 24;
 const BOMB_NOTICE_DURATION_SECONDS = 4.0;
+
 const NEXT_KEY_UNLOCK_CONTAINER_WIDGET_NAME_PREFIX = "Container_NextKeyUnlock_";
 const NEXT_KEY_UNLOCK_WIDGET_NAME_PREFIX = "Text_NextKeyUnlock_";
-const NEXT_KEY_UNLOCK_WIDGET_POS = mod.CreateVector(0, -466, 0);
-const NEXT_KEY_UNLOCK_CONTAINER_SIZE = mod.CreateVector(676, 46, 0);
-const NEXT_KEY_UNLOCK_WIDGET_SIZE = mod.CreateVector(554, 38, 0);
+
+// Key unlock countdown uses the same centered raised banner lane.
+const NEXT_KEY_UNLOCK_WIDGET_POS = mod.CreateVector(0, CIPHER_NEXT_KEY_BANNER_CENTER_Y, 0);
+const NEXT_KEY_UNLOCK_TEXT_POS = NEXT_KEY_UNLOCK_WIDGET_POS;
+const NEXT_KEY_UNLOCK_CONTAINER_SIZE = BOMB_NOTICE_CONTAINER_SIZE;
+const NEXT_KEY_UNLOCK_WIDGET_SIZE = mod.CreateVector(430, 50, 0);
 const NEXT_KEY_UNLOCK_WIDGET_BG_COLOR = BOMB_NOTICE_WIDGET_BG_COLOR;
 const NEXT_KEY_UNLOCK_WIDGET_TEXT_COLOR = mod.CreateVector(1, 1, 1);
 const NEXT_KEY_UNLOCK_WIDGET_TEXT_SIZE = 24;
@@ -13705,18 +13894,18 @@ function deleteLegacyPlayerLiveHudWidgets(playerId: number): void {
 }
 
 function bindPlayerTopScoreWidgetRefs(p: Player): void {
-  p.friendlyScoreWidget = mod.FindUIWidgetWithName(CIPHER_FRIENDLY_SCORE_TEXT_WIDGET_NAME_PREFIX + p.id);
-  p.opponentScoreWidget = mod.FindUIWidgetWithName(CIPHER_ENEMY_SCORE_TEXT_WIDGET_NAME_PREFIX + p.id);
+  p.friendlyScoreWidget = SafeFindWidget(CIPHER_FRIENDLY_SCORE_TEXT_WIDGET_NAME_PREFIX + p.id) as any;
+  p.opponentScoreWidget = SafeFindWidget(CIPHER_ENEMY_SCORE_TEXT_WIDGET_NAME_PREFIX + p.id) as any;
   p.friendlyScorePadWidget = null as any;
   p.opponentScorePadWidget = null as any;
-  p.bombCarrierTextWidget = mod.FindUIWidgetWithName(BOMB_CARRIER_WIDGET_NAME_PREFIX + p.id);
-  p.bombNoticeContainerWidget = mod.FindUIWidgetWithName(BOMB_NOTICE_CONTAINER_WIDGET_NAME_PREFIX + p.id);
-  p.bombNoticeLeftAccentWidget = mod.FindUIWidgetWithName(BOMB_NOTICE_LEFT_ACCENT_WIDGET_NAME_PREFIX + p.id);
-  p.bombNoticeRightAccentWidget = mod.FindUIWidgetWithName(BOMB_NOTICE_RIGHT_ACCENT_WIDGET_NAME_PREFIX + p.id);
-  p.bombNoticeTextWidget = mod.FindUIWidgetWithName(BOMB_NOTICE_WIDGET_NAME_PREFIX + p.id);
-  p.bombNoticeDetailWidget = mod.FindUIWidgetWithName(BOMB_NOTICE_DETAIL_WIDGET_NAME_PREFIX + p.id);
-  p.nextKeyUnlockContainerWidget = mod.FindUIWidgetWithName(NEXT_KEY_UNLOCK_CONTAINER_WIDGET_NAME_PREFIX + p.id);
-  p.nextKeyUnlockTextWidget = mod.FindUIWidgetWithName(NEXT_KEY_UNLOCK_WIDGET_NAME_PREFIX + p.id);
+  p.bombCarrierTextWidget = SafeFindWidget(BOMB_CARRIER_WIDGET_NAME_PREFIX + p.id) as any;
+  p.bombNoticeContainerWidget = SafeFindWidget(BOMB_NOTICE_CONTAINER_WIDGET_NAME_PREFIX + p.id) as any;
+  p.bombNoticeLeftAccentWidget = SafeFindWidget(BOMB_NOTICE_LEFT_ACCENT_WIDGET_NAME_PREFIX + p.id) as any;
+  p.bombNoticeRightAccentWidget = SafeFindWidget(BOMB_NOTICE_RIGHT_ACCENT_WIDGET_NAME_PREFIX + p.id) as any;
+  p.bombNoticeTextWidget = SafeFindWidget(BOMB_NOTICE_WIDGET_NAME_PREFIX + p.id) as any;
+  p.bombNoticeDetailWidget = SafeFindWidget(BOMB_NOTICE_DETAIL_WIDGET_NAME_PREFIX + p.id) as any;
+  p.nextKeyUnlockContainerWidget = SafeFindWidget(NEXT_KEY_UNLOCK_CONTAINER_WIDGET_NAME_PREFIX + p.id) as any;
+  p.nextKeyUnlockTextWidget = SafeFindWidget(NEXT_KEY_UNLOCK_WIDGET_NAME_PREFIX + p.id) as any;
   p.bombCarrierUiLastVisible = false;
   p.bombCarrierUiLastVersion = -1;
   p.bombCarrierUiLastAlphaBucket = -1;
@@ -13726,14 +13915,14 @@ function bindPlayerTopScoreWidgetRefs(p: Player): void {
 }
 
 function bindPlayerCipherKeyHudWidgetRefs(p: Player, force: boolean = false): void {
-  if (force || !p.bombCarrierTextWidget) p.bombCarrierTextWidget = mod.FindUIWidgetWithName(BOMB_CARRIER_WIDGET_NAME_PREFIX + p.id);
-  if (force || !p.bombNoticeContainerWidget) p.bombNoticeContainerWidget = mod.FindUIWidgetWithName(BOMB_NOTICE_CONTAINER_WIDGET_NAME_PREFIX + p.id);
-  if (force || !p.bombNoticeLeftAccentWidget) p.bombNoticeLeftAccentWidget = mod.FindUIWidgetWithName(BOMB_NOTICE_LEFT_ACCENT_WIDGET_NAME_PREFIX + p.id);
-  if (force || !p.bombNoticeRightAccentWidget) p.bombNoticeRightAccentWidget = mod.FindUIWidgetWithName(BOMB_NOTICE_RIGHT_ACCENT_WIDGET_NAME_PREFIX + p.id);
-  if (force || !p.bombNoticeTextWidget) p.bombNoticeTextWidget = mod.FindUIWidgetWithName(BOMB_NOTICE_WIDGET_NAME_PREFIX + p.id);
-  if (force || !p.bombNoticeDetailWidget) p.bombNoticeDetailWidget = mod.FindUIWidgetWithName(BOMB_NOTICE_DETAIL_WIDGET_NAME_PREFIX + p.id);
-  if (force || !p.nextKeyUnlockTextWidget) p.nextKeyUnlockTextWidget = mod.FindUIWidgetWithName(NEXT_KEY_UNLOCK_WIDGET_NAME_PREFIX + p.id);
-  if (force || !p.nextKeyUnlockContainerWidget) p.nextKeyUnlockContainerWidget = mod.FindUIWidgetWithName(NEXT_KEY_UNLOCK_CONTAINER_WIDGET_NAME_PREFIX + p.id);
+  if (force || !p.bombCarrierTextWidget) p.bombCarrierTextWidget = SafeFindWidget(BOMB_CARRIER_WIDGET_NAME_PREFIX + p.id) as any;
+  if (force || !p.bombNoticeContainerWidget) p.bombNoticeContainerWidget = SafeFindWidget(BOMB_NOTICE_CONTAINER_WIDGET_NAME_PREFIX + p.id) as any;
+  if (force || !p.bombNoticeLeftAccentWidget) p.bombNoticeLeftAccentWidget = SafeFindWidget(BOMB_NOTICE_LEFT_ACCENT_WIDGET_NAME_PREFIX + p.id) as any;
+  if (force || !p.bombNoticeRightAccentWidget) p.bombNoticeRightAccentWidget = SafeFindWidget(BOMB_NOTICE_RIGHT_ACCENT_WIDGET_NAME_PREFIX + p.id) as any;
+  if (force || !p.bombNoticeTextWidget) p.bombNoticeTextWidget = SafeFindWidget(BOMB_NOTICE_WIDGET_NAME_PREFIX + p.id) as any;
+  if (force || !p.bombNoticeDetailWidget) p.bombNoticeDetailWidget = SafeFindWidget(BOMB_NOTICE_DETAIL_WIDGET_NAME_PREFIX + p.id) as any;
+  if (force || !p.nextKeyUnlockTextWidget) p.nextKeyUnlockTextWidget = SafeFindWidget(NEXT_KEY_UNLOCK_WIDGET_NAME_PREFIX + p.id) as any;
+  if (force || !p.nextKeyUnlockContainerWidget) p.nextKeyUnlockContainerWidget = SafeFindWidget(NEXT_KEY_UNLOCK_CONTAINER_WIDGET_NAME_PREFIX + p.id) as any;
   markCipherKeyHudReadyForPlayer(p.id, hasCipherKeyHudWidgetRefs(p));
 }
 
@@ -13792,37 +13981,37 @@ function setTopScoreWidgetDepthForPlayer(playerId: number): void {
   ];
 
   for (let i = 0; i < names.length; i++) {
-    const widget = mod.FindUIWidgetWithName(names[i]);
+    const widget = SafeFindWidget(names[i]);
     if (!widget) continue;
-    mod.SetUIWidgetDepth(widget, mod.UIDepth.AboveGameUI);
+    SafeSetWidgetDepthHandle(widget, mod.UIDepth.AboveGameUI);
   }
 }
 
 
 function hasValidRootTopScoreWidgets(playerId: number): boolean {
-  const liveHudRoot = mod.FindUIWidgetWithName(getPlayerLiveHudRootWidgetName(playerId));
-  const friendlyScore = mod.FindUIWidgetWithName(CIPHER_FRIENDLY_SCORE_TEXT_WIDGET_NAME_PREFIX + playerId);
-  const enemyScore = mod.FindUIWidgetWithName(CIPHER_ENEMY_SCORE_TEXT_WIDGET_NAME_PREFIX + playerId);
-  const friendlyScoreBox = mod.FindUIWidgetWithName(CIPHER_FRIENDLY_SCORE_BOX_WIDGET_NAME_PREFIX + playerId);
-  const enemyScoreBox = mod.FindUIWidgetWithName(CIPHER_ENEMY_SCORE_BOX_WIDGET_NAME_PREFIX + playerId);
-  const timeBox = mod.FindUIWidgetWithName(CIPHER_LIVE_TIME_BOX_WIDGET_NAME_PREFIX + playerId);
-  const timeText = mod.FindUIWidgetWithName(CIPHER_LIVE_TIME_TEXT_WIDGET_NAME_PREFIX + playerId);
-  const livePanel = mod.FindUIWidgetWithName(CIPHER_LIVE_PANEL_WIDGET_NAME_PREFIX + playerId);
-  const liveStatus = mod.FindUIWidgetWithName(CIPHER_LIVE_STATUS_WIDGET_NAME_PREFIX + playerId);
-  const carrierStatus = mod.FindUIWidgetWithName(CIPHER_LIVE_CARRIER_STATUS_WIDGET_NAME_PREFIX + playerId);
-  const friendlyProgressBg = mod.FindUIWidgetWithName(CIPHER_FRIENDLY_PROGRESS_BG_WIDGET_NAME_PREFIX + playerId);
-  const friendlyProgressFill = mod.FindUIWidgetWithName(CIPHER_FRIENDLY_PROGRESS_FILL_WIDGET_NAME_PREFIX + playerId);
-  const enemyProgressBg = mod.FindUIWidgetWithName(CIPHER_ENEMY_PROGRESS_BG_WIDGET_NAME_PREFIX + playerId);
-  const enemyProgressFill = mod.FindUIWidgetWithName(CIPHER_ENEMY_PROGRESS_FILL_WIDGET_NAME_PREFIX + playerId);
-  const bombCarrier = mod.FindUIWidgetWithName(BOMB_CARRIER_WIDGET_NAME_PREFIX + playerId);
-  const bombNoticeContainer = mod.FindUIWidgetWithName(BOMB_NOTICE_CONTAINER_WIDGET_NAME_PREFIX + playerId);
-  const bombNoticeLeftAccent = mod.FindUIWidgetWithName(BOMB_NOTICE_LEFT_ACCENT_WIDGET_NAME_PREFIX + playerId);
-  const bombNoticeRightAccent = mod.FindUIWidgetWithName(BOMB_NOTICE_RIGHT_ACCENT_WIDGET_NAME_PREFIX + playerId);
-  const bombNotice = mod.FindUIWidgetWithName(BOMB_NOTICE_WIDGET_NAME_PREFIX + playerId);
-  const bombNoticeDetail = mod.FindUIWidgetWithName(BOMB_NOTICE_DETAIL_WIDGET_NAME_PREFIX + playerId);
-  const bombNoticePlayer = mod.FindUIWidgetWithName(BOMB_NOTICE_PLAYER_TEXT_WIDGET_NAME_PREFIX + playerId);
-  const nextKeyUnlockContainer = mod.FindUIWidgetWithName(NEXT_KEY_UNLOCK_CONTAINER_WIDGET_NAME_PREFIX + playerId);
-  const nextKeyUnlock = mod.FindUIWidgetWithName(NEXT_KEY_UNLOCK_WIDGET_NAME_PREFIX + playerId);
+  const liveHudRoot = SafeFindWidget(getPlayerLiveHudRootWidgetName(playerId));
+  const friendlyScore = SafeFindWidget(CIPHER_FRIENDLY_SCORE_TEXT_WIDGET_NAME_PREFIX + playerId);
+  const enemyScore = SafeFindWidget(CIPHER_ENEMY_SCORE_TEXT_WIDGET_NAME_PREFIX + playerId);
+  const friendlyScoreBox = SafeFindWidget(CIPHER_FRIENDLY_SCORE_BOX_WIDGET_NAME_PREFIX + playerId);
+  const enemyScoreBox = SafeFindWidget(CIPHER_ENEMY_SCORE_BOX_WIDGET_NAME_PREFIX + playerId);
+  const timeBox = SafeFindWidget(CIPHER_LIVE_TIME_BOX_WIDGET_NAME_PREFIX + playerId);
+  const timeText = SafeFindWidget(CIPHER_LIVE_TIME_TEXT_WIDGET_NAME_PREFIX + playerId);
+  const livePanel = SafeFindWidget(CIPHER_LIVE_PANEL_WIDGET_NAME_PREFIX + playerId);
+  const liveStatus = SafeFindWidget(CIPHER_LIVE_STATUS_WIDGET_NAME_PREFIX + playerId);
+  const carrierStatus = SafeFindWidget(CIPHER_LIVE_CARRIER_STATUS_WIDGET_NAME_PREFIX + playerId);
+  const friendlyProgressBg = SafeFindWidget(CIPHER_FRIENDLY_PROGRESS_BG_WIDGET_NAME_PREFIX + playerId);
+  const friendlyProgressFill = SafeFindWidget(CIPHER_FRIENDLY_PROGRESS_FILL_WIDGET_NAME_PREFIX + playerId);
+  const enemyProgressBg = SafeFindWidget(CIPHER_ENEMY_PROGRESS_BG_WIDGET_NAME_PREFIX + playerId);
+  const enemyProgressFill = SafeFindWidget(CIPHER_ENEMY_PROGRESS_FILL_WIDGET_NAME_PREFIX + playerId);
+  const bombCarrier = SafeFindWidget(BOMB_CARRIER_WIDGET_NAME_PREFIX + playerId);
+  const bombNoticeContainer = SafeFindWidget(BOMB_NOTICE_CONTAINER_WIDGET_NAME_PREFIX + playerId);
+  const bombNoticeLeftAccent = SafeFindWidget(BOMB_NOTICE_LEFT_ACCENT_WIDGET_NAME_PREFIX + playerId);
+  const bombNoticeRightAccent = SafeFindWidget(BOMB_NOTICE_RIGHT_ACCENT_WIDGET_NAME_PREFIX + playerId);
+  const bombNotice = SafeFindWidget(BOMB_NOTICE_WIDGET_NAME_PREFIX + playerId);
+  const bombNoticeDetail = SafeFindWidget(BOMB_NOTICE_DETAIL_WIDGET_NAME_PREFIX + playerId);
+  const bombNoticePlayer = SafeFindWidget(BOMB_NOTICE_PLAYER_TEXT_WIDGET_NAME_PREFIX + playerId);
+  const nextKeyUnlockContainer = SafeFindWidget(NEXT_KEY_UNLOCK_CONTAINER_WIDGET_NAME_PREFIX + playerId);
+  const nextKeyUnlock = SafeFindWidget(NEXT_KEY_UNLOCK_WIDGET_NAME_PREFIX + playerId);
 
   if (
     !liveHudRoot ||
@@ -13898,402 +14087,401 @@ function rebuildPlayerTopScoreWidgets(p: Player): boolean {
   safeDeleteWidgetByName("Text_BombDroppedDeath" + playerId);
   safeDeleteWidgetByName(getPlayerLiveHudRootWidgetName(playerId));
 
-  try {
+  const addHudNode = (node: any): void => {
     modlib.ParseUI({
+      ...node,
+      playerId: targetPlayer,
+    });
+  };
+
+  try {
+    // Dummy root only exists so the rest of the runtime can find the player's live HUD root.
+    // The visible HUD pieces below are intentionally ROOT-positioned like the working Squad Obliteration HUD.
+    addHudNode({
       name: getPlayerLiveHudRootWidgetName(playerId),
       type: "Container",
       position: [0, 0],
-      size: [SAFE_UI_ROOT_WIDTH, SAFE_UI_ROOT_HEIGHT],
-      anchor: mod.UIAnchor.Center,
+      size: [1, 1],
+      anchor: mod.UIAnchor.TopLeft,
       visible: true,
       padding: 0,
-      bgColor: [0.7647, 0.7333, 0.7333],
+      bgColor: [0, 0, 0],
+      bgAlpha: 0,
+      bgFill: mod.UIBgFill.None,
+    });
+
+    // Score panel shell.
+    addHudNode({
+      name: CIPHER_LIVE_PANEL_WIDGET_NAME_PREFIX + playerId,
+      type: "Container",
+      position: [42, 60],
+      size: [268, 104],
+      anchor: mod.UIAnchor.TopLeft,
+      visible: true,
+      padding: 0,
+      bgColor: [0.2, 0.2, 0.2],
       bgAlpha: 1,
       bgFill: mod.UIBgFill.None,
-      playerId: targetPlayer,
-      children: [
-        {
-          name: CIPHER_LIVE_PANEL_WIDGET_NAME_PREFIX + playerId,
-          type: "Container",
-          position: [-700, -446],
-          size: [268, 104],
-          anchor: mod.UIAnchor.Center,
-          visible: true,
-          padding: 0,
-          bgColor: [0.2, 0.2, 0.2],
-          bgAlpha: 1,
-          bgFill: mod.UIBgFill.None,
-          playerId: targetPlayer,
-          children: [
-            {
-              name: CIPHER_LIVE_TIME_BOX_WIDGET_NAME_PREFIX + playerId,
-              type: "Container",
-              position: [-88, -64],
-              size: [68, 38],
-              anchor: mod.UIAnchor.Center,
-              visible: true,
-              padding: 0,
-              bgColor: [0.3294, 0.3686, 0.3882],
-              bgAlpha: 0.5,
-              bgFill: mod.UIBgFill.Blur,
-              playerId: targetPlayer,
-              children: [
-                {
-                  name: CIPHER_LIVE_TIME_TEXT_WIDGET_NAME_PREFIX + playerId,
-                  type: "Text",
-                  position: [0, 0],
-                  size: [100, 50],
-                  anchor: mod.UIAnchor.Center,
-                  visible: true,
-                  padding: 0,
-                  bgColor: [0.2, 0.2, 0.2],
-                  bgAlpha: 1,
-                  bgFill: mod.UIBgFill.None,
-                  textLabel: mod.stringkeys.TimeDefault,
-                  textColor: [1, 1, 1],
-                  textAlpha: 1,
-                  textSize: 20,
-                  textAnchor: mod.UIAnchor.Center,
-                  playerId: targetPlayer,
-                },
-              ],
-            },
-            {
-              name: CIPHER_FRIENDLY_SCORE_BOX_WIDGET_NAME_PREFIX + playerId,
-              type: "Container",
-              position: [-88, -24],
-              size: [68, 38],
-              anchor: mod.UIAnchor.Center,
-              visible: true,
-              padding: 0,
-              bgColor: [0.3294, 0.3686, 0.3882],
-              bgAlpha: 0.5,
-              bgFill: mod.UIBgFill.Blur,
-              playerId: targetPlayer,
-              children: [
-                {
-                  name: CIPHER_FRIENDLY_SCORE_TEXT_WIDGET_NAME_PREFIX + playerId,
-                  type: "Text",
-                  position: [0, 0],
-                  size: [100, 50],
-                  anchor: mod.UIAnchor.Center,
-                  visible: true,
-                  padding: 0,
-                  bgColor: [0.2, 0.2, 0.2],
-                  bgAlpha: 1,
-                  bgFill: mod.UIBgFill.None,
-                  textLabel: mod.Message((mod.stringkeys as any).Text_FRIENDLY_SCORE, getFriendlyScore(mod.GetTeam(targetPlayer))),
-                  textColor: [0.1255, 0.3725, 0.6941],
-                  textAlpha: 1,
-                  textSize: CIPHER_SCORE_TEXT_SIZE,
-                  textAnchor: mod.UIAnchor.Center,
-                  playerId: targetPlayer,
-                },
-              ],
-            },
-            {
-              name: CIPHER_ENEMY_SCORE_BOX_WIDGET_NAME_PREFIX + playerId,
-              type: "Container",
-              position: [-88, 22],
-              size: [68, 38],
-              anchor: mod.UIAnchor.Center,
-              visible: true,
-              padding: 0,
-              bgColor: [0.2118, 0.2235, 0.2353],
-              bgAlpha: 0.5,
-              bgFill: mod.UIBgFill.Blur,
-              playerId: targetPlayer,
-              children: [
-                {
-                  name: CIPHER_ENEMY_SCORE_TEXT_WIDGET_NAME_PREFIX + playerId,
-                  type: "Text",
-                  position: [0, 0],
-                  size: [100, 50],
-                  anchor: mod.UIAnchor.Center,
-                  visible: true,
-                  padding: 0,
-                  bgColor: [0.2, 0.2, 0.2],
-                  bgAlpha: 1,
-                  bgFill: mod.UIBgFill.None,
-                  textLabel: mod.Message((mod.stringkeys as any).Text_ENEMY_SCORE, getOpponentScore(mod.GetTeam(targetPlayer))),
-                  textColor: [0.8235, 0.098, 0.098],
-                  textAlpha: 1,
-                  textSize: CIPHER_SCORE_TEXT_SIZE,
-                  textAnchor: mod.UIAnchor.Center,
-                  playerId: targetPlayer,
-                },
-              ],
-            },
-            {
-              name: CIPHER_FRIENDLY_PROGRESS_BG_WIDGET_NAME_PREFIX + playerId,
-              type: "Container",
-              position: [40, -24],
-              size: [188, 22],
-              anchor: mod.UIAnchor.Center,
-              visible: true,
-              padding: 0,
-              bgColor: [0.3294, 0.3686, 0.3882],
-              bgAlpha: 0.5,
-              bgFill: mod.UIBgFill.Blur,
-              playerId: targetPlayer,
-              children: [
-                {
-                  name: CIPHER_FRIENDLY_PROGRESS_FILL_WIDGET_NAME_PREFIX + playerId,
-                  type: "Container",
-                  position: [0, 0],
-                  size: [1, 22],
-                  anchor: mod.UIAnchor.TopLeft,
-                  visible: false,
-                  padding: 0,
-                  bgColor: [0.2196, 0.4196, 0.6863],
-                  bgAlpha: 0.8,
-                  bgFill: mod.UIBgFill.Solid,
-                  playerId: targetPlayer,
-                },
-              ],
-            },
-            {
-              name: CIPHER_ENEMY_PROGRESS_BG_WIDGET_NAME_PREFIX + playerId,
-              type: "Container",
-              position: [40, 22],
-              size: [188, 22],
-              anchor: mod.UIAnchor.Center,
-              visible: true,
-              padding: 0,
-              bgColor: [0.3294, 0.3686, 0.3882],
-              bgAlpha: 0.5,
-              bgFill: mod.UIBgFill.Blur,
-              playerId: targetPlayer,
-              children: [
-                {
-                  name: CIPHER_ENEMY_PROGRESS_FILL_WIDGET_NAME_PREFIX + playerId,
-                  type: "Container",
-                  position: [0, 0],
-                  size: [1, 22],
-                  anchor: mod.UIAnchor.TopLeft,
-                  visible: false,
-                  padding: 0,
-                  bgColor: [0.8235, 0.098, 0.098],
-                  bgAlpha: 0.5,
-                  bgFill: mod.UIBgFill.Solid,
-                  playerId: targetPlayer,
-                },
-              ],
-            },
-            {
-              name: CIPHER_LIVE_STATUS_CONTAINER_WIDGET_NAME_PREFIX + playerId,
-              type: "Container",
-              position: [-4, -64],
-              size: [100, 50],
-              anchor: mod.UIAnchor.Center,
-              visible: true,
-              padding: 0,
-              bgColor: [0.2, 0.2, 0.2],
-              bgAlpha: 1,
-              bgFill: mod.UIBgFill.None,
-              playerId: targetPlayer,
-              children: [
-                {
-                  name: CIPHER_LIVE_STATUS_WIDGET_NAME_PREFIX + playerId,
-                  type: "Text",
-                  position: [0, 0],
-                  size: [100, 50],
-                  anchor: mod.UIAnchor.TopLeft,
-                  visible: true,
-                  padding: 0,
-                  bgColor: [0.2, 0.2, 0.2],
-                  bgAlpha: 1,
-                  bgFill: mod.UIBgFill.None,
-                  textLabel: getStringMessageWithFallback((mod.stringkeys as any).CipherStatusTie, "TIE"),
-                  textColor: [0.2902, 0.4471, 0.6588],
-                  textAlpha: 1,
-                  textSize: CIPHER_STATUS_TEXT_SIZE,
-                  textAnchor: mod.UIAnchor.Center,
-                  playerId: targetPlayer,
-                },
-              ],
-            },
-            {
-              name: BOMB_CARRIER_WIDGET_NAME_PREFIX + playerId,
-              type: "Text",
-              position: [-8, 80],
-              size: [276, 50],
-              anchor: mod.UIAnchor.TopLeft,
-              visible: false,
-              padding: 0,
-              bgColor: [0.2, 0.2, 0.2],
-              bgAlpha: 1,
-              bgFill: mod.UIBgFill.None,
-              textLabel: getStringMessageWithFallback((mod.stringkeys as any).CipherYouCarryingKey, "YOU ARE CARRYING KEY"),
-              textColor: [0.2863, 0.4353, 0.6431],
-              textAlpha: 1,
-              textSize: CIPHER_CARRIER_STATUS_TEXT_SIZE,
-              textAnchor: mod.UIAnchor.Center,
-              playerId: targetPlayer,
-            },
-          ],
-        },
-        {
-          name: BOMB_NOTICE_CONTAINER_WIDGET_NAME_PREFIX + playerId,
-          type: "Container",
-          position: [0, -348],
-          size: [464, 72],
-          anchor: mod.UIAnchor.Center,
-          visible: false,
-          padding: 0,
-          bgColor: [0.2902, 0.4392, 0.6431],
-          bgAlpha: 0.8,
-          bgFill: mod.UIBgFill.Blur,
-          playerId: targetPlayer,
-          children: [
-            {
-              name: BOMB_NOTICE_LEFT_ACCENT_WIDGET_NAME_PREFIX + playerId,
-              type: "Container",
-              position: [0, 0],
-              size: [464, 72],
-              anchor: mod.UIAnchor.Center,
-              visible: true,
-              padding: 0,
-              bgColor: [1, 1, 1],
-              bgAlpha: 1,
-              bgFill: mod.UIBgFill.OutlineThick,
-              playerId: targetPlayer,
-              children: [
-                {
-                  name: BOMB_NOTICE_WIDGET_NAME_PREFIX + playerId,
-                  type: "Text",
-                  position: [0, 0],
-                  size: [298, 50],
-                  anchor: mod.UIAnchor.Center,
-                  visible: true,
-                  padding: 0,
-                  bgColor: [0.2, 0.2, 0.2],
-                  bgAlpha: 1,
-                  bgFill: mod.UIBgFill.None,
-                  textLabel: mod.stringkeys.EmptyText,
-                  textColor: [1, 1, 1],
-                  textAlpha: 1,
-                  textSize: BOMB_NOTICE_WIDGET_TEXT_SIZE,
-                  textAnchor: mod.UIAnchor.Center,
-                  playerId: targetPlayer,
-                },
-              ],
-            },
-          ],
-        },
-        {
-          name: BOMB_NOTICE_RIGHT_ACCENT_WIDGET_NAME_PREFIX + playerId,
-          type: "Container",
-          position: [-759, -236],
-          size: [318, 56],
-          anchor: mod.UIAnchor.Center,
-          visible: false,
-          padding: 0,
-          bgColor: [0.6588, 0.2667, 0.2549],
-          bgAlpha: 1,
-          bgFill: mod.UIBgFill.Blur,
-          playerId: targetPlayer,
-          children: [
-            {
-              name: BOMB_NOTICE_DETAIL_WIDGET_NAME_PREFIX + playerId,
-              type: "Text",
-              position: [0, 0],
-              size: [262, 50],
-              anchor: mod.UIAnchor.Center,
-              visible: true,
-              padding: 0,
-              bgColor: [0.2, 0.2, 0.2],
-              bgAlpha: 1,
-              bgFill: mod.UIBgFill.None,
-              textLabel: mod.stringkeys.EmptyText,
-              textColor: [1, 1, 1],
-              textAlpha: 1,
-              textSize: BOMB_NOTICE_DETAIL_TEXT_SIZE,
-              textAnchor: mod.UIAnchor.Center,
-              playerId: targetPlayer,
-            },
-            {
-              name: BOMB_NOTICE_PLAYER_CONTAINER_WIDGET_NAME_PREFIX + playerId,
-              type: "Container",
-              position: [-74, -46],
-              size: [172, 32],
-              anchor: mod.UIAnchor.Center,
-              visible: true,
-              padding: 0,
-              bgColor: [0.5922, 0.2627, 0.251],
-              bgAlpha: 1,
-              bgFill: mod.UIBgFill.Solid,
-              playerId: targetPlayer,
-              children: [
-                {
-                  name: BOMB_NOTICE_PLAYER_TEXT_WIDGET_NAME_PREFIX + playerId,
-                  type: "Text",
-                  position: [0, -9],
-                  size: [100, 50],
-                  anchor: mod.UIAnchor.TopLeft,
-                  visible: true,
-                  padding: 0,
-                  bgColor: [0.2, 0.2, 0.2],
-                  bgAlpha: 1,
-                  bgFill: mod.UIBgFill.None,
-                  textLabel: mod.stringkeys.EmptyText,
-                  textColor: [1, 1, 1],
-                  textAlpha: 1,
-                  textSize: BOMB_NOTICE_PLAYER_TEXT_SIZE,
-                  textAnchor: mod.UIAnchor.Center,
-                  playerId: targetPlayer,
-                },
-              ],
-            },
-            {
-              name: BOMB_NOTICE_DROPPED_OUTLINE_WIDGET_NAME_PREFIX + playerId,
-              type: "Container",
-              position: [0, 0],
-              size: [318, 56],
-              anchor: mod.UIAnchor.Center,
-              visible: true,
-              padding: 0,
-              bgColor: [1, 1, 1],
-              bgAlpha: 1,
-              bgFill: mod.UIBgFill.OutlineThin,
-              playerId: targetPlayer,
-            },
-          ],
-        },
-        {
-          name: NEXT_KEY_UNLOCK_CONTAINER_WIDGET_NAME_PREFIX + playerId,
-          type: "Container",
-          position: [0, -466],
-          size: [676, 46],
-          anchor: mod.UIAnchor.Center,
-          visible: false,
-          padding: 0,
-          bgColor: [0.2, 0.2, 0.2],
-          bgAlpha: 0.5,
-          bgFill: mod.UIBgFill.Blur,
-          playerId: targetPlayer,
-          children: [
-            {
-              name: NEXT_KEY_UNLOCK_WIDGET_NAME_PREFIX + playerId,
-              type: "Text",
-              position: [0, 0],
-              size: [554, 38],
-              anchor: mod.UIAnchor.Center,
-              visible: false,
-              padding: 0,
-              bgColor: [0, 0, 0],
-              bgAlpha: 0,
-              bgFill: mod.UIBgFill.None,
-              textLabel: mod.stringkeys.EmptyText,
-              textColor: [1, 1, 1],
-              textAlpha: 1,
-              textSize: NEXT_KEY_UNLOCK_WIDGET_TEXT_SIZE,
-              textAnchor: mod.UIAnchor.Center,
-              playerId: targetPlayer,
-            },
-          ],
-        },
-      ],
+    });
+
+    // Hidden match-time widgets kept only because existing runtime code expects them.
+        // Time remaining box above the score boxes.
+    addHudNode({
+      name: CIPHER_LIVE_TIME_BOX_WIDGET_NAME_PREFIX + playerId,
+      type: "Container",
+      position: [36, 17],
+      size: [100, 50],
+      anchor: mod.UIAnchor.TopLeft,
+      visible: true,
+      padding: 0,
+      bgColor: [0.3294, 0.3686, 0.3882],
+      bgAlpha: 0.8,
+      bgFill: mod.UIBgFill.Blur,
+    });
+
+    addHudNode({
+      name: CIPHER_LIVE_TIME_TEXT_WIDGET_NAME_PREFIX + playerId,
+      type: "Text",
+      position: [36, 17],
+      size: [100, 50],
+      anchor: mod.UIAnchor.TopLeft,
+      visible: true,
+      padding: 0,
+      bgColor: [0.2, 0.2, 0.2],
+      bgAlpha: 1,
+      bgFill: mod.UIBgFill.None,
+      textLabel: mod.stringkeys.TimeDefault,
+      textColor: [1, 1, 1],
+      textAlpha: 1,
+      textSize: CIPHER_LIVE_TIME_TEXT_FONT_SIZE,
+      textAnchor: mod.UIAnchor.Center,
+    });
+
+    // Winning / losing / tied label.
+    addHudNode({
+      name: CIPHER_LIVE_STATUS_CONTAINER_WIDGET_NAME_PREFIX + playerId,
+      type: "Container",
+      position: [122, 23],
+      size: [100, 50],
+      anchor: mod.UIAnchor.TopLeft,
+      visible: true,
+      padding: 0,
+      bgColor: [0.2, 0.2, 0.2],
+      bgAlpha: 1,
+      bgFill: mod.UIBgFill.None,
+    });
+
+    addHudNode({
+      name: CIPHER_LIVE_STATUS_WIDGET_NAME_PREFIX + playerId,
+      type: "Text",
+      position: [122, 5],
+      size: [100, 50],
+      anchor: mod.UIAnchor.TopLeft,
+      visible: true,
+      padding: 0,
+      bgColor: [0.2, 0.2, 0.2],
+      bgAlpha: 1,
+      bgFill: mod.UIBgFill.None,
+      textLabel: getStringMessageWithFallback((mod.stringkeys as any).CipherStatusTie, "TIE"),
+      textColor: [0.2902, 0.4471, 0.6588],
+      textAlpha: 1,
+      textSize: CIPHER_STATUS_TEXT_SIZE,
+      textAnchor: mod.UIAnchor.Center,
+    });
+
+    // Friendly score box and score text.
+    addHudNode({
+      name: CIPHER_FRIENDLY_SCORE_BOX_WIDGET_NAME_PREFIX + playerId,
+      type: "Container",
+      position: [54, 69],
+      size: [68, 38],
+      anchor: mod.UIAnchor.TopLeft,
+      visible: true,
+      padding: 0,
+      bgColor: [0.3294, 0.3686, 0.3882],
+      bgAlpha: 0.5,
+      bgFill: mod.UIBgFill.Blur,
+    });
+
+    addHudNode({
+      name: CIPHER_FRIENDLY_SCORE_TEXT_WIDGET_NAME_PREFIX + playerId,
+      type: "Text",
+      position: [38, 63],
+      size: [100, 50],
+      anchor: mod.UIAnchor.TopLeft,
+      visible: true,
+      padding: 0,
+      bgColor: [0.2, 0.2, 0.2],
+      bgAlpha: 1,
+      bgFill: mod.UIBgFill.None,
+      textLabel: mod.Message((mod.stringkeys as any).Text_FRIENDLY_SCORE, getFriendlyScore(mod.GetTeam(targetPlayer))),
+      textColor: [0.1255, 0.3725, 0.6941],
+      textAlpha: 1,
+      textSize: CIPHER_SCORE_TEXT_SIZE,
+      textAnchor: mod.UIAnchor.Center,
+    });
+
+    // Friendly ticker bar.
+    addHudNode({
+      name: CIPHER_FRIENDLY_PROGRESS_BG_WIDGET_NAME_PREFIX + playerId,
+      type: "Container",
+      position: [122, 77],
+      size: [188, 22],
+      anchor: mod.UIAnchor.TopLeft,
+      visible: true,
+      padding: 0,
+      bgColor: [0.3294, 0.3686, 0.3882],
+      bgAlpha: 0.5,
+      bgFill: mod.UIBgFill.Blur,
+    });
+
+    addHudNode({
+      name: CIPHER_FRIENDLY_PROGRESS_FILL_WIDGET_NAME_PREFIX + playerId,
+      type: "Container",
+      position: [122, 77],
+      size: [1, 22],
+      anchor: mod.UIAnchor.TopLeft,
+      visible: false,
+      padding: 0,
+      bgColor: [0.2196, 0.4196, 0.6863],
+      bgAlpha: 0.8,
+      bgFill: mod.UIBgFill.Solid,
+    });
+
+    // Enemy score box and score text.
+    addHudNode({
+      name: CIPHER_ENEMY_SCORE_BOX_WIDGET_NAME_PREFIX + playerId,
+      type: "Container",
+      position: [54, 115],
+      size: [68, 38],
+      anchor: mod.UIAnchor.TopLeft,
+      visible: true,
+      padding: 0,
+      bgColor: [0.2118, 0.2235, 0.2353],
+      bgAlpha: 0.5,
+      bgFill: mod.UIBgFill.Blur,
+    });
+
+    addHudNode({
+      name: CIPHER_ENEMY_SCORE_TEXT_WIDGET_NAME_PREFIX + playerId,
+      type: "Text",
+      position: [38, 109],
+      size: [100, 50],
+      anchor: mod.UIAnchor.TopLeft,
+      visible: true,
+      padding: 0,
+      bgColor: [0.2, 0.2, 0.2],
+      bgAlpha: 1,
+      bgFill: mod.UIBgFill.None,
+      textLabel: mod.Message((mod.stringkeys as any).Text_ENEMY_SCORE, getOpponentScore(mod.GetTeam(targetPlayer))),
+      textColor: [0.8235, 0.098, 0.098],
+      textAlpha: 1,
+      textSize: CIPHER_SCORE_TEXT_SIZE,
+      textAnchor: mod.UIAnchor.Center,
+    });
+
+    // Enemy ticker bar.
+    addHudNode({
+      name: CIPHER_ENEMY_PROGRESS_BG_WIDGET_NAME_PREFIX + playerId,
+      type: "Container",
+      position: [122, 123],
+      size: [188, 22],
+      anchor: mod.UIAnchor.TopLeft,
+      visible: true,
+      padding: 0,
+      bgColor: [0.3294, 0.3686, 0.3882],
+      bgAlpha: 0.5,
+      bgFill: mod.UIBgFill.Blur,
+    });
+
+    addHudNode({
+      name: CIPHER_ENEMY_PROGRESS_FILL_WIDGET_NAME_PREFIX + playerId,
+      type: "Container",
+      position: [122, 123],
+      size: [1, 22],
+      anchor: mod.UIAnchor.TopLeft,
+      visible: false,
+      padding: 0,
+      bgColor: [0.8235, 0.098, 0.098],
+      bgAlpha: 0.5,
+      bgFill: mod.UIBgFill.Solid,
+    });
+
+    // Carrier status text under the score panel.
+    addHudNode({
+      name: BOMB_CARRIER_WIDGET_NAME_PREFIX + playerId,
+      type: "Text",
+      position: [34, 140],
+      size: [276, 50],
+      anchor: mod.UIAnchor.TopLeft,
+      visible: false,
+      padding: 0,
+      bgColor: [0.2, 0.2, 0.2],
+      bgAlpha: 1,
+      bgFill: mod.UIBgFill.None,
+      textLabel: getStringMessageWithFallback((mod.stringkeys as any).CipherYouCarryingKey, "YOU ARE CARRYING KEY"),
+      textColor: [0.2863, 0.4353, 0.6431],
+      textAlpha: 1,
+      textSize: CIPHER_CARRIER_STATUS_TEXT_SIZE,
+      textAnchor: mod.UIAnchor.Center,
+    });
+
+    // Top-center key event banner container.
+    addHudNode({
+      name: BOMB_NOTICE_CONTAINER_WIDGET_NAME_PREFIX + playerId,
+      type: "Container",
+      position: [0, CIPHER_EVENT_BANNER_CENTER_Y],
+      size: [464, 72],
+      anchor: mod.UIAnchor.Center,
+      visible: false,
+      padding: 0,
+      bgColor: [0.2902, 0.4392, 0.6431],
+      bgAlpha: 0.58,
+      bgFill: mod.UIBgFill.Blur,
+    });
+
+    // Top-center key event outline.
+    // Color is overwritten at runtime by friendly/enemy tone.
+    addHudNode({
+      name: BOMB_NOTICE_LEFT_ACCENT_WIDGET_NAME_PREFIX + playerId,
+      type: "Container",
+      position: [0, CIPHER_EVENT_BANNER_CENTER_Y],
+      size: [464, 72],
+      anchor: mod.UIAnchor.Center,
+      visible: false,
+      padding: 0,
+      bgColor: [0.10, 0.55, 1.00],
+      bgAlpha: 1,
+      bgFill: mod.UIBgFill.OutlineThick,
+    });
+
+    // Top-center key event text.
+    addHudNode({
+      name: BOMB_NOTICE_WIDGET_NAME_PREFIX + playerId,
+      type: "Text",
+      position: [0, CIPHER_EVENT_BANNER_CENTER_Y],
+      size: [430, 50],
+      anchor: mod.UIAnchor.Center,
+      visible: false,
+      padding: 0,
+      bgColor: [0.2, 0.2, 0.2],
+      bgAlpha: 1,
+      bgFill: mod.UIBgFill.None,
+      textLabel: mod.stringkeys.EmptyText,
+      textColor: [1, 1, 1],
+      textAlpha: 1,
+      textSize: BOMB_NOTICE_WIDGET_TEXT_SIZE,
+      textAnchor: mod.UIAnchor.Center,
+    });
+
+    // Left dropped-key banner.
+    addHudNode({
+      name: BOMB_NOTICE_RIGHT_ACCENT_WIDGET_NAME_PREFIX + playerId,
+      type: "Container",
+      position: [42, 276],
+      size: [318, 56],
+      anchor: mod.UIAnchor.TopLeft,
+      visible: false,
+      padding: 0,
+      bgColor: [0.6588, 0.2667, 0.2549],
+      bgAlpha: 1,
+      bgFill: mod.UIBgFill.Blur,
+    });
+
+    addHudNode({
+      name: BOMB_NOTICE_DETAIL_WIDGET_NAME_PREFIX + playerId,
+      type: "Text",
+      position: [70, 279],
+      size: [262, 50],
+      anchor: mod.UIAnchor.TopLeft,
+      visible: false,
+      padding: 0,
+      bgColor: [0.2, 0.2, 0.2],
+      bgAlpha: 1,
+      bgFill: mod.UIBgFill.None,
+      textLabel: mod.stringkeys.EmptyText,
+      textColor: [1, 1, 1],
+      textAlpha: 1,
+      textSize: BOMB_NOTICE_DETAIL_TEXT_SIZE,
+      textAnchor: mod.UIAnchor.Center,
+    });
+
+    addHudNode({
+      name: BOMB_NOTICE_PLAYER_CONTAINER_WIDGET_NAME_PREFIX + playerId,
+      type: "Container",
+      position: [41, 242],
+      size: [172, 32],
+      anchor: mod.UIAnchor.TopLeft,
+      visible: false,
+      padding: 0,
+      bgColor: [0.5922, 0.2627, 0.251],
+      bgAlpha: 1,
+      bgFill: mod.UIBgFill.Solid,
+    });
+
+    addHudNode({
+      name: BOMB_NOTICE_PLAYER_TEXT_WIDGET_NAME_PREFIX + playerId,
+      type: "Text",
+      position: [41, 233],
+      size: [100, 50],
+      anchor: mod.UIAnchor.TopLeft,
+      visible: false,
+      padding: 0,
+      bgColor: [0.2, 0.2, 0.2],
+      bgAlpha: 1,
+      bgFill: mod.UIBgFill.None,
+      textLabel: mod.stringkeys.EmptyText,
+      textColor: [1, 1, 1],
+      textAlpha: 1,
+      textSize: BOMB_NOTICE_PLAYER_TEXT_SIZE,
+      textAnchor: mod.UIAnchor.Center,
+    });
+
+    addHudNode({
+      name: BOMB_NOTICE_DROPPED_OUTLINE_WIDGET_NAME_PREFIX + playerId,
+      type: "Container",
+      position: [42, 276],
+      size: [318, 56],
+      anchor: mod.UIAnchor.TopLeft,
+      visible: false,
+      padding: 0,
+      bgColor: [1, 1, 1],
+      bgAlpha: 1,
+      bgFill: mod.UIBgFill.OutlineThin,
+    });
+
+    // Top-center next-key countdown container.
+    // This is intentionally higher than the key event banner.
+    addHudNode({
+      name: NEXT_KEY_UNLOCK_CONTAINER_WIDGET_NAME_PREFIX + playerId,
+      type: "Container",
+      position: [0, CIPHER_NEXT_KEY_BANNER_CENTER_Y],
+      size: [464, 72],
+      anchor: mod.UIAnchor.Center,
+      visible: false,
+      padding: 0,
+      bgColor: [0.2, 0.2, 0.2],
+      bgAlpha: 0.5,
+      bgFill: mod.UIBgFill.Blur,
+    });
+
+    // Top-center next-key countdown text.
+    addHudNode({
+      name: NEXT_KEY_UNLOCK_WIDGET_NAME_PREFIX + playerId,
+      type: "Text",
+      position: [0, CIPHER_NEXT_KEY_BANNER_CENTER_Y],
+      size: [430, 50],
+      anchor: mod.UIAnchor.Center,
+      visible: false,
+      padding: 0,
+      bgColor: [0, 0, 0],
+      bgAlpha: 0,
+      bgFill: mod.UIBgFill.None,
+      textLabel: mod.stringkeys.EmptyText,
+      textColor: [1, 1, 1],
+      textAlpha: 1,
+      textSize: NEXT_KEY_UNLOCK_WIDGET_TEXT_SIZE,
+      textAnchor: mod.UIAnchor.Center,
     });
   } catch (_errBuild) {
     return false;
@@ -14301,14 +14489,25 @@ function rebuildPlayerTopScoreWidgets(p: Player): boolean {
 
   bindPlayerTopScoreWidgetRefs(p);
   setTopScoreWidgetDepthForPlayer(playerId);
-  refreshBombNoticeUiForPlayer(p);
+  refreshBombNoticeUiForPlayer(p, undefined, true);
   refreshNextKeyUnlockHudForPlayer(p, undefined, true);
 
   return hasValidRootTopScoreWidgets(playerId);
 }
 
+function isValidUiWidgetName(widgetName: string | undefined | null): widgetName is string {
+  if (typeof widgetName !== "string") return false;
+  return widgetName.trim().length > 0;
+}
+
 function safeDeleteWidgetByName(widgetName: string): void {
-  const widget = mod.FindUIWidgetWithName(widgetName);
+  if (!isValidUiWidgetName(widgetName)) return;
+  let widget: mod.UIWidget | undefined = undefined;
+  try {
+    widget = mod.FindUIWidgetWithName(widgetName);
+  } catch (_errFind) {
+    return;
+  }
   if (!widget) return;
 
   try {
@@ -14317,6 +14516,8 @@ function safeDeleteWidgetByName(widgetName: string): void {
 }
 
 function safeDeleteAllWidgetsByName(widgetName: string): void {
+  if (!isValidUiWidgetName(widgetName)) return;
+
   for (let i = 0; i < 16; i++) {
     let widget: mod.UIWidget | undefined = undefined;
     try {
@@ -14725,29 +14926,38 @@ function getStringMessageWithFallback2(key: any, fallbackText: string, arg0: any
 
 
 function rebuildPlayerLiveHud(p: Player): void {
-  bindPlayerTopScoreWidgetRefs(p);
-  if (!hasValidRootTopScoreWidgets(p.id)) {
-    if (!rebuildPlayerTopScoreWidgets(p)) {
-      deletePlayerLiveHudWidgets(p.id);
-      liveHudBuiltByPlayerId[p.id] = false;
-      return;
+  try {
+    bindPlayerTopScoreWidgetRefs(p);
+    if (!hasValidRootTopScoreWidgets(p.id)) {
+      if (!rebuildPlayerTopScoreWidgets(p)) {
+        deletePlayerLiveHudWidgets(p.id);
+        liveHudBuiltByPlayerId[p.id] = false;
+        return;
+      }
+    } else {
+      setTopScoreWidgetDepthForPlayer(p.id);
     }
-  } else {
-    setTopScoreWidgetDepthForPlayer(p.id);
-  }
 
-  p.flagWidget = {} as any;
-  p.activeFlagContainerWidget = null as any;
-  p.activeFlagFriendlyWidget = null as any;
-  p.activeFlagEnemyWidget = null as any;
-  p.friendlyCapWidget = null as any;
-  p.enemyCapWidget = null as any;
-  p.activeFlagWidget = null as any;
-  p.progressBarWidget = null as any;
-  rebuildObjectiveHoldProgressUiWidgetsForPlayer(p);
-  rebuildDeployObjectiveTimerUiWidgetsForPlayer(p);
-  UpdateTopTicketBarsForPlayer(p);
-  liveHudBuiltByPlayerId[p.id] = true;
+    p.flagWidget = {} as any;
+    p.activeFlagContainerWidget = null as any;
+    p.activeFlagFriendlyWidget = null as any;
+    p.activeFlagEnemyWidget = null as any;
+    p.friendlyCapWidget = null as any;
+    p.enemyCapWidget = null as any;
+    p.activeFlagWidget = null as any;
+    p.progressBarWidget = null as any;
+    rebuildObjectiveHoldProgressUiWidgetsForPlayer(p);
+    rebuildDeployObjectiveTimerUiWidgetsForPlayer(p);
+    UpdateTopTicketBarsForPlayer(p);
+    liveHudBuiltByPlayerId[p.id] = true;
+    markCipherKeyHudReadyForPlayer(p.id, true);
+  } catch (err) {
+    LogRuntimeError("rebuildPlayerLiveHud/" + String(p?.id ?? -1), err);
+    if (p) {
+      liveHudBuiltByPlayerId[p.id] = false;
+      markCipherKeyHudDirtyForPlayer(p.id);
+    }
+  }
 }
 
 function getObjectiveHoldRootWidgetName(playerId: number): string {
@@ -14971,7 +15181,7 @@ function getDeployObjectiveTimerLaneOutlineTopWidgetName(playerId: number): stri
 }
 
 function getDeployObjectiveTimerLaneOutlineBottomWidgetName(playerId: number): string {
-  return "";
+  return "DeployObjectiveTimerLaneOutlineBottom" + playerId;
 }
 
 function getDeployObjectiveTimerLaneOutlineLeftWidgetName(playerId: number): string {
@@ -15265,17 +15475,8 @@ function getCachedDeployObjectiveTimerWidgetsForPlayer(p: Player): {
   }
 
   if (!root || !panel || !laneFill || !laneText || !outlineTop || !outlineBottom || !outlineLeft || !outlineRight || !title || !value) {
-    rebuildDeployObjectiveTimerUiWidgetsForPlayer(p);
-    root = p.deployObjectiveTimerRootWidget;
-    panel = p.deployObjectiveTimerPanelWidget;
-    laneFill = p.deployObjectiveTimerLaneFillWidget;
-    laneText = p.deployObjectiveTimerLaneTextWidget;
-    outlineTop = p.deployObjectiveTimerLaneOutlineTopWidget;
-    outlineBottom = p.deployObjectiveTimerLaneOutlineBottomWidget;
-    outlineLeft = p.deployObjectiveTimerLaneOutlineLeftWidget;
-    outlineRight = p.deployObjectiveTimerLaneOutlineRightWidget;
-    title = p.deployObjectiveTimerTitleWidget;
-    value = p.deployObjectiveTimerValueWidget;
+    markCipherKeyHudDirtyForPlayer(p.id);
+    queueLiveHudBuild(p.id, "deploy_timer_missing_widgets", "normal", 1);
   }
 
   return { root, panel, laneFill, laneText, outlineTop, outlineBottom, outlineLeft, outlineRight, title, value };
@@ -15343,9 +15544,10 @@ function hideDeployObjectiveTimerUiForPlayer(playerId: number): void {
 }
 
 function HideAllDeployObjectiveTimerUi(): void {
-  serverPlayers.forEach((p) => {
-    hideDeployObjectiveTimerUiForPlayer(p.id);
-  });
+  const players = getValidHumanPlayersSnapshot();
+  for (let i = 0; i < players.length; i++) {
+    hideDeployObjectiveTimerUiForPlayer(players[i].id);
+  }
 }
 
 function UpdateDeployObjectiveTimerUiForPlayer(p: Player, nowSec?: number): void {
@@ -15427,7 +15629,10 @@ function UpdateDeployObjectiveTimerUiForAllPlayers(nowSec?: number): void {
   }
 
   const sampleNowSec = nowSec ?? getCurrentSchedulerNowSeconds();
-  serverPlayers.forEach((p) => UpdateDeployObjectiveTimerUiForPlayer(p, sampleNowSec));
+  const players = getValidHumanPlayersSnapshot();
+  for (let i = 0; i < players.length; i++) {
+    UpdateDeployObjectiveTimerUiForPlayer(players[i], sampleNowSec);
+  }
 }
 
 function findActiveObjectiveHoldCpIdForPlayer(playerId: number): number | undefined {
@@ -15524,13 +15729,17 @@ function UpdateObjectiveHoldProgressUiForAllPlayers(nowSec?: number): void {
   }
 
   const sampleNowSec = nowSec ?? getCurrentSchedulerNowSeconds();
-  serverPlayers.forEach((p) => UpdateObjectiveHoldProgressUiForPlayer(p, sampleNowSec));
+  const players = getValidHumanPlayersSnapshot();
+  for (let i = 0; i < players.length; i++) {
+    UpdateObjectiveHoldProgressUiForPlayer(players[i], sampleNowSec);
+  }
 }
 
 function HideAllObjectiveHoldProgressUi(): void {
-  serverPlayers.forEach((p) => {
-    hideObjectiveHoldProgressForPlayer(p.id);
-  });
+  const players = getValidHumanPlayersSnapshot();
+  for (let i = 0; i < players.length; i++) {
+    hideObjectiveHoldProgressForPlayer(players[i].id);
+  }
 }
 
 
@@ -15562,7 +15771,7 @@ function hasCipherKeyHudWidgetRefs(p: Player): boolean {
     p.bombNoticeRightAccentWidget &&
     p.bombNoticeTextWidget &&
     p.bombNoticeDetailWidget &&
-    mod.FindUIWidgetWithName(BOMB_NOTICE_PLAYER_TEXT_WIDGET_NAME_PREFIX + p.id) &&
+    SafeFindWidget(BOMB_NOTICE_PLAYER_TEXT_WIDGET_NAME_PREFIX + p.id) &&
     p.nextKeyUnlockContainerWidget &&
     p.nextKeyUnlockTextWidget
   );
@@ -15687,11 +15896,10 @@ function applyBombCarrierHudStateForPlayer(
 }
 
 function UpdateBombCarrierUiForAllPlayers(_nowSec?: number, _force: boolean = false): void {
-  serverPlayers.forEach((p) => {
-    if (!p) return;
-    if (isCipherRuntimeBotPlayerId(p.id) || isBotBackfillPlayerSafe(p.player)) return;
-    UpdateTopTicketBarsForPlayer(p);
-  });
+  const players = getValidHumanPlayersSnapshot();
+  for (let i = 0; i < players.length; i++) {
+    UpdateTopTicketBarsForPlayer(players[i]);
+  }
 }
 
 function getActiveGlobalBombNoticeMessage(): any {
@@ -15758,9 +15966,15 @@ function reassertBombNoticeWidgetLayoutForPlayer(p: Player): void {
   const rightAccent = p.bombNoticeRightAccentWidget;
   const widget = p.bombNoticeTextWidget;
   const detail = p.bombNoticeDetailWidget;
-  const playerContainer = mod.FindUIWidgetWithName(BOMB_NOTICE_PLAYER_CONTAINER_WIDGET_NAME_PREFIX + p.id);
-  const playerText = mod.FindUIWidgetWithName(BOMB_NOTICE_PLAYER_TEXT_WIDGET_NAME_PREFIX + p.id);
-  const droppedOutline = mod.FindUIWidgetWithName(BOMB_NOTICE_DROPPED_OUTLINE_WIDGET_NAME_PREFIX + p.id);
+  const playerContainer = SafeFindWidget(BOMB_NOTICE_PLAYER_CONTAINER_WIDGET_NAME_PREFIX + p.id);
+  const playerText = SafeFindWidget(BOMB_NOTICE_PLAYER_TEXT_WIDGET_NAME_PREFIX + p.id);
+  const droppedOutline = SafeFindWidget(BOMB_NOTICE_DROPPED_OUTLINE_WIDGET_NAME_PREFIX + p.id);
+
+  const nowSec = getCurrentSchedulerNowSeconds();
+  const tone = getActiveBombNoticeToneForPlayer(p, nowSec);
+  const accentColor = getCipherEventBannerColorForTone(tone);
+
+  // Center key event banner.
   SafeSetWidgetPositionHandle(container, BOMB_NOTICE_WIDGET_POS);
   SafeSetWidgetSizeHandle(container, BOMB_NOTICE_CONTAINER_SIZE);
   SafeSetWidgetDepthHandle(container, mod.UIDepth.AboveGameUI);
@@ -15768,21 +15982,25 @@ function reassertBombNoticeWidgetLayoutForPlayer(p: Player): void {
   try { if (container) mod.SetUIWidgetBgAlpha(container, 0.58); } catch (_errAlpha) {}
   try { if (container) mod.SetUIWidgetBgFill(container, mod.UIBgFill.Blur); } catch (_errFill) {}
 
+  // Center key event outline. Friendly = blue. Enemy = red.
   SafeSetWidgetPositionHandle(leftAccent, BOMB_NOTICE_OUTLINE_POS);
   SafeSetWidgetSizeHandle(leftAccent, BOMB_NOTICE_CONTAINER_SIZE);
   SafeSetWidgetDepthHandle(leftAccent, mod.UIDepth.AboveGameUI);
+  SafeSetWidgetBgColorHandle(leftAccent, accentColor);
   try { if (leftAccent) mod.SetUIWidgetBgFill(leftAccent, mod.UIBgFill.OutlineThick); } catch (_errFill) {}
-
-  SafeSetWidgetPositionHandle(rightAccent, BOMB_DROPPED_NOTICE_POS);
-  SafeSetWidgetSizeHandle(rightAccent, BOMB_DROPPED_NOTICE_SIZE);
-  SafeSetWidgetDepthHandle(rightAccent, mod.UIDepth.AboveGameUI);
-  try { if (rightAccent) mod.SetUIWidgetBgFill(rightAccent, mod.UIBgFill.Blur); } catch (_errFill) {}
 
   SafeSetWidgetPositionHandle(widget, BOMB_NOTICE_TEXT_POS);
   SafeSetWidgetSizeHandle(widget, BOMB_NOTICE_WIDGET_SIZE);
   SafeSetWidgetDepthHandle(widget, mod.UIDepth.AboveGameUI);
   SafeSetTextColorHandle(widget, BOMB_NOTICE_WIDGET_TEXT_COLOR);
   SafeSetTextSizeHandle(widget, BOMB_NOTICE_WIDGET_TEXT_SIZE);
+
+  // Left dropped-key banner.
+  SafeSetWidgetPositionHandle(rightAccent, BOMB_DROPPED_NOTICE_POS);
+  SafeSetWidgetSizeHandle(rightAccent, BOMB_DROPPED_NOTICE_SIZE);
+  SafeSetWidgetDepthHandle(rightAccent, mod.UIDepth.AboveGameUI);
+  SafeSetWidgetBgColorHandle(rightAccent, accentColor);
+  try { if (rightAccent) mod.SetUIWidgetBgFill(rightAccent, mod.UIBgFill.Blur); } catch (_errFill) {}
 
   SafeSetWidgetPositionHandle(detail, BOMB_DROPPED_NOTICE_TEXT_POS);
   SafeSetWidgetSizeHandle(detail, BOMB_DROPPED_NOTICE_TEXT_SIZE_VECTOR);
@@ -15793,16 +16011,19 @@ function reassertBombNoticeWidgetLayoutForPlayer(p: Player): void {
   SafeSetWidgetPositionHandle(playerContainer, BOMB_DROPPED_PLAYER_CONTAINER_POS);
   SafeSetWidgetSizeHandle(playerContainer, BOMB_DROPPED_PLAYER_CONTAINER_SIZE);
   SafeSetWidgetDepthHandle(playerContainer, mod.UIDepth.AboveGameUI);
+  SafeSetWidgetBgColorHandle(playerContainer, accentColor);
+
   SafeSetWidgetPositionHandle(playerText, BOMB_DROPPED_PLAYER_TEXT_POS);
   SafeSetWidgetSizeHandle(playerText, BOMB_DROPPED_PLAYER_TEXT_SIZE_VECTOR);
   SafeSetWidgetDepthHandle(playerText, mod.UIDepth.AboveGameUI);
   SafeSetTextColorHandle(playerText, mod.CreateVector(1, 1, 1));
   SafeSetTextSizeHandle(playerText, BOMB_NOTICE_PLAYER_TEXT_SIZE);
 
-  SafeSetWidgetPositionHandle(droppedOutline, mod.CreateVector(0, 0, 0));
+  // Dropped-key outline. Do not let this return to 0,0 or white.
+  SafeSetWidgetPositionHandle(droppedOutline, BOMB_DROPPED_NOTICE_POS);
   SafeSetWidgetSizeHandle(droppedOutline, BOMB_DROPPED_NOTICE_SIZE);
   SafeSetWidgetDepthHandle(droppedOutline, mod.UIDepth.AboveGameUI);
-  SafeSetWidgetBgColorHandle(droppedOutline, mod.CreateVector(1, 1, 1));
+  SafeSetWidgetBgColorHandle(droppedOutline, accentColor);
   try { if (droppedOutline) mod.SetUIWidgetBgFill(droppedOutline, mod.UIBgFill.OutlineThin); } catch (_errFill) {}
 }
 
@@ -15812,8 +16033,8 @@ function refreshBombNoticeUiForPlayer(p: Player, nowSec?: number, force: boolean
   let rightAccent = p.bombNoticeRightAccentWidget;
   let widget = p.bombNoticeTextWidget;
   let detail = p.bombNoticeDetailWidget;
-  let playerContainer = mod.FindUIWidgetWithName(BOMB_NOTICE_PLAYER_CONTAINER_WIDGET_NAME_PREFIX + p.id);
-  let playerText = mod.FindUIWidgetWithName(BOMB_NOTICE_PLAYER_TEXT_WIDGET_NAME_PREFIX + p.id);
+  let playerContainer = SafeFindWidget(BOMB_NOTICE_PLAYER_CONTAINER_WIDGET_NAME_PREFIX + p.id);
+  let playerText = SafeFindWidget(BOMB_NOTICE_PLAYER_TEXT_WIDGET_NAME_PREFIX + p.id);
   if ((!container || !leftAccent || !rightAccent || !widget || !detail) && force) {
     bindPlayerCipherKeyHudWidgetRefs(p, true);
     container = p.bombNoticeContainerWidget;
@@ -15821,8 +16042,8 @@ function refreshBombNoticeUiForPlayer(p: Player, nowSec?: number, force: boolean
     rightAccent = p.bombNoticeRightAccentWidget;
     widget = p.bombNoticeTextWidget;
     detail = p.bombNoticeDetailWidget;
-    playerContainer = mod.FindUIWidgetWithName(BOMB_NOTICE_PLAYER_CONTAINER_WIDGET_NAME_PREFIX + p.id);
-    playerText = mod.FindUIWidgetWithName(BOMB_NOTICE_PLAYER_TEXT_WIDGET_NAME_PREFIX + p.id);
+    playerContainer = SafeFindWidget(BOMB_NOTICE_PLAYER_CONTAINER_WIDGET_NAME_PREFIX + p.id);
+    playerText = SafeFindWidget(BOMB_NOTICE_PLAYER_TEXT_WIDGET_NAME_PREFIX + p.id);
   }
   if (!container || !leftAccent || !rightAccent || !widget || !detail || !playerContainer || !playerText) {
     markCipherKeyHudDirtyForPlayer(p.id);
@@ -15832,9 +16053,43 @@ function refreshBombNoticeUiForPlayer(p: Player, nowSec?: number, force: boolean
   const resolvedNowSec = nowSec ?? getCurrentSchedulerNowSeconds();
   const visible = gameStatus === 3 && isBombNoticeVisibleForPlayer(p, resolvedNowSec);
   const stateKey = visible ? getBombNoticeUiStateKeyForPlayer(p, resolvedNowSec) : "hidden";
+
   if (force || visible) reassertBombNoticeWidgetLayoutForPlayer(p);
+
   if (!force && p.bombNoticeUiLastStateKey === stateKey) return;
   p.bombNoticeUiLastStateKey = stateKey;
+
+  const droppedOutline = SafeFindWidget(BOMB_NOTICE_DROPPED_OUTLINE_WIDGET_NAME_PREFIX + p.id);
+
+  // IMPORTANT:
+  // When hidden, clear the text first, then hide everything.
+  // This prevents the half-second UnknownString flash right before the banner disappears.
+  if (!visible) {
+    const empty = mod.Message(mod.stringkeys.EmptyText);
+
+    SafeSetTextLabelHandle(widget, empty);
+    SafeSetTextLabelHandle(detail, empty);
+    SafeSetTextLabelHandle(playerText, empty);
+
+    SafeSetWidgetBgAlphaHandle(leftAccent, 0);
+    SafeSetWidgetBgAlphaHandle(rightAccent, 0);
+    SafeSetWidgetBgAlphaHandle(playerContainer, 0);
+    SafeSetWidgetBgAlphaHandle(droppedOutline, 0);
+
+    SafeSetWidgetVisibleHandle(container, false);
+    SafeSetWidgetVisibleHandle(leftAccent, false);
+    SafeSetWidgetVisibleHandle(widget, false);
+    SafeSetWidgetVisibleHandle(rightAccent, false);
+    SafeSetWidgetVisibleHandle(detail, false);
+    SafeSetWidgetVisibleHandle(playerContainer, false);
+    SafeSetWidgetVisibleHandle(playerText, false);
+    SafeSetWidgetVisibleHandle(droppedOutline, false);
+
+    SafeSetTextAlphaHandle(widget, 0);
+    SafeSetTextAlphaHandle(detail, 0);
+    SafeSetTextAlphaHandle(playerText, 0);
+    return;
+  }
 
   try {
     const tone = getActiveBombNoticeToneForPlayer(p, resolvedNowSec);
@@ -15842,14 +16097,14 @@ function refreshBombNoticeUiForPlayer(p: Player, nowSec?: number, force: boolean
     const accentColor = getCipherEventBannerColorForTone(tone);
     const centerVisible = visible && kind === "center";
     const droppedVisible = visible && kind === "dropped";
-    const droppedOutline = mod.FindUIWidgetWithName(BOMB_NOTICE_DROPPED_OUTLINE_WIDGET_NAME_PREFIX + p.id);
+    const droppedOutline = SafeFindWidget(BOMB_NOTICE_DROPPED_OUTLINE_WIDGET_NAME_PREFIX + p.id);
     const eventMessage = getActiveBombNoticeMessageForPlayer(p, resolvedNowSec);
     const detailMessage = getActiveBombNoticeDetailForPlayer(p, resolvedNowSec);
     SafeSetWidgetBgColorHandle(container, tone === "neutral" ? BOMB_NOTICE_WIDGET_BG_COLOR : accentColor);
     SafeSetWidgetBgColorHandle(leftAccent, accentColor);
     SafeSetWidgetBgColorHandle(rightAccent, accentColor);
     SafeSetWidgetBgColorHandle(playerContainer, accentColor);
-    SafeSetWidgetBgColorHandle(droppedOutline, mod.CreateVector(1, 1, 1));
+    SafeSetWidgetBgColorHandle(droppedOutline, accentColor);
     SafeSetWidgetBgAlphaHandle(leftAccent, centerVisible ? 0.92 : 0);
     SafeSetWidgetBgAlphaHandle(rightAccent, droppedVisible ? 0.72 : 0);
     SafeSetWidgetBgAlphaHandle(playerContainer, droppedVisible ? 0.82 : 0);
@@ -15860,17 +16115,17 @@ function refreshBombNoticeUiForPlayer(p: Player, nowSec?: number, force: boolean
     SafeSetTextSizeHandle(widget, BOMB_NOTICE_WIDGET_TEXT_SIZE);
     SafeSetTextSizeHandle(detail, BOMB_NOTICE_DETAIL_TEXT_SIZE);
     SafeSetTextSizeHandle(playerText, BOMB_NOTICE_PLAYER_TEXT_SIZE);
-    mod.SetUIWidgetVisible(container, centerVisible);
-    mod.SetUIWidgetVisible(leftAccent, centerVisible);
-    mod.SetUIWidgetVisible(widget, centerVisible);
-    mod.SetUIWidgetVisible(rightAccent, droppedVisible);
-    mod.SetUIWidgetVisible(detail, droppedVisible);
-    mod.SetUIWidgetVisible(playerContainer, droppedVisible);
-    mod.SetUIWidgetVisible(playerText, droppedVisible);
-    if (droppedOutline) mod.SetUIWidgetVisible(droppedOutline, droppedVisible);
-    mod.SetUITextAlpha(widget, centerVisible ? 1 : 0);
-    mod.SetUITextAlpha(detail, droppedVisible ? 1 : 0);
-    mod.SetUITextAlpha(playerText, droppedVisible ? 1 : 0);
+    SafeSetWidgetVisibleHandle(container, centerVisible);
+    SafeSetWidgetVisibleHandle(leftAccent, centerVisible);
+    SafeSetWidgetVisibleHandle(widget, centerVisible);
+    SafeSetWidgetVisibleHandle(rightAccent, droppedVisible);
+    SafeSetWidgetVisibleHandle(detail, droppedVisible);
+    SafeSetWidgetVisibleHandle(playerContainer, droppedVisible);
+    SafeSetWidgetVisibleHandle(playerText, droppedVisible);
+    SafeSetWidgetVisibleHandle(droppedOutline, droppedVisible);
+    SafeSetTextAlphaHandle(widget, centerVisible ? 1 : 0);
+    SafeSetTextAlphaHandle(detail, droppedVisible ? 1 : 0);
+    SafeSetTextAlphaHandle(playerText, droppedVisible ? 1 : 0);
   } catch (_errNotice) {
     p.bombNoticeContainerWidget = null as any;
     p.bombNoticeLeftAccentWidget = null as any;
@@ -15883,10 +16138,10 @@ function refreshBombNoticeUiForPlayer(p: Player, nowSec?: number, force: boolean
 
 function refreshBombNoticeUiForAllPlayers(nowSec?: number, force: boolean = false): void {
   const resolvedNowSec = nowSec ?? getCurrentSchedulerNowSeconds();
+  const players = getValidHumanPlayersSnapshot();
 
-  serverPlayers.forEach((p) => {
-    if (!p) return;
-    if (isCipherRuntimeBotPlayerId(p.id) || isBotBackfillPlayerSafe(p.player)) return;
+  for (let i = 0; i < players.length; i++) {
+    const p = players[i];
 
     if (
       force ||
@@ -15896,15 +16151,15 @@ function refreshBombNoticeUiForAllPlayers(nowSec?: number, force: boolean = fals
       !p.bombNoticeTextWidget ||
       !p.bombNoticeDetailWidget
     ) {
-      p.bombNoticeContainerWidget = mod.FindUIWidgetWithName(BOMB_NOTICE_CONTAINER_WIDGET_NAME_PREFIX + p.id) as any;
-      p.bombNoticeLeftAccentWidget = mod.FindUIWidgetWithName(BOMB_NOTICE_LEFT_ACCENT_WIDGET_NAME_PREFIX + p.id) as any;
-      p.bombNoticeRightAccentWidget = mod.FindUIWidgetWithName(BOMB_NOTICE_RIGHT_ACCENT_WIDGET_NAME_PREFIX + p.id) as any;
-      p.bombNoticeTextWidget = mod.FindUIWidgetWithName(BOMB_NOTICE_WIDGET_NAME_PREFIX + p.id) as any;
-      p.bombNoticeDetailWidget = mod.FindUIWidgetWithName(BOMB_NOTICE_DETAIL_WIDGET_NAME_PREFIX + p.id) as any;
+      p.bombNoticeContainerWidget = SafeFindWidget(BOMB_NOTICE_CONTAINER_WIDGET_NAME_PREFIX + p.id) as any;
+      p.bombNoticeLeftAccentWidget = SafeFindWidget(BOMB_NOTICE_LEFT_ACCENT_WIDGET_NAME_PREFIX + p.id) as any;
+      p.bombNoticeRightAccentWidget = SafeFindWidget(BOMB_NOTICE_RIGHT_ACCENT_WIDGET_NAME_PREFIX + p.id) as any;
+      p.bombNoticeTextWidget = SafeFindWidget(BOMB_NOTICE_WIDGET_NAME_PREFIX + p.id) as any;
+      p.bombNoticeDetailWidget = SafeFindWidget(BOMB_NOTICE_DETAIL_WIDGET_NAME_PREFIX + p.id) as any;
     }
 
     refreshBombNoticeUiForPlayer(p, resolvedNowSec, force);
-  });
+  }
 }
 
 function getNextKeyUnlockHudStateKey(visible: boolean, remainingSeconds: number): string {
@@ -15915,6 +16170,7 @@ function getNextKeyUnlockHudStateKey(visible: boolean, remainingSeconds: number)
 function reassertNextKeyUnlockWidgetLayoutForPlayer(p: Player): void {
   const container = p.nextKeyUnlockContainerWidget;
   const widget = p.nextKeyUnlockTextWidget;
+
   SafeSetWidgetPositionHandle(container, NEXT_KEY_UNLOCK_WIDGET_POS);
   SafeSetWidgetSizeHandle(container, NEXT_KEY_UNLOCK_CONTAINER_SIZE);
   SafeSetWidgetDepthHandle(container, mod.UIDepth.AboveGameUI);
@@ -15922,7 +16178,7 @@ function reassertNextKeyUnlockWidgetLayoutForPlayer(p: Player): void {
   try { if (container) mod.SetUIWidgetBgAlpha(container, 0.5); } catch (_errAlpha) {}
   try { if (container) mod.SetUIWidgetBgFill(container, mod.UIBgFill.Blur); } catch (_errFill) {}
 
-  SafeSetWidgetPositionHandle(widget, mod.CreateVector(0, 0, 0));
+  SafeSetWidgetPositionHandle(widget, NEXT_KEY_UNLOCK_TEXT_POS);
   SafeSetWidgetSizeHandle(widget, NEXT_KEY_UNLOCK_WIDGET_SIZE);
   SafeSetWidgetDepthHandle(widget, mod.UIDepth.AboveGameUI);
   SafeSetTextColorHandle(widget, NEXT_KEY_UNLOCK_WIDGET_TEXT_COLOR);
@@ -15933,11 +16189,11 @@ function refreshNextKeyUnlockHudForPlayer(p: Player, nowSec?: number, force: boo
   let widget = p.nextKeyUnlockTextWidget;
   let container = p.nextKeyUnlockContainerWidget;
   if ((!widget || force) && gameStatus === 3) {
-    p.nextKeyUnlockTextWidget = mod.FindUIWidgetWithName(NEXT_KEY_UNLOCK_WIDGET_NAME_PREFIX + p.id) as any;
+    p.nextKeyUnlockTextWidget = SafeFindWidget(NEXT_KEY_UNLOCK_WIDGET_NAME_PREFIX + p.id) as any;
     widget = p.nextKeyUnlockTextWidget;
   }
   if ((!container || force) && gameStatus === 3) {
-    p.nextKeyUnlockContainerWidget = mod.FindUIWidgetWithName(NEXT_KEY_UNLOCK_CONTAINER_WIDGET_NAME_PREFIX + p.id) as any;
+    p.nextKeyUnlockContainerWidget = SafeFindWidget(NEXT_KEY_UNLOCK_CONTAINER_WIDGET_NAME_PREFIX + p.id) as any;
     container = p.nextKeyUnlockContainerWidget;
   }
   if (!widget || !container) {
@@ -15957,11 +16213,11 @@ function refreshNextKeyUnlockHudForPlayer(p: Player, nowSec?: number, force: boo
   try {
     SafeSetTextLabelHandle(widget, formatNextKeyHudTimerLabel(remainingSeconds));
     SafeSetTextSizeHandle(widget, NEXT_KEY_UNLOCK_WIDGET_TEXT_SIZE);
-    mod.SetUIWidgetVisible(container, visible);
-    mod.SetUIWidgetVisible(widget, visible);
-    mod.SetUITextAlpha(widget, visible ? 1 : 0);
-    mod.SetUIWidgetDepth(container, mod.UIDepth.AboveGameUI);
-    mod.SetUIWidgetDepth(widget, mod.UIDepth.AboveGameUI);
+    SafeSetWidgetVisibleHandle(container, visible);
+    SafeSetWidgetVisibleHandle(widget, visible);
+    SafeSetTextAlphaHandle(widget, visible ? 1 : 0);
+    SafeSetWidgetDepthHandle(container, mod.UIDepth.AboveGameUI);
+    SafeSetWidgetDepthHandle(widget, mod.UIDepth.AboveGameUI);
   } catch (_errNextKeyHud) {
     p.nextKeyUnlockContainerWidget = null as any;
     p.nextKeyUnlockTextWidget = null as any;
@@ -15973,12 +16229,11 @@ function refreshNextKeyUnlockHudForPlayer(p: Player, nowSec?: number, force: boo
 
 function refreshNextKeyUnlockHudForAllPlayers(nowSec?: number, force: boolean = false): void {
   const resolvedNowSec = nowSec ?? getCurrentSchedulerNowSeconds();
+  const players = getValidHumanPlayersSnapshot();
 
-  serverPlayers.forEach((p) => {
-    if (!p) return;
-    if (isCipherRuntimeBotPlayerId(p.id) || isBotBackfillPlayerSafe(p.player)) return;
-    refreshNextKeyUnlockHudForPlayer(p, resolvedNowSec, force);
-  });
+  for (let i = 0; i < players.length; i++) {
+    refreshNextKeyUnlockHudForPlayer(players[i], resolvedNowSec, force);
+  }
 }
 
 function updateNextKeyUnlockCountdownVisuals(nowSec?: number, force: boolean = false): void {
@@ -16000,7 +16255,9 @@ function clearNextKeyUnlockCountdown(context: string, forceHudRefresh: boolean =
   nextKeyUnlockLabelMode = "next_key";
   clearNextKeyUnlockRuntimeWorldIcon(context);
   nextKeyUnlockHudLastStateByPlayerId = {};
-  if (forceHudRefresh) refreshNextKeyUnlockHudForAllPlayers(undefined, true);
+  if (forceHudRefresh) {
+    queueCipherKeyUiRefresh("clearNextKeyUnlockCountdown/" + context, { force: true, refreshNextKey: true }, 1);
+  }
 }
 
 function clearBombNoticeState(): void {
@@ -16013,7 +16270,7 @@ function clearBombNoticeState(): void {
   bombNoticeKindByPlayerId = {};
   bombNoticeVisibleUntilSecByPlayerId = {};
   bombNoticeTokenByPlayerId = {};
-  refreshBombNoticeUiForAllPlayers(undefined, true);
+  queueCipherKeyUiRefresh("clearBombNoticeState", { force: true, refreshBombNotice: true }, 1);
 }
 
 async function hideBombNoticeForPlayerAfterDelay(
@@ -16028,32 +16285,11 @@ async function hideBombNoticeForPlayerAfterDelay(
   delete bombNoticeDetailMessageByPlayerId[playerId];
   delete bombNoticeToneByPlayerId[playerId];
   delete bombNoticeKindByPlayerId[playerId];
-  const sp = serverPlayers.get(playerId);
-  if (sp) refreshBombNoticeUiForPlayer(sp, undefined, true);
-}
-
-async function animateBombNoticeForPlayer(playerId: number, token: number): Promise<void> {
-  const steps = [0.35, 0.7, 1];
-  for (let i = 0; i < steps.length; i++) {
-    if (i > 0) await mod.Wait(0.05);
-    if ((bombNoticeTokenByPlayerId[playerId] ?? 0) !== token) return;
-    const p = serverPlayers.get(playerId);
-    if (!p) return;
-    const scale = steps[i];
-    try {
-      const playerContainer = mod.FindUIWidgetWithName(BOMB_NOTICE_PLAYER_CONTAINER_WIDGET_NAME_PREFIX + playerId);
-      const playerText = mod.FindUIWidgetWithName(BOMB_NOTICE_PLAYER_TEXT_WIDGET_NAME_PREFIX + playerId);
-      if (p.bombNoticeContainerWidget) mod.SetUIWidgetBgAlpha(p.bombNoticeContainerWidget, 0.58 * scale);
-      if (p.bombNoticeLeftAccentWidget) mod.SetUIWidgetBgAlpha(p.bombNoticeLeftAccentWidget, 0.92 * scale);
-      if (p.bombNoticeRightAccentWidget) mod.SetUIWidgetBgAlpha(p.bombNoticeRightAccentWidget, 0.72 * scale);
-      if (playerContainer) mod.SetUIWidgetBgAlpha(playerContainer, 0.82 * scale);
-      if (p.bombNoticeTextWidget) mod.SetUITextAlpha(p.bombNoticeTextWidget, scale);
-      if (p.bombNoticeDetailWidget) mod.SetUITextAlpha(p.bombNoticeDetailWidget, scale);
-      if (playerText) mod.SetUITextAlpha(playerText, scale);
-    } catch (_errAnimate) {
-      return;
-    }
-  }
+  queueCipherKeyUiRefresh(
+    "hideBombNoticeForPlayerAfterDelay/" + String(playerId),
+    { force: true, refreshBombNotice: true },
+    1
+  );
 }
 
 function showBombNoticeForAllPlayers(
@@ -16097,8 +16333,11 @@ function showBombNoticeForPlayerDetailed(
   bombNoticeKindByPlayerId[playerId] = kind;
   const nowSec = getCurrentSchedulerNowSeconds();
   bombNoticeVisibleUntilSecByPlayerId[playerId] = nowSec + durationSeconds;
-  refreshBombNoticeUiForPlayer(sp, nowSec, true);
-  void animateBombNoticeForPlayer(playerId, token);
+  queueCipherKeyUiRefresh(
+    "showBombNoticeForPlayerDetailed/" + String(playerId),
+    { force: true, refreshBombNotice: true },
+    0
+  );
   void hideBombNoticeForPlayerAfterDelay(playerId, token, durationSeconds);
 }
 
@@ -16200,13 +16439,13 @@ function showCipherKeyDeliveryNoticeForTeam(
         : "WE CIPHERED " + symbolText + " NODE"
       : "ENEMY CIPHERED " + symbolText + " NODE";
     showBombNoticeForPlayerDetailed(
-      viewer.id,
-      undefined,
-      deliveryText,
-      mod.Message(mod.stringkeys.EmptyText),
-      friendly ? "friendly" : "enemy",
-      BOMB_NOTICE_DURATION_SECONDS,
-      "center"
+    viewer.id,
+    deliveryText,
+    deliveryText,
+    mod.Message(mod.stringkeys.EmptyText),
+    friendly ? "friendly" : "enemy",
+    BOMB_NOTICE_DURATION_SECONDS,
+    "center"
     );
   }
 }
@@ -16214,22 +16453,20 @@ function showCipherKeyDeliveryNoticeForTeam(
 function refreshCipherKeyUiAndIconsImmediately(reason: string): void {
   if (gameStatus !== 3) return;
 
-  const nowSec = getCurrentSchedulerNowSeconds();
-
-  refreshCipherKeyPlayerSnapshots(reason);
-  repairCipherKeyHudCachesForAllPlayers(true);
-  refreshBombNoticeUiForAllPlayers(nowSec, true);
-  updateNextKeyUnlockCountdownVisuals(nowSec, true);
-  UpdateBombCarrierUiForAllPlayers(nowSec, true);
-  SetUIScores();
-
-  if (bombCarrierPlayerId !== undefined) {
-    syncCipherCarrierVisualsNow(nowSec, reason);
-    updateBombCarrierBeepLoopTick(nowSec);
-  }
-
-  ensureDroppedBombRuntimeWorldIconVisibleIfNeeded();
-  ensureBaseBombRuntimeWorldIconVisibleIfNeeded();
+  queueCipherKeyUiRefresh(
+    reason,
+    {
+      force: true,
+      rebuildHud: true,
+      refreshBombNotice: true,
+      refreshNextKey: true,
+      updateCarrierHud: true,
+      updateScores: true,
+      updateIcons: true,
+      syncCarrierVisuals: true,
+    },
+    1
+  );
 }
 
 
@@ -16279,7 +16516,10 @@ function UpdateTopFlagColorsForPlayer(p: Player): void {
 }
 
 function UpdateTopFlagColorsForAllPlayers(): void {
-  serverPlayers.forEach((p) => UpdateTopFlagColorsForPlayer(p));
+  const players = getValidHumanPlayersSnapshot();
+  for (let i = 0; i < players.length; i++) {
+    UpdateTopFlagColorsForPlayer(players[i]);
+  }
 }
 
 function getCipherScoreProgressWidth(score: number): number {
@@ -16305,10 +16545,12 @@ function getLiveScorePanelTimeLabel(nowSec?: number): any {
 
 function UpdateLiveScorePanelTimeForAllPlayers(nowSec?: number): void {
   const label = getLiveScorePanelTimeLabel(nowSec);
-  serverPlayers.forEach((p) => {
-    const timeText = mod.FindUIWidgetWithName(CIPHER_LIVE_TIME_TEXT_WIDGET_NAME_PREFIX + p.id);
+  const players = getValidHumanPlayersSnapshot();
+  for (let i = 0; i < players.length; i++) {
+    const p = players[i];
+    const timeText = SafeFindWidget(CIPHER_LIVE_TIME_TEXT_WIDGET_NAME_PREFIX + p.id);
     SafeSetTextLabelHandle(timeText, label);
-  });
+  }
 }
 
 function getCipherViewerMatchStatusMessage(p: Player): { message: any; color: mod.Vector } {
@@ -16378,26 +16620,75 @@ function getCipherCarrierStatusForPlayer(p: Player): { message: any; color: mod.
 
 // Ticket bar fills shrink with the viewer's friendly/opponent tickets.
 function UpdateTopTicketBarsForPlayer(p: Player): void {
+  if (gameStatus !== 3) {
+    const friendlyFill = SafeFindWidget(CIPHER_FRIENDLY_PROGRESS_FILL_WIDGET_NAME_PREFIX + p.id);
+    const enemyFill = SafeFindWidget(CIPHER_ENEMY_PROGRESS_FILL_WIDGET_NAME_PREFIX + p.id);
+
+    SafeSetWidgetVisibleHandle(friendlyFill, false);
+    SafeSetWidgetVisibleHandle(enemyFill, false);
+
+    try { if (friendlyFill) mod.SetUIWidgetBgAlpha(friendlyFill, 0); } catch (_errFriendlyAlpha) {}
+    try { if (enemyFill) mod.SetUIWidgetBgAlpha(enemyFill, 0); } catch (_errEnemyAlpha) {}
+
+    return;
+  }
   const currentTeam = mod.GetTeam(p.player);
   const friendly = getFriendlyScore(currentTeam);
   const enemy = getOpponentScore(currentTeam);
-  const friendlyFill = mod.FindUIWidgetWithName(CIPHER_FRIENDLY_PROGRESS_FILL_WIDGET_NAME_PREFIX + p.id);
-  const enemyFill = mod.FindUIWidgetWithName(CIPHER_ENEMY_PROGRESS_FILL_WIDGET_NAME_PREFIX + p.id);
-  const friendlyScore = p.friendlyScoreWidget ?? mod.FindUIWidgetWithName(CIPHER_FRIENDLY_SCORE_TEXT_WIDGET_NAME_PREFIX + p.id);
-  const enemyScore = p.opponentScoreWidget ?? mod.FindUIWidgetWithName(CIPHER_ENEMY_SCORE_TEXT_WIDGET_NAME_PREFIX + p.id);
-  const status = mod.FindUIWidgetWithName(CIPHER_LIVE_STATUS_WIDGET_NAME_PREFIX + p.id);
-  const carrierStatus = mod.FindUIWidgetWithName(CIPHER_LIVE_CARRIER_STATUS_WIDGET_NAME_PREFIX + p.id);
+
+  const friendlyFill = SafeFindWidget(CIPHER_FRIENDLY_PROGRESS_FILL_WIDGET_NAME_PREFIX + p.id);
+  const enemyFill = SafeFindWidget(CIPHER_ENEMY_PROGRESS_FILL_WIDGET_NAME_PREFIX + p.id);
+
+  const friendlyScore =
+    p.friendlyScoreWidget ??
+    SafeFindWidget(CIPHER_FRIENDLY_SCORE_TEXT_WIDGET_NAME_PREFIX + p.id);
+
+  const enemyScore =
+    p.opponentScoreWidget ??
+    SafeFindWidget(CIPHER_ENEMY_SCORE_TEXT_WIDGET_NAME_PREFIX + p.id);
+
+  const status = SafeFindWidget(CIPHER_LIVE_STATUS_WIDGET_NAME_PREFIX + p.id);
+  const carrierStatus = SafeFindWidget(CIPHER_LIVE_CARRIER_STATUS_WIDGET_NAME_PREFIX + p.id);
+
   const friendlyWidth = getCipherScoreProgressWidth(friendly);
   const enemyWidth = getCipherScoreProgressWidth(enemy);
 
-  SafeSetTextLabelHandle(friendlyScore, mod.Message((mod.stringkeys as any).Text_FRIENDLY_SCORE, friendly));
-  SafeSetTextLabelHandle(enemyScore, mod.Message((mod.stringkeys as any).Text_ENEMY_SCORE, enemy));
-  SafeSetWidgetSizeHandle(friendlyFill, mod.CreateVector(friendlyWidth, CIPHER_SCORE_PROGRESS_HEIGHT, 0));
-  SafeSetWidgetSizeHandle(enemyFill, mod.CreateVector(enemyWidth, CIPHER_SCORE_PROGRESS_HEIGHT, 0));
+  SafeSetTextLabelHandle(
+    friendlyScore,
+    mod.Message((mod.stringkeys as any).Text_FRIENDLY_SCORE, friendly)
+  );
+
+  SafeSetTextLabelHandle(
+    enemyScore,
+    mod.Message((mod.stringkeys as any).Text_ENEMY_SCORE, enemy)
+  );
+
+  // IMPORTANT FIX:
+  // Always re-lock the fills to the left edge of the ticker lanes.
+  // If the engine treats the fill as center-anchored after resizing, this prevents it from drifting.
+  SafeSetWidgetPositionHandle(friendlyFill, CIPHER_FRIENDLY_PROGRESS_POS);
+  SafeSetWidgetPositionHandle(enemyFill, CIPHER_ENEMY_PROGRESS_POS);
+
+  SafeSetWidgetSizeHandle(
+    friendlyFill,
+    mod.CreateVector(friendlyWidth, CIPHER_SCORE_PROGRESS_HEIGHT, 0)
+  );
+
+  SafeSetWidgetSizeHandle(
+    enemyFill,
+    mod.CreateVector(enemyWidth, CIPHER_SCORE_PROGRESS_HEIGHT, 0)
+  );
+
   SafeSetWidgetVisibleHandle(friendlyFill, friendlyWidth > 0);
   SafeSetWidgetVisibleHandle(enemyFill, enemyWidth > 0);
+
   SafeSetWidgetBgColorHandle(friendlyFill, COLOR_FRIENDLY);
   SafeSetWidgetBgColorHandle(enemyFill, COLOR_ENEMY);
+
+  // Restore alpha when live starts again.
+  // The postmatch hide path sets fill alpha to 0 to prevent leftover bars.
+  try { if (friendlyFill) mod.SetUIWidgetBgAlpha(friendlyFill, 0.8); } catch (_errFriendlyAlpha) {}
+  try { if (enemyFill) mod.SetUIWidgetBgAlpha(enemyFill, 0.5); } catch (_errEnemyAlpha) {}
 
   const statusState = getCipherViewerMatchStatusMessage(p);
   SafeSetTextLabelHandle(status, statusState.message);
@@ -16417,7 +16708,9 @@ function UpdateTopTicketBarsForPlayer(p: Player): void {
 // -------------------------------------------------------------------------------------------------
 
 
-function SafeFindWidget(name: string): mod.UIWidget | null {
+function SafeFindWidget(name: string | undefined | null): mod.UIWidget | null {
+  if (!isValidUiWidgetName(name)) return null;
+
   try {
     const w = mod.FindUIWidgetWithName(name);
     return w ? w : null;
@@ -20354,6 +20647,7 @@ function enterPostmatchFromLive(forcedWinner?: mod.Team): void {
   const live = mod.FindUIWidgetWithName("LiveContainer");
   if (live) mod.SetUIWidgetVisible(live, false);
   setLiveScorePanelVisible(false);
+  hideCipherLiveHudForAllPlayers();
 }
 
 
@@ -20599,8 +20893,8 @@ function SafeSetWorldIconTextById(iconId: number, textLabel: any): void {
 
 
 function SetUITime(nowSec?: number): void {
-  const timeWidget = mod.FindUIWidgetWithName("RemainingTime");
-  const introValueWidget = mod.FindUIWidgetWithName("LiveTimerIntroValue");
+  const timeWidget = SafeFindWidget("RemainingTime");
+  const introValueWidget = SafeFindWidget("LiveTimerIntroValue");
   if (!timeWidget && !introValueWidget) return;
 
   const resolvedNow = nowSec !== undefined ? nowSec : getCurrentSchedulerNowSeconds();
@@ -20649,7 +20943,10 @@ function getOpponentScore(team: mod.Team): number {
 
 
 function SetUIScores(): void {
-  serverPlayers.forEach((p) => p.updateTickets());
+  const players = getValidHumanPlayersSnapshot();
+  for (let i = 0; i < players.length; i++) {
+    players[i].updateTickets();
+  }
 }
 
 /* =================================================================================================
@@ -20755,6 +21052,365 @@ function getCipherKeyUiPlayerSnapshot(lazyRefresh: boolean = true): Player[] {
   }
 
   return players;
+}
+
+function isValidHumanPlayerState(p: Player | undefined): p is Player {
+  if (!p) return false;
+
+  try {
+    if (!mod.IsPlayerValid(p.player)) return false;
+  } catch (_errValid) {
+    return false;
+  }
+
+  if (isCipherRuntimeBotPlayerId(p.id)) return false;
+
+  try {
+    if (isBotBackfillPlayerSafe(p.player)) return false;
+  } catch (_errBot) {
+    return false;
+  }
+
+  return true;
+}
+
+function getValidHumanPlayerById(playerId: number): Player | undefined {
+  const p = serverPlayers.get(playerId);
+  return isValidHumanPlayerState(p) ? p : undefined;
+}
+
+function getValidHumanPlayersSnapshot(): Player[] {
+  const players: Player[] = [];
+  serverPlayers.forEach((p) => {
+    if (isValidHumanPlayerState(p)) players.push(p);
+  });
+  return players;
+}
+
+function queueLiveHudBuild(
+  playerId: number,
+  reason: string,
+  priority: LiveHudQueuePriority = "normal",
+  delayTicks: number = 0
+): void {
+  const p = getValidHumanPlayerById(playerId);
+  if (!p) return;
+  if (gameStatus !== 3) return;
+
+  const dueTick = phaseTickCount + mod.Max(0, delayTicks);
+  markCipherKeyHudDirtyForPlayer(playerId);
+
+  if (liveHudBuildQueuedByPlayerId[playerId] === true) {
+    for (let i = 0; i < liveHudBuildQueue.length; i++) {
+      const item = liveHudBuildQueue[i];
+      if (item.playerId !== playerId) continue;
+      item.dueTick = Math.min(item.dueTick, dueTick);
+      if (priority === "urgent") item.priority = "urgent";
+      item.reason = reason;
+      return;
+    }
+
+    delete liveHudBuildQueuedByPlayerId[playerId];
+  }
+
+  const item: LiveHudBuildQueueItem = { playerId, reason, dueTick, priority };
+  liveHudBuildQueuedByPlayerId[playerId] = true;
+  if (priority === "urgent") liveHudBuildQueue.unshift(item);
+  else liveHudBuildQueue.push(item);
+}
+
+function queueLiveHudBuildForAll(reason: string, priority: LiveHudQueuePriority = "normal", delayTicks: number = 0): void {
+  const players = getValidHumanPlayersSnapshot();
+  for (let i = 0; i < players.length; i++) {
+    queueLiveHudBuild(players[i].id, reason, priority, delayTicks);
+  }
+}
+
+function clearLiveHudQueueForPlayer(playerId: number): void {
+  liveHudBuildQueue = liveHudBuildQueue.filter((item) => item.playerId !== playerId);
+  delete liveHudBuildQueuedByPlayerId[playerId];
+}
+
+function clearLiveHudQueues(): void {
+  liveHudBuildQueue = [];
+  liveHudBuildQueuedByPlayerId = {};
+}
+
+function mergeCipherKeyUiRefreshFlags(
+  base: CipherKeyUiRefreshFlags,
+  incoming: CipherKeyUiRefreshFlags
+): CipherKeyUiRefreshFlags {
+  return {
+    force: base.force === true || incoming.force === true,
+    rebuildHud: base.rebuildHud === true || incoming.rebuildHud === true,
+    refreshBombNotice: base.refreshBombNotice === true || incoming.refreshBombNotice === true,
+    refreshNextKey: base.refreshNextKey === true || incoming.refreshNextKey === true,
+    updateCarrierHud: base.updateCarrierHud === true || incoming.updateCarrierHud === true,
+    updateScores: base.updateScores === true || incoming.updateScores === true,
+    updateIcons: base.updateIcons === true || incoming.updateIcons === true,
+    syncCarrierVisuals: base.syncCarrierVisuals === true || incoming.syncCarrierVisuals === true,
+    syncHybridSurface: base.syncHybridSurface === true || incoming.syncHybridSurface === true,
+    pickupNoticeTeamId: incoming.pickupNoticeTeamId ?? base.pickupNoticeTeamId,
+  };
+}
+
+function queueCipherKeyUiRefresh(
+  reason: string,
+  flags: CipherKeyUiRefreshFlags,
+  delayTicks: number = 1
+): void {
+  if (gameStatus !== 3) return;
+
+  const dueTick = phaseTickCount + mod.Max(0, delayTicks);
+  for (let i = 0; i < cipherKeyUiRefreshQueue.length; i++) {
+    const item = cipherKeyUiRefreshQueue[i];
+    const existingTeam = item.flags.pickupNoticeTeamId ?? 0;
+    const incomingTeam = flags.pickupNoticeTeamId ?? 0;
+    if (item.dueTick !== dueTick || existingTeam !== incomingTeam) continue;
+
+    item.flags = mergeCipherKeyUiRefreshFlags(item.flags, flags);
+    item.reason = item.reason + ";" + reason;
+    return;
+  }
+
+  cipherKeyUiRefreshQueue.push({ reason, dueTick, flags });
+}
+
+function clearCipherKeyUiRefreshQueue(): void {
+  cipherKeyUiRefreshQueue = [];
+}
+
+function runCipherKeyUiRefreshJob(item: CipherKeyUiRefreshQueueItem): void {
+  if (gameStatus !== 3) return;
+
+  const flags = item.flags;
+  const nowSec = getCurrentSchedulerNowSeconds();
+  refreshCipherKeyPlayerSnapshots(item.reason);
+
+  if (flags.pickupNoticeTeamId === 1) {
+    showCipherKeyPickupNoticeForTeam(team1);
+  } else if (flags.pickupNoticeTeamId === 2) {
+    showCipherKeyPickupNoticeForTeam(team2);
+  }
+
+  if (flags.rebuildHud === true) {
+    queueLiveHudBuildForAll("key_ui_refresh/" + item.reason, "normal", 1);
+  }
+
+  if (flags.refreshBombNotice === true) {
+    refreshBombNoticeUiForAllPlayers(nowSec, flags.force === true);
+  }
+
+  if (flags.refreshNextKey === true) {
+    updateNextKeyUnlockCountdownVisuals(nowSec, flags.force === true);
+  }
+
+  if (flags.updateCarrierHud === true) {
+    const carrierAlpha = getBombCarrierPulseAlpha(nowSec);
+    const carrierAlphaBucket = mod.Floor(carrierAlpha * 100);
+    const players = getValidHumanPlayersSnapshot();
+    for (let i = 0; i < players.length; i++) {
+      const p = players[i];
+      const visible = bombCarrierPlayerId === p.id;
+      applyBombCarrierHudStateForPlayer(p, visible, visible ? carrierAlpha : 1, visible ? carrierAlphaBucket : 100, flags.force === true);
+    }
+    UpdateBombCarrierUiForAllPlayers(nowSec, flags.force === true);
+  }
+
+  if (flags.updateScores === true) {
+    SetUIScores();
+  }
+
+  if (flags.syncCarrierVisuals === true && bombCarrierPlayerId !== undefined) {
+    syncCipherCarrierVisualsNow(nowSec, item.reason);
+    updateBombCarrierBeepLoopTick(nowSec);
+  }
+
+  if (flags.updateIcons === true) {
+    ensureDroppedBombRuntimeWorldIconVisibleIfNeeded();
+    ensureBaseBombRuntimeWorldIconVisibleIfNeeded();
+  }
+
+  if (flags.syncHybridSurface === true && gameStatus === 3 && initialization[3] === true) {
+    syncLiveHybridObjectiveSurfaceState(item.reason);
+  }
+}
+
+function processCipherKeyUiRefreshQueue(): void {
+  if (gameStatus !== 3) {
+    clearCipherKeyUiRefreshQueue();
+    return;
+  }
+
+  let processed = 0;
+  for (let i = 0; i < cipherKeyUiRefreshQueue.length && processed < CIPHER_KEY_UI_REFRESHES_PER_TICK;) {
+    const item = cipherKeyUiRefreshQueue[i];
+    if (item.dueTick > phaseTickCount) {
+      i += 1;
+      continue;
+    }
+
+    cipherKeyUiRefreshQueue.splice(i, 1);
+    try {
+      runCipherKeyUiRefreshJob(item);
+    } catch (err) {
+      LogRuntimeError("processCipherKeyUiRefresh/" + item.reason, err);
+    }
+    processed += 1;
+  }
+}
+
+function takeNextDueLiveHudBuild(): LiveHudBuildQueueItem | undefined {
+  let normalIndex = -1;
+
+  for (let i = 0; i < liveHudBuildQueue.length; i++) {
+    const item = liveHudBuildQueue[i];
+    if (item.dueTick > phaseTickCount) continue;
+    if (item.priority === "urgent") {
+      liveHudBuildQueue.splice(i, 1);
+      delete liveHudBuildQueuedByPlayerId[item.playerId];
+      return item;
+    }
+    if (normalIndex < 0) normalIndex = i;
+  }
+
+  if (normalIndex >= 0) {
+    const item = liveHudBuildQueue.splice(normalIndex, 1)[0];
+    delete liveHudBuildQueuedByPlayerId[item.playerId];
+    return item;
+  }
+
+  return undefined;
+}
+
+function processLiveHudQueues(): void {
+  if (gameStatus !== 3) return;
+
+  let builds = 0;
+  while (builds < LIVE_HUD_BUILDS_PER_TICK) {
+    const item = takeNextDueLiveHudBuild();
+    if (!item) break;
+
+    const p = getValidHumanPlayerById(item.playerId);
+    if (!p) continue;
+
+    try {
+      if (!restrictedAreaRootWidgetByPlayerId[p.id]) {
+        buildRestrictedAreaUiForPlayer(p);
+      }
+
+      SafeSetWidgetVisibleByName("LiveContainer", true);
+      rebuildPlayerLiveHud(p);
+      repairCipherKeyHudCacheForPlayer(p, false);
+    } catch (err) {
+      LogRuntimeError("processLiveHudBuild/" + item.reason + "/" + String(item.playerId), err);
+      liveHudBuiltByPlayerId[item.playerId] = false;
+      markCipherKeyHudDirtyForPlayer(item.playerId);
+    }
+
+    builds += 1;
+  }
+
+  repairDirtyCipherKeyHudCaches(LIVE_HUD_REPAIRS_PER_TICK);
+}
+
+function getPhasePlayerOperationQueueKey(playerId: number, kind: PhasePlayerOperationKind): string {
+  return kind + ":" + String(playerId);
+}
+
+function queuePhasePlayerOperation(
+  playerId: number,
+  kind: PhasePlayerOperationKind,
+  reason: string,
+  delayTicks: number = 0
+): void {
+  const p = getValidHumanPlayerById(playerId);
+  if (!p) return;
+
+  const key = getPhasePlayerOperationQueueKey(playerId, kind);
+  const dueTick = phaseTickCount + mod.Max(0, delayTicks);
+
+  if (phasePlayerOperationQueuedByKey[key] === true) {
+    for (let i = 0; i < phasePlayerOperationQueue.length; i++) {
+      const item = phasePlayerOperationQueue[i];
+      if (item.playerId !== playerId || item.kind !== kind) continue;
+      item.dueTick = Math.min(item.dueTick, dueTick);
+      item.reason = reason;
+      return;
+    }
+
+    delete phasePlayerOperationQueuedByKey[key];
+  }
+
+  phasePlayerOperationQueuedByKey[key] = true;
+  phasePlayerOperationQueue.push({ playerId, kind, reason, dueTick });
+}
+
+function queuePhasePlayerOperationForAll(kind: PhasePlayerOperationKind, reason: string, delayTicks: number = 0): void {
+  const players = getValidHumanPlayersSnapshot();
+  for (let i = 0; i < players.length; i++) {
+    queuePhasePlayerOperation(players[i].id, kind, reason, delayTicks);
+  }
+}
+
+function clearPhasePlayerOperationsForPlayer(playerId: number): void {
+  phasePlayerOperationQueue = phasePlayerOperationQueue.filter((item) => item.playerId !== playerId);
+  delete phasePlayerOperationQueuedByKey[getPhasePlayerOperationQueueKey(playerId, "deploy")];
+  delete phasePlayerOperationQueuedByKey[getPhasePlayerOperationQueueKey(playerId, "undeploy")];
+}
+
+function clearPhasePlayerOperationQueues(): void {
+  phasePlayerOperationQueue = [];
+  phasePlayerOperationQueuedByKey = {};
+  preliveTransitionSpawnPendingAfterUndeploy = false;
+}
+
+function hasPendingPhasePlayerOperations(kind?: PhasePlayerOperationKind): boolean {
+  for (let i = 0; i < phasePlayerOperationQueue.length; i++) {
+    if (kind === undefined || phasePlayerOperationQueue[i].kind === kind) return true;
+  }
+  return false;
+}
+
+function processPhasePlayerOperationQueue(): void {
+  if (phasePlayerOperationQueue.length <= 0) return;
+
+  let processed = 0;
+  for (let i = 0; i < phasePlayerOperationQueue.length && processed < PHASE_PLAYER_OPS_PER_TICK;) {
+    const item = phasePlayerOperationQueue[i];
+    if (item.dueTick > phaseTickCount) {
+      i += 1;
+      continue;
+    }
+
+    phasePlayerOperationQueue.splice(i, 1);
+    delete phasePlayerOperationQueuedByKey[getPhasePlayerOperationQueueKey(item.playerId, item.kind)];
+
+    const p = getValidHumanPlayerById(item.playerId);
+    if (!p) continue;
+
+    try {
+      if (item.kind === "undeploy") {
+        mod.UndeployPlayer(p.player);
+        p.isDeployed = false;
+      } else {
+        mod.SetRedeployTime(p.player, 0);
+        mod.DeployPlayer(p.player);
+      }
+    } catch (err) {
+      LogRuntimeError("processPhasePlayerOperation/" + item.kind + "/" + item.reason + "/" + String(item.playerId), err);
+    }
+
+    processed += 1;
+  }
+}
+
+function flushPreliveTransitionSpawnRequestsAfterUndeploy(): void {
+  if (!preliveTransitionSpawnPendingAfterUndeploy) return;
+  if (hasPendingPhasePlayerOperations("undeploy")) return;
+
+  preliveTransitionSpawnPendingAfterUndeploy = false;
+  requestTransitionSpawnForAllTransitionPlayers("prelive_start");
 }
 
 let playerInDamageZone: { [playerId: number]: boolean } = {};
@@ -21517,71 +22173,88 @@ class Player {
   updateTickets(): void {
     if (!this.friendlyScoreWidget || !this.opponentScoreWidget) return;
 
-    const currentTeam = mod.GetTeam(this.player);
+    try {
+      const currentTeam = mod.GetTeam(this.player);
 
-    const friendly = getFriendlyScore(currentTeam);
-    const enemy = getOpponentScore(currentTeam);
+      const friendly = getFriendlyScore(currentTeam);
+      const enemy = getOpponentScore(currentTeam);
 
-    mod.SetUITextLabel(this.friendlyScoreWidget, mod.Message((mod.stringkeys as any).Text_FRIENDLY_SCORE, friendly));
-    mod.SetUITextLabel(this.opponentScoreWidget, mod.Message((mod.stringkeys as any).Text_ENEMY_SCORE, enemy));
+      SafeSetTextLabelHandle(this.friendlyScoreWidget, mod.Message((mod.stringkeys as any).Text_FRIENDLY_SCORE, friendly));
+      SafeSetTextLabelHandle(this.opponentScoreWidget, mod.Message((mod.stringkeys as any).Text_ENEMY_SCORE, enemy));
 
-    UpdateTopTicketBarsForPlayer(this);
+      UpdateTopTicketBarsForPlayer(this);
 
-    // NEW: keep top flag colors correct when the player's team changes mid-match
-    UpdateTopFlagColorsForPlayer(this);
+      // NEW: keep top flag colors correct when the player's team changes mid-match
+      UpdateTopFlagColorsForPlayer(this);
+    } catch (_err) {
+      this.friendlyScoreWidget = null as any;
+      this.opponentScoreWidget = null as any;
+      markCipherKeyHudDirtyForPlayer(this.id);
+    }
   }
 
 
   updateUIPlayersOnPoint(): void {
     if (!this.friendlyCapWidget || !this.enemyCapWidget) return;
 
-    const point = this.getCapturePoint();
-    if (!point) return;
+    try {
+      const point = this.getCapturePoint();
+      if (!point) return;
 
-    const cp = serverCapturePoints[mod.GetObjId(point)];
-    const team = mod.GetTeam(this.player);
+      const cp = serverCapturePoints[mod.GetObjId(point)];
+      const team = mod.GetTeam(this.player);
 
-    if (modlib.Equals(team, team1)) {
-      mod.SetUITextLabel(this.friendlyCapWidget, mod.Message(cp.getOnPoint()[0]));
-      mod.SetUITextLabel(this.enemyCapWidget, mod.Message(cp.getOnPoint()[1]));
-    } else {
-      mod.SetUITextLabel(this.friendlyCapWidget, mod.Message(cp.getOnPoint()[1]));
-      mod.SetUITextLabel(this.enemyCapWidget, mod.Message(cp.getOnPoint()[0]));
+      if (modlib.Equals(team, team1)) {
+        SafeSetTextLabelHandle(this.friendlyCapWidget, mod.Message(cp.getOnPoint()[0]));
+        SafeSetTextLabelHandle(this.enemyCapWidget, mod.Message(cp.getOnPoint()[1]));
+      } else {
+        SafeSetTextLabelHandle(this.friendlyCapWidget, mod.Message(cp.getOnPoint()[1]));
+        SafeSetTextLabelHandle(this.enemyCapWidget, mod.Message(cp.getOnPoint()[0]));
+      }
+    } catch (_err) {
+      this.friendlyCapWidget = null as any;
+      this.enemyCapWidget = null as any;
+      markCipherKeyHudDirtyForPlayer(this.id);
     }
   }
 
   updateUIProgress(): void {
     if (!this.progressBarWidget) return;
 
-    const point = this.getCapturePoint();
-    if (!point) return;
+    try {
+      const point = this.getCapturePoint();
+      if (!point) return;
 
-    const cp = serverCapturePoints[mod.GetObjId(point)];
-    const team = mod.GetTeam(this.player);
-    const capturingTeam = cp.getCapturingTeam();
+      const cp = serverCapturePoints[mod.GetObjId(point)];
+      const team = mod.GetTeam(this.player);
+      const capturingTeam = cp.getCapturingTeam();
 
-    let prog = cp.getCaptureProgress();
+      let prog = cp.getCaptureProgress();
 
-    if (mod.Equals(cp.getOwner(), team) && prog >= PROGRESS_FULL) {
-      prog = 1;
-    }
-
-    const size = mod.CreateVector(mod.Ceiling(60 * prog), 60, 0);
-
-    if (this.progressBarWidget) {
-      mod.SetUIWidgetSize(this.progressBarWidget, size);
-
-      if (!mod.Equals(capturingTeam, teamNeutral) && prog > PROGRESS_EMPTY && prog < PROGRESS_FULL) {
-        if (mod.Equals(capturingTeam, team)) mod.SetUIWidgetBgColor(this.progressBarWidget, COLOR_FRIENDLY);
-        else mod.SetUIWidgetBgColor(this.progressBarWidget, COLOR_ENEMY);
-      } else if (modlib.Equals(cp.getOwner(), team)) {
-        mod.SetUIWidgetBgColor(this.progressBarWidget, COLOR_FRIENDLY);
-      } else if (modlib.Equals(cp.getOwner(), teamNeutral)) {
-        if (modlib.Equals(cp.getCapturingTeam(), team)) mod.SetUIWidgetBgColor(this.progressBarWidget, COLOR_FRIENDLY);
-        else mod.SetUIWidgetBgColor(this.progressBarWidget, COLOR_ENEMY);
-      } else {
-        mod.SetUIWidgetBgColor(this.progressBarWidget, COLOR_ENEMY);
+      if (mod.Equals(cp.getOwner(), team) && prog >= PROGRESS_FULL) {
+        prog = 1;
       }
+
+      const size = mod.CreateVector(mod.Ceiling(60 * prog), 60, 0);
+
+      if (this.progressBarWidget) {
+        SafeSetWidgetSizeHandle(this.progressBarWidget, size);
+
+        if (!mod.Equals(capturingTeam, teamNeutral) && prog > PROGRESS_EMPTY && prog < PROGRESS_FULL) {
+          if (mod.Equals(capturingTeam, team)) SafeSetWidgetBgColorHandle(this.progressBarWidget, COLOR_FRIENDLY);
+          else SafeSetWidgetBgColorHandle(this.progressBarWidget, COLOR_ENEMY);
+        } else if (modlib.Equals(cp.getOwner(), team)) {
+          SafeSetWidgetBgColorHandle(this.progressBarWidget, COLOR_FRIENDLY);
+        } else if (modlib.Equals(cp.getOwner(), teamNeutral)) {
+          if (modlib.Equals(cp.getCapturingTeam(), team)) SafeSetWidgetBgColorHandle(this.progressBarWidget, COLOR_FRIENDLY);
+          else SafeSetWidgetBgColorHandle(this.progressBarWidget, COLOR_ENEMY);
+        } else {
+          SafeSetWidgetBgColorHandle(this.progressBarWidget, COLOR_ENEMY);
+        }
+      }
+    } catch (_err) {
+      this.progressBarWidget = null as any;
+      markCipherKeyHudDirtyForPlayer(this.id);
     }
   }
 }
@@ -22382,7 +23055,10 @@ function EnforceFixedLiveHQSpawns(): void {
 
 
 function UpdateScoreboard(): void {
-  serverPlayers.forEach((p) => p.updateScoreboard());
+  const players = getValidHumanPlayersSnapshot();
+  for (let i = 0; i < players.length; i++) {
+    players[i].updateScoreboard();
+  }
 }
 
 
@@ -22485,10 +23161,16 @@ function ResetRoundGameplayState(): void {
   applyObjectiveRoundStartOwnership(true);
 
   // Clear all players capturepoint refs and hide the capture widget container
-  serverPlayers.forEach((p) => {
+  const resetPlayers = getValidHumanPlayersSnapshot();
+  for (let i = 0; i < resetPlayers.length; i++) {
+    const p = resetPlayers[i];
     p.setCapturePoint(null);
-    if (p.activeFlagContainerWidget) mod.SetUIWidgetVisible(p.activeFlagContainerWidget, false);
-  });
+    if (p.activeFlagContainerWidget) {
+      try {
+        mod.SetUIWidgetVisible(p.activeFlagContainerWidget, false);
+      } catch (_err) {}
+    }
+  }
 
   // Reset the match timer baseline (your custom timer uses phaseTickCount + ROUND_TIME)
   phaseTickCount = 0;
@@ -22568,6 +23250,10 @@ function resetLifecycleStateForFreshMatchStart(): void {
   prematchHealthAppliedMaxByPlayerId = {};
   objectiveEngineWarnedByKey = {};
   resetTransitionSpawnQueueState(true);
+  clearLiveHudQueues();
+  clearCipherKeyUiRefreshQueue();
+  clearPhasePlayerOperationQueues();
+  preliveZeroTransitionHandled = false;
   perfTelemetryLastSampleAtSec = 0;
   perfTelemetryLastFrameAtSec = -1;
   perfTelemetrySmoothedHz = 0;
@@ -22631,6 +23317,9 @@ function ReturnToPreMatchState(): void {
   resetMatchStartBannerState(true);
   clearPostmatchShowcaseState();
   stopDamageZonePulseTimer();
+  clearLiveHudQueues();
+  clearCipherKeyUiRefreshQueue();
+  clearPhasePlayerOperationQueues();
   playerInDamageZone = {};
 
   // IMPORTANT: make sure prematch init re-runs (so prematch enables icons/interacts/etc)
@@ -22649,7 +23338,9 @@ function ReturnToPreMatchState(): void {
   SafeSetWidgetVisibleByName("PostMatchContainer", false);
 
   // --- Reset READY state so we do NOT auto-start the next prematch-to-live transition ---
-  serverPlayers.forEach((p) => {
+  const prematchPlayers = getValidHumanPlayersSnapshot();
+  for (let i = 0; i < prematchPlayers.length; i++) {
+    const p = prematchPlayers[i];
     p.resetReadyForNewRound();
 
     // Also force the per-player prematch ready text to update immediately
@@ -22668,12 +23359,16 @@ function ReturnToPreMatchState(): void {
     }
 
     // Clear redeploy time so players can be placed into prematch world state.
-    mod.SetRedeployTime(p.player, 0);
+    try {
+      mod.SetRedeployTime(p.player, 0);
+    } catch (errRedeploy) {
+      LogRuntimeError("ReturnToPreMatchState/setRedeployTime/" + String(p.id), errRedeploy);
+    }
 
     // Apply prematch restrictions (combat enabled, interact allowed)
     applyPhaseInputRestrictionsForPlayer(p.player);
 
-  });
+  }
 
   // --- Re-enable prematch world icons + interact points ---
   for (let i = 0; i < 4; i++) {
@@ -22693,8 +23388,8 @@ function ReturnToPreMatchState(): void {
   ShowPrematchUi();
   applyPrematch889HealthForAllPlayers();
 
-  // --- Put everyone back into the world in prematch ---
-  mod.DeployAllPlayers();
+  // --- Put everyone back into the world in prematch through the bounded operation queue. ---
+  queuePhasePlayerOperationForAll("deploy", "ReturnToPreMatchState");
   setObjectiveNativeMcomObjectivesEnabled(false, "restorePrematch");
   disableAllObjectiveCapturePointObjectives("restorePrematch");
   disableAllObjectiveSurfaceSectors("restorePrematch", true);
@@ -22739,7 +23434,10 @@ function InitializePreMatch(): void {
     mod.FindUIWidgetWithName("PostMatchContainer"),
   ];
 
-  serverPlayers.forEach((p) => p.setTeam());
+  const prematchPlayers = getValidHumanPlayersSnapshot();
+  for (let i = 0; i < prematchPlayers.length; i++) {
+    prematchPlayers[i].setTeam();
+  }
 
   SafeSetWorldIconTextById(WORLDICON_T1_SWITCH, mod.Message(mod.stringkeys.SwitchTeam));
   SafeSetWorldIconTextById(WORLDICON_T1_READY, mod.Message(mod.stringkeys.Ready));
@@ -22772,7 +23470,9 @@ function InitializePreMatch(): void {
 
   refreshPrematchReadyStateUi();
 
-  serverPlayers.forEach((p) => setReadyPhaseProtectionForPlayer(p.player, true));
+  for (let i = 0; i < prematchPlayers.length; i++) {
+    setReadyPhaseProtectionForPlayer(prematchPlayers[i].player, true);
+  }
   applyPrematch889HealthForAllPlayers();
 
   initialization[0] = true;
@@ -22791,6 +23491,7 @@ function InitializeCountDown(): void {
     clearPhaseCountdownDeadline();
     resetEngineSchedulerCadenceState();
     setLiveScorePanelVisible(false);
+    hideCipherLiveHudForAllPlayers();
     setObjectiveNativeMcomObjectivesEnabled(false, "InitializeCountDown");
     syncDisabledBombAnchorObjectives();
     StopAllObjectiveMcomSfx();
@@ -22801,6 +23502,10 @@ function InitializeCountDown(): void {
     applyObjectiveLiveHybridRoundStartState(true);
     resetMatchStartBannerState(true);
     resetLiveClockState();
+    clearLiveHudQueues();
+    clearCipherKeyUiRefreshQueue();
+    clearPhasePlayerOperationQueues();
+    preliveZeroTransitionHandled = false;
 
 
     // Restore the legacy countdown UI behavior for the ready-up delay.
@@ -22829,7 +23534,10 @@ function InitializeCountDown(): void {
     resetTransitionSpawnQueueState(false);
     clearCipherSpawnJobQueues();
 
-    serverPlayers.forEach((p) => setReadyPhaseProtectionForPlayer(p.player, true));
+    const countdownPlayers = getValidHumanPlayersSnapshot();
+    for (let i = 0; i < countdownPlayers.length; i++) {
+      setReadyPhaseProtectionForPlayer(countdownPlayers[i].player, true);
+    }
     initOk = true;
   } catch (err) {
     LogRuntimeError("InitializeCountDown", err);
@@ -22879,6 +23587,10 @@ function InitializePreLive(): void {
     resetCipherSpawnRoutingState();
     preliveTeamSanityWarnedByPlayerId = {};
     resetRuntimeBotStagedSpawnSchedule();
+    clearLiveHudQueues();
+    clearCipherKeyUiRefreshQueue();
+    clearPhasePlayerOperationQueues();
+    preliveZeroTransitionHandled = false;
 
     if (!validatePreLivePlayerTeamsFromEngine()) {
       initOk = false;
@@ -22924,10 +23636,13 @@ function InitializePreLive(): void {
     applyObjectiveLiveHybridRoundStartState(true);
 
     cipherPhaseTransitionUndeployIgnoreUntilSec = getCurrentSchedulerNowSeconds() + PRELIVE_TIME + 2;
-    mod.UndeployAllPlayers();
-    requestTransitionSpawnForAllTransitionPlayers("prelive_start");
+    queuePhasePlayerOperationForAll("undeploy", "InitializePreLive");
+    preliveTransitionSpawnPendingAfterUndeploy = true;
 
-    serverPlayers.forEach((p) => setReadyPhaseProtectionForPlayer(p.player, true));
+    const prelivePlayers = getValidHumanPlayersSnapshot();
+    for (let i = 0; i < prelivePlayers.length; i++) {
+      setReadyPhaseProtectionForPlayer(prelivePlayers[i].player, true);
+    }
     initOk = true;
   } catch (err) {
     LogRuntimeError("InitializePreLive", err);
@@ -22951,6 +23666,8 @@ function InitializeLive(): void {
     emitLiveTransitionCheckpoint("live_init_enter");
     stopDamageZonePulseTimer();
     clearPostmatchShowcaseState();
+    clearLiveHudQueues();
+    clearCipherKeyUiRefreshQueue();
     endCipherFirstDeployAnchorSession("InitializeLive");
     resetLiveClockState();
     emitLiveTransitionCheckpoint("live_init_clock_reset");
@@ -23028,23 +23745,33 @@ function InitializeLive(): void {
     HideSharedTicketBarFills();
     emitLiveTransitionCheckpoint("live_init_countdown_hidden");
 
-
-    serverPlayers.forEach((p) => p.addUI());
+    const livePlayers = getValidHumanPlayersSnapshot();
+    for (let i = 0; i < livePlayers.length; i++) {
+      queueLiveHudBuild(livePlayers[i].id, "InitializeLive", "normal", i);
+    }
     beginRegulationClock(getCurrentSchedulerNowSeconds());
     emitLiveTransitionCheckpoint("live_init_player_ui_clock");
 
-    serverPlayers.forEach((p) => setReadyPhaseProtectionForPlayer(p.player, false));
+    for (let i = 0; i < livePlayers.length; i++) {
+      try {
+        setReadyPhaseProtectionForPlayer(livePlayers[i].player, false);
+      } catch (errProtection) {
+        LogRuntimeError("InitializeLive/setReadyPhaseProtection/" + String(livePlayers[i].id), errProtection);
+      }
+    }
 
-    serverPlayers.forEach((p) => {
-      p.setTeam();
-      mod.SetRedeployTime(p.player, REDEPLOY_TIME);
-      clearCipherLiveInputRestrictionsForPlayer(p.player);
-      if (p.isDeployed) p.isFirstDeploy();
-    });
+    for (let i = 0; i < livePlayers.length; i++) {
+      const p = livePlayers[i];
+      try {
+        p.setTeam();
+        mod.SetRedeployTime(p.player, REDEPLOY_TIME);
+        clearCipherLiveInputRestrictionsForPlayer(p.player);
+        if (p.isDeployed) p.isFirstDeploy();
+      } catch (errPlayerSetup) {
+        LogRuntimeError("InitializeLive/playerSetup/" + String(p.id), errPlayerSetup);
+      }
+    }
     refreshCipherKeyPlayerSnapshots("InitializeLive");
-    repairCipherKeyHudCachesForAllPlayers(true);
-    UpdateBombCarrierUiForAllPlayers(undefined, true);
-    refreshBombNoticeUiForAllPlayers(undefined, true);
     startRuntimeBotLiveStartSettle("half1", "InitializeLive");
     requestLiveBotSpawnsForAllBots("InitializeLive");
     emitLiveTransitionCheckpoint("live_init_players_unlocked");
@@ -24103,6 +24830,7 @@ function InitializePostmatch(): void {
     schedulePostmatchEndGameModeFallback("InitializePostmatch");
     resetEngineSchedulerCadenceState();
     setLiveScorePanelVisible(false);
+    hideCipherLiveHudForAllPlayersHard();
     setObjectiveNativeMcomObjectivesEnabled(false, "InitializePostmatch");
     disableAllObjectiveCapturePointObjectives("InitializePostmatch");
     disableAllObjectiveSurfaceSectors("InitializePostmatch", true);
@@ -24395,12 +25123,17 @@ function resetEngineSchedulerCadenceState(): void {
 function setPhaseCountdownDeadlineFromNow(durationSeconds: number): void {
   const nowSec = getCurrentSchedulerNowSeconds();
   phaseCountdownDeadlineAtSec = nowSec + durationSeconds;
-  phaseCountdownLastShownSeconds = mod.Ceiling(durationSeconds);
+  phaseCountdownLastShownSeconds = clampCountdownDisplaySeconds(durationSeconds);
 }
 
 function clearPhaseCountdownDeadline(): void {
   phaseCountdownDeadlineAtSec = 0;
   phaseCountdownLastShownSeconds = -1;
+}
+
+function clampCountdownDisplaySeconds(rawSeconds: number): number {
+  if (!Number.isFinite(rawSeconds) || rawSeconds <= 0.0001) return 0;
+  return mod.Max(0, mod.Ceiling(rawSeconds));
 }
 
 function emitPerfTelemetryLog(message: any): void {
@@ -24574,6 +25307,9 @@ function Mode_OnGameModeEnding(): void {
   stopDamageZonePulseTimer();
   clearCipherAdminRuntimeState("Mode_OnGameModeEnding");
   cancelAllCipherRespawnRouteJobs();
+  clearLiveHudQueues();
+  clearCipherKeyUiRefreshQueue();
+  clearPhasePlayerOperationQueues();
   clearRuntimeBotState(true);
   stopAllObjectiveAwardBursts();
   StopAllObjectiveMcomSfx();
@@ -24618,6 +25354,7 @@ function OngoingGlobal_Inner(): void {
   const nowSec = currentFrameNowSec;
   updatePerfTelemetryFrame(nowSec);
   tickCipherAdminInteractFallback(nowSec);
+  processPhasePlayerOperationQueue();
 
   if (gameStatus === 0) {
     if (!initialization[0]) InitializePreMatch();
@@ -24636,8 +25373,7 @@ function OngoingGlobal_Inner(): void {
       SafeSetTextLabelByName("CountDownText", mod.Message(countDown));
 
       if (countDown === 0) {
-        // Existing ready-up 5-second delay ends here; undeploy once, then hand off to pre-live.
-        mod.UndeployAllPlayers();
+        // Existing ready-up delay ends here; pre-live init will queue bounded undeploys.
         gameStatus = 2;
       }
     }
@@ -24650,6 +25386,7 @@ function OngoingGlobal_Inner(): void {
       return;
     }
 
+    flushPreliveTransitionSpawnRequestsAfterUndeploy();
     processTransitionSpawnQueue("prelive_countdown");
     processCipherSpawnJobs("prelive_countdown");
     tickRuntimeBotStagedSpawning(nowSec, "prelive_countdown");
@@ -24657,7 +25394,7 @@ function OngoingGlobal_Inner(): void {
     applyRuntimeBotPhaseLocksForAll("prelive_countdown_bot_lock");
 
     if (phaseCountdownDeadlineAtSec <= 0) setPhaseCountdownDeadlineFromNow(countDown);
-    const displaySeconds = mod.Max(0, mod.Ceiling(phaseCountdownDeadlineAtSec - nowSec));
+    const displaySeconds = clampCountdownDisplaySeconds(phaseCountdownDeadlineAtSec - nowSec);
     if (displaySeconds !== phaseCountdownLastShownSeconds || displaySeconds <= 0) {
       phaseCountdownLastShownSeconds = displaySeconds;
       countDown = displaySeconds;
@@ -24665,7 +25402,8 @@ function OngoingGlobal_Inner(): void {
       playCountdownHeartbeatToAll(vol);
 
       SafeSetTextLabelByName("CountDownText", mod.Message(countDown));
-      if (countDown === 0) {
+      if (countDown === 0 && !preliveZeroTransitionHandled) {
+        preliveZeroTransitionHandled = true;
         emitLiveTransitionCheckpoint("prelive_zero_enter");
         playMatchStartStingerToAll(1.0);
         emitLiveTransitionCheckpoint("prelive_zero_stinger_after");
@@ -24689,6 +25427,8 @@ function OngoingGlobal_Inner(): void {
       return;
     }
 
+    processLiveHudQueues();
+    processCipherKeyUiRefreshQueue();
     runCipherLiveKeyWatchdog(nowSec, "live_tick");
     runQueuedCipherTransitionReconcile(nowSec);
 
@@ -24722,7 +25462,6 @@ function OngoingGlobal_Inner(): void {
     UpdateObjectiveArmAlarmSfxState();
     UpdateObjectiveHoldProgressUiForAllPlayers(visualNowSec);
     UpdateDeployObjectiveTimerUiForAllPlayers();
-    repairDirtyCipherKeyHudCaches(2);
 
     if (ENABLE_CARRIER_SUBTICK) {
       UpdateBombCarrierUiForAllPlayers(visualNowSec);
@@ -24837,7 +25576,7 @@ function OngoingGlobal_Inner(): void {
     let postmatchSecondDue = false;
     if (useEngineSchedulerFrame) {
       if (phaseCountdownDeadlineAtSec <= 0) setPhaseCountdownDeadlineFromNow(countDown);
-      const displaySeconds = mod.Max(0, mod.Ceiling(phaseCountdownDeadlineAtSec - nowSec));
+      const displaySeconds = clampCountdownDisplaySeconds(phaseCountdownDeadlineAtSec - nowSec);
       if (displaySeconds !== phaseCountdownLastShownSeconds) {
         phaseCountdownLastShownSeconds = displaySeconds;
         countDown = displaySeconds;
@@ -24932,7 +25671,7 @@ function Mode_OnPlayerJoinGame(eventPlayer: mod.Player): void {
       }
     }
 
-    if (player) {
+    if (player && gameStatus !== 3) {
       buildRestrictedAreaUiForPlayer(player);
     }
 
@@ -24957,13 +25696,17 @@ function Mode_OnPlayerJoinGame(eventPlayer: mod.Player): void {
       if (player) replacePrematchReadyText(player.id, eventPlayer);
       refreshPrematchReadyStateUi();
     } else if (gameStatus === 3) {
-      HidePrematchUiForTransition();
       SafeSetWidgetVisibleByName("LiveContainer", true);
       HideSharedTicketBarFills();
 
       if (player) {
-        player.addUI();
-        repairCipherKeyHudCacheForPlayer(player, true);
+        try {
+          mod.SetRedeployTime(player.player, REDEPLOY_TIME);
+          clearCipherLiveInputRestrictionsForPlayer(player.player);
+        } catch (errLiveJoinSetup) {
+          LogRuntimeError("OnPlayerJoinGame/live_setup/" + String(player.id), errLiveJoinSetup);
+        }
+        queueLiveHudBuild(player.id, "OnPlayerJoinGame_live", "urgent", 1);
       }
 
       if (player && (cipherSecondHalfTransitionActive || cipherSuddenDeathTransitionActive)) {
@@ -25006,6 +25749,8 @@ function Mode_OnPlayerLeaveGame(eventNumber: number): void {
     const leavingRuntimeSlot = getRuntimeBotSlotForPlayerId(leaving.id);
     const leavingIsRuntimeBot = leavingRuntimeSlot !== undefined || runtimeBotReleasedPlayerId[leaving.id] === true;
     cleanupRestrictedAreaUiForPlayer(leaving.id);
+    clearLiveHudQueueForPlayer(leaving.id);
+    clearPhasePlayerOperationsForPlayer(leaving.id);
     deleteCipherSuddenDeathAliveHudForPlayer(leaving.id);
     resetCipherSuddenDeathAliveHudRefsForPlayer(leaving);
     // Ensure HUD can be rebuilt cleanly if the engine destroys UI widgets on disconnect.
@@ -25022,7 +25767,7 @@ function Mode_OnPlayerLeaveGame(eventNumber: number): void {
     if (gameStatus === 3 && bombCarrierPlayerId === leaving.id) {
       const leavePos = tryGetPlayerPositionSafe(leaving.player);
       if (leavePos) lastKnownLivePositionByPlayerId[leaving.id] = leavePos;
-      forceBombDropFromCarrier(leaving.id, "disconnect");
+      scheduleBombCarrierDropAfterCombatEvent(leaving.id, "disconnect", leavePos);
     }
 
     cancelObjectiveCaptureAttemptsForPlayer(leaving.id);

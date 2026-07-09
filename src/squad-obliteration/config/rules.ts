@@ -8,7 +8,7 @@ export const RULES = {
     cipherKeysToDestroyObjective: 2,
     nodeOverloadCooldownSeconds: 45,
     countdownTimeSeconds: 5,
-    preliveTimeSeconds: 15,
+    preliveTimeSeconds: 10,
     postmatchTimeSeconds: 20,
     redeployTimeSeconds: 5,
     objectiveInteractHoldSeconds: 4.5,
