@@ -478,7 +478,6 @@ let lastPrematchTeamSwitchTickByPlayerId: { [playerId: number]: number } = {};
 let prematchStabilizationGateWarnedBySwitchTick: { [switchTick: string]: boolean } = {};
 let prematchPreliveGateWarnedByKey: { [key: string]: boolean } = {};
 let preliveTeamSanityWarnedByPlayerId: { [playerId: number]: boolean } = {};
-let prematchHqMapValidationWarnedByKey: { [key: string]: boolean } = {};
 let prematchReadyPlayersByTeam: [number, number] = [0, 0];
 let prematchTotalPlayersByTeam: [number, number] = [0, 0];
 let prematchAllPlayersReady = false;
@@ -498,20 +497,27 @@ const POSTMATCH_END_RETRY_MS = 1000;
    3) WORLD IDS (HQ / CAPTURE POINTS / INTERACT / ICONS / DAMAGE ZONE)
 ================================================================================================= */
 
-/* Initial HQs (countdown + prelive + live fallback routing) */
-const TEAM1_INITIAL_HQ = 1;
-const TEAM2_INITIAL_HQ = 2;
+/* First-half live HQs */
+const TEAM1_INITIAL_HQ = WORLD_IDS.hq.team1Initial;
+const TEAM2_INITIAL_HQ = WORLD_IDS.hq.team2Initial;
 
 /* Prematch ready-up HQs */
-const TEAM1_READYUP_HQ = 8888;
-const TEAM2_READYUP_HQ = 8889;
-let resolvedPrematchHqTeam1Id: number = TEAM1_READYUP_HQ;
-let resolvedPrematchHqTeam2Id: number = TEAM2_READYUP_HQ;
-let prematchHqFallbackActive = false;
+const TEAM1_READYUP_HQ = WORLD_IDS.hq.team1Readyup;
+const TEAM2_READYUP_HQ = WORLD_IDS.hq.team2Readyup;
 
 /* Fixed live HQs for half 2 and sudden death */
-const TEAM1_LIVE_HQ = 3;
-const TEAM2_LIVE_HQ = 4;
+const TEAM1_LIVE_HQ = WORLD_IDS.hq.team1Live;
+const TEAM2_LIVE_HQ = WORLD_IDS.hq.team2Live;
+
+/* Only these authored HQ IDs exist in the Cipher spatial and may be toggled. */
+const MANAGED_CIPHER_HQ_IDS: number[] = [
+  TEAM1_READYUP_HQ,
+  TEAM2_READYUP_HQ,
+  TEAM1_INITIAL_HQ,
+  TEAM2_INITIAL_HQ,
+  TEAM1_LIVE_HQ,
+  TEAM2_LIVE_HQ,
+];
 
 /* Per-flag HQs */
 /* Two-flag combos */
@@ -23809,83 +23815,6 @@ function isBotBackfillPlayer(player: mod.Player): boolean {
    9) HQ ENABLE/DISABLE + ROUTING LOGIC
 ================================================================================================= */
 
-function warnPrematchHqMapValidationOnce(key: string, message: any): void {
-  if (!shouldEmitStringKeyDebugWorldLogs()) return;
-  if (prematchHqMapValidationWarnedByKey[key] === true) return;
-  prematchHqMapValidationWarnedByKey[key] = true;
-  emitStringKeyDebugWorldLog(message);
-}
-
-function tryResolveHqObjIdFromMapData(hqId: number): number {
-  try {
-    const hq = mod.GetHQ(hqId);
-    return getObjIdSafe(hq);
-  } catch (_err) {
-    return -1;
-  }
-}
-
-function validatePrematchReadyupHqsFromMapData(): void {
-  const configuredTeam1HqId: number = Number(TEAM1_READYUP_HQ);
-  const configuredTeam2HqId: number = Number(TEAM2_READYUP_HQ);
-
-  const team1ObjId = tryResolveHqObjIdFromMapData(configuredTeam1HqId);
-  const team2ObjId = tryResolveHqObjIdFromMapData(configuredTeam2HqId);
-
-  let valid = true;
-  let reason = "ok";
-
-  if (configuredTeam1HqId === configuredTeam2HqId) {
-    valid = false;
-    reason = "same_configured_id";
-  } else if (team1ObjId < 0 && team2ObjId < 0) {
-    valid = false;
-    reason = "missing_both";
-  } else if (team1ObjId < 0) {
-    valid = false;
-    reason = "missing_team1";
-  } else if (team2ObjId < 0) {
-    valid = false;
-    reason = "missing_team2";
-  } else if (team1ObjId === team2ObjId) {
-    valid = false;
-    reason = "same_objid";
-  }
-
-  if (valid) {
-    resolvedPrematchHqTeam1Id = configuredTeam1HqId;
-    resolvedPrematchHqTeam2Id = configuredTeam2HqId;
-    prematchHqFallbackActive = false;
-  } else {
-    resolvedPrematchHqTeam1Id = TEAM1_INITIAL_HQ;
-    resolvedPrematchHqTeam2Id = TEAM2_INITIAL_HQ;
-    prematchHqFallbackActive = true;
-  }
-
-  const diag = "cfg=" +
-    String(configuredTeam1HqId) +
-    "/" +
-    String(configuredTeam2HqId) +
-    " obj=" +
-    String(team1ObjId) +
-    "/" +
-    String(team2ObjId) +
-    " valid=" +
-    (valid ? "1" : "0") +
-    " reason=" +
-    reason +
-    " targets=" +
-    String(resolvedPrematchHqTeam1Id) +
-    "/" +
-    String(resolvedPrematchHqTeam2Id);
-
-  const key = "prematch_hq_map/" + diag;
-  warnPrematchHqMapValidationOnce(
-    key,
-    mod.Message("[PREMATCH HQ MAP] {}", diag)
-  );
-}
-
 function enforceReadyupHqsDisabledOutsidePrematch(_source: string): void {
   if (gameStatus === 0) return;
   SafeEnableHQById(TEAM1_READYUP_HQ, false);
@@ -23913,9 +23842,7 @@ function SafeEnableHQById(hqId: number, enabled: boolean, force: boolean = false
 }
 
 function getAllManagedCipherHqIds(): number[] {
-  const ids = [TEAM1_READYUP_HQ, TEAM2_READYUP_HQ];
-  for (let id = 1; id <= 20; id++) ids.push(id);
-  return ids;
+  return MANAGED_CIPHER_HQ_IDS;
 }
 
 function applyCipherHqProfileNow(desiredIds: number[], force: boolean): void {
@@ -23991,13 +23918,10 @@ function ConfigureLiveSpawns(): void {
 }
 
 function ConfigurePreMatchSpawns(): void {
-  validatePrematchReadyupHqsFromMapData();
-
-  if (prematchHqFallbackActive) {
-    setCipherHqPhaseProfile("prematch_fallback", [TEAM1_INITIAL_HQ, TEAM2_INITIAL_HQ]);
-    return;
-  }
-  setCipherHqPhaseProfile("prematch_ready", [resolvedPrematchHqTeam1Id, resolvedPrematchHqTeam2Id]);
+  // HQ is an opaque Portal SDK handle. GetObjId only accepts mod.Object, so attempting
+  // to validate GetHQ(8888/8889) through GetObjId falsely reports both authored HQs as
+  // missing. The spatial file is authoritative: prematch always uses 8888 and 8889.
+  setCipherHqPhaseProfile("prematch_ready", [TEAM1_READYUP_HQ, TEAM2_READYUP_HQ]);
 }
 
 
@@ -24200,10 +24124,6 @@ function resetLifecycleStateForFreshMatchStart(): void {
   hqPhaseProfileEpoch += 1;
   hqPhaseProfileDesiredIds = [];
   prematchUiGuardWarnedByKey = {};
-  prematchHqMapValidationWarnedByKey = {};
-  resolvedPrematchHqTeam1Id = TEAM1_READYUP_HQ;
-  resolvedPrematchHqTeam2Id = TEAM2_READYUP_HQ;
-  prematchHqFallbackActive = false;
   prematchSwitchLastHandledTickByPlayerId = {};
   prematchSwitchDebounceWarnedByPlayerId = {};
   prematchReadyLastHandledTickByPlayerId = {};
