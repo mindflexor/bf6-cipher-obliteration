@@ -1,4 +1,4 @@
-import { CipherEvents as Events } from '../events/cipher-events.ts';
+import { Events } from 'bf6-portal-utils/events/index.ts';
 
 import { combatRuntimeHandlers } from '../runtime/mode-runtime.ts';
 import type { ModeContext } from '../state/mode-context.ts';
