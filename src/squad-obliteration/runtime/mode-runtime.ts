@@ -570,6 +570,13 @@ const CP_C_SECOND_HALF_ID = WORLD_IDS.capturePoints.cSecondHalf;
 const CP_D_SECOND_HALF_ID = WORLD_IDS.capturePoints.dSecondHalf;
 const AUTHORED_FIRST_HALF_SECTOR_ID = WORLD_IDS.objectiveSectors.firstHalf;
 const AUTHORED_SECOND_HALF_SECTOR_ID = WORLD_IDS.objectiveSectors.secondHalf;
+
+// CapturePoints are enabled only as 3D objective markers. Their native capture
+// progression is effectively locked because Cipher scoring is driven by the
+// authored objective AreaTriggers, not CapturePoint enter/exit events.
+const OBJECTIVE_CAPTURE_LOCKED_CAPTURE_TIME = 9999;
+const OBJECTIVE_CAPTURE_LOCKED_NEUTRALIZE_TIME = 9999;
+
 const FIRST_HALF_OBJECTIVE_CP_IDS: number[] = [CP_A_ID, CP_B_ID, CP_C_ID, CP_D_ID];
 const SECOND_HALF_OBJECTIVE_CP_IDS: number[] = [
   CP_A_SECOND_HALF_ID,
@@ -6620,16 +6627,45 @@ function safeEnableCapturePointObjectiveByCpId(
   }
 }
 
+function safeSetCapturePointTimingByCpId(
+  cpId: number,
+  captureTime: number,
+  neutralizeTime: number,
+  context: string
+): void {
+  const capturePoint = resolveObjectiveCapturePointHandleByCpId(cpId, "SetCapturePointTiming/" + context);
+  if (!capturePoint) return;
+
+  try {
+    mod.SetCapturePointCapturingTime(capturePoint, captureTime);
+    mod.SetCapturePointNeutralizationTime(capturePoint, neutralizeTime);
+    mod.SetMaxCaptureMultiplier(capturePoint, 1);
+  } catch (err) {
+    warnObjectiveEngineCallOnce(
+      "set_cp_timing/" + context + "/" + String(cpId),
+      mod.Message("[OBJECTIVE ENGINE] SetCapturePointTiming failed cp/context {}", String(cpId) + "/" + context)
+    );
+    LogRuntimeError("SetCapturePointTiming/" + context + "/" + String(cpId), err);
+  }
+}
+
+function applyObjectiveLockedCaptureTiming(cpId: number): void {
+  safeSetCapturePointTimingByCpId(
+    cpId,
+    OBJECTIVE_CAPTURE_LOCKED_CAPTURE_TIME,
+    OBJECTIVE_CAPTURE_LOCKED_NEUTRALIZE_TIME,
+    "applyObjectiveLockedCaptureTiming"
+  );
+}
+
 function disableAllObjectiveCapturePointObjectives(context: string): void {
   disableAllScriptedObjectiveCapturePointSurfaces(context, true);
 }
 
 function isObjectiveCapturePointSurfaceActive(cpId: number): boolean {
-  if (!isObjectiveCpId(cpId)) return false;
-  if (!isObjectiveActiveForCurrentHalf(cpId)) return false;
-  if (isObjectiveDisabledAfterAward(cpId)) return false;
-  if (isObjectivePendingAwardActive(cpId)) return false;
-  return isCipherNodeActive(cpId);
+  // CapturePoints are a permanent display layer for the active half. Node
+  // reboot/award state is represented by the custom VFX and WorldIcons only.
+  return isObjectiveCpId(cpId) && isObjectiveActiveForCurrentHalf(cpId);
 }
 
 function disableAllObjectiveSurfaceSectors(context: string, force: boolean = false): void {
@@ -6642,6 +6678,7 @@ function disableAllScriptedObjectiveCapturePointSurfaces(context: string, force:
   for (let i = 0; i < ALL_SCRIPTED_OBJECTIVE_CP_IDS.length; i++) {
     const cpId = ALL_SCRIPTED_OBJECTIVE_CP_IDS[i];
     const owner = getExpectedScriptObjectiveCapturePointOwner(cpId);
+    applyObjectiveLockedCaptureTiming(cpId);
     setObjectiveAuthoritativeOwner(cpId, owner, context + "_owner");
     safeEnableCapturePointObjectiveByCpId(cpId, false, context + "_cp", force);
     ensureObjectiveEngineOwnerMatchesScript(cpId, context + "_cp");
@@ -6655,9 +6692,9 @@ function applyScriptedObjectiveCapturePointSurface(
   context: string,
   force: boolean = false
 ): void {
-  void enabled;
+  applyObjectiveLockedCaptureTiming(cpId);
   setObjectiveAuthoritativeOwner(cpId, owner, context + "_owner");
-  safeEnableCapturePointObjectiveByCpId(cpId, false, context + "_display_only_cp", force);
+  safeEnableCapturePointObjectiveByCpId(cpId, enabled, context + "_display_only_cp", force);
   ensureObjectiveEngineOwnerMatchesScript(cpId, context + "_cp");
 }
 
@@ -6923,7 +6960,14 @@ function startCipherNodeReboot(cpId: number, attackingTeam: mod.Team, context: s
   const cp = serverCapturePoints[cpId];
 
   if (isObjectiveCaptureAttemptActive(cpId)) endObjectiveCaptureAttempt(cpId);
-  safeEnableCapturePointObjectiveByCpId(cpId, false, "startCipherNodeReboot/" + context, true);
+  // Keep the active-half CapturePoint marker visible while the node reboots.
+  applyScriptedObjectiveCapturePointSurface(
+    cpId,
+    getObjectiveDefendingTeamForCurrentHalf(cpId),
+    isObjectiveActiveForCurrentHalf(cpId),
+    "startCipherNodeReboot/" + context,
+    true
+  );
   setObjectiveCaptureInteractEnabled(cpId, false);
   setObjectiveAwardVfxEnabled(cpId, false);
   setObjectiveAuthoritativeOwner(
@@ -7883,27 +7927,20 @@ function isObjectivePendingAwardActive(cpId: number): boolean {
 }
 
 function syncObjectiveArmedPendingVisualStateForCp(cpId: number): void {
-  const armedPending = isObjectivePendingAwardActive(cpId);
   updateCipherCounterWorldIconForCp(cpId, true);
 
-  if (armedPending) {
-    safeEnableCapturePointObjectiveByCpId(cpId, false, "syncObjectiveArmedPendingVisualStateForCp_armed");
-    return;
-  }
+  const def = objectiveDefByCpId[cpId];
+  if (!def) return;
 
-  if (isCipherNodeRebooting(cpId)) {
-    safeEnableCapturePointObjectiveByCpId(cpId, false, "syncObjectiveArmedPendingVisualStateForCp_rebooting");
-    return;
-  }
-
-  if (isObjectiveDisabledAfterAward(cpId)) {
-    safeEnableCapturePointObjectiveByCpId(cpId, false, "syncObjectiveArmedPendingVisualStateForCp_disabled");
-    return;
-  }
-
-  if (gameStatus === 3) {
-    safeEnableCapturePointObjectiveByCpId(cpId, false, "syncObjectiveArmedPendingVisualStateForCp_display_only");
-  }
+  // Cipher node state changes only affect custom VFX/WorldIcons. The native
+  // CapturePoint remains a locked, owned 3D landmark for the active half.
+  applyScriptedObjectiveCapturePointSurface(
+    cpId,
+    def.defendingTeam,
+    isObjectiveActiveForCurrentHalf(cpId) && (gameStatus === 0 || gameStatus === 2 || gameStatus === 3),
+    "syncObjectiveArmedPendingVisualStateForCp",
+    true
+  );
 }
 
 function hideAllObjectiveArmedWorldIcons(): void {
@@ -8222,7 +8259,13 @@ function disableObjectiveAfterAwardSuccess(cpId: number, ownerTeam: mod.Team): v
   captureObjectiveDestroyExplosionPositionForCp(cpId);
   objectiveDisabledAfterAwardByCpId[cpId] = true;
   objectiveDisabledOwnerTeamByCpId[cpId] = ownerTeam;
-  safeEnableCapturePointObjectiveByCpId(cpId, false, "disableObjectiveAfterAwardSuccess", true);
+  applyScriptedObjectiveCapturePointSurface(
+    cpId,
+    getObjectiveDefendingTeamForCurrentHalf(cpId),
+    isObjectiveActiveForCurrentHalf(cpId),
+    "disableObjectiveAfterAwardSuccess",
+    true
+  );
   setObjectiveCaptureInteractEnabled(cpId, false);
   setObjectiveAwardVfxEnabled(cpId, false);
   playObjectiveDisableEmpPresentationForCp(cpId, ownerTeam);
@@ -8847,7 +8890,7 @@ function ValidateObjectiveConfiguration(): void {
 }
 
 function registerObjectivesDeterministically(): void {
-  // Non-live phases keep the capture-point/interact layer inert. Live re-enables CP objectives separately.
+  // Start from a clean objective layer. The active half is enabled later as locked, display-only CapturePoints.
   disableAllObjectiveCapturePointObjectives("registerObjectivesDeterministically");
   disableAllNeutralObjectiveCapturePointObjectives("registerObjectivesDeterministically");
   disableAllObjectiveSurfaceSectors("registerObjectivesDeterministically", true);
@@ -8872,6 +8915,7 @@ function applyObjectiveRoundStartOwnership(resetRoundState: boolean = true): voi
     const cp = serverCapturePoints[def.cpId];
     if (!cp) continue;
 
+    applyObjectiveLockedCaptureTiming(def.cpId);
     setObjectiveAuthoritativeOwner(def.cpId, getObjectiveDefendingTeamForCurrentHalf(def.cpId));
     clearObjectivePendingAward(def.cpId);
   }
@@ -8895,6 +8939,7 @@ function applyObjectiveLiveHybridRoundStartState(resetRoundState: boolean = true
     const cp = serverCapturePoints[def.cpId];
     if (!cp) continue;
 
+    applyObjectiveLockedCaptureTiming(def.cpId);
     setObjectiveAuthoritativeOwner(
       def.cpId,
       getObjectiveDefendingTeamForCurrentHalf(def.cpId),
