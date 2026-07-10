@@ -21507,35 +21507,83 @@ function activatePendingPlayerSession(pending: PendingPlayerSession): void {
   if (!identity || identity.playerId !== pending.playerId || identity.isBot) return;
   if (identity.teamId !== 1 && identity.teamId !== 2) return;
 
-  clearVolatilePlayerSessionState(pending.playerId, "pending_join_activate");
-  // A receiver is immutable after a widget is created. Remove any prior-session
-  // receiver-bound surfaces before the new handle is admitted to active state.
-  deleteCipherTransitionHudForPlayer(pending.playerId);
-  deleteCipherSuddenDeathAliveHudForPlayer(pending.playerId);
+  const isPrematchAdmission = !gameModeStarted || gameStatus === -1 || gameStatus === 0;
+
+  // Session cleanup is best-effort. A stale private UI handle must never prevent a
+  // valid human from being admitted to the prematch roster or from deploying.
+  try {
+    clearVolatilePlayerSessionState(pending.playerId, "pending_join_activate");
+  } catch (err) {
+    LogRuntimeError("PendingJoinActivate/clearVolatile/" + String(pending.playerId), err);
+  }
+  try {
+    deleteCipherTransitionHudForPlayer(pending.playerId);
+  } catch (err) {
+    LogRuntimeError("PendingJoinActivate/deleteTransitionHud/" + String(pending.playerId), err);
+  }
+  try {
+    deleteCipherSuddenDeathAliveHudForPlayer(pending.playerId);
+  } catch (err) {
+    LogRuntimeError("PendingJoinActivate/deleteSuddenDeathHud/" + String(pending.playerId), err);
+  }
+
   const player = new Player(pending.player);
   const snapshot = disconnectedPlayerSnapshotById[pending.playerId];
   if (snapshot) player.restorePersistentSnapshot(snapshot);
   player.player = pending.player;
   player.team = identity.team;
   player.isDeployed = pending.deployAckSeen;
+
+  // Admit the current session before doing soldier/UI phase work. The roster reads
+  // this activated table, while deployment can occur before a soldier exists.
   serverPlayers.set(player.id, player);
   playerActivatedSessionTokenByPlayerId[player.id] = pending.sessionToken;
   delete pendingPlayerSessionById[player.id];
+
+  if (isPrematchAdmission) {
+    try {
+      mod.SetRedeployTime(player.player, 0);
+    } catch (_errRedeploy) {}
+    try {
+      mod.EnablePlayerDeploy(player.player, true);
+    } catch (err) {
+      LogRuntimeError("PendingJoinActivate/prematchDeployUnlock/" + String(player.id), err);
+    }
+    // Make the player visible in the ready-up roster immediately. Do not wait for
+    // OnPlayerDeployed because that event cannot fire while deployment is locked.
+    try {
+      refreshPrematchReadyStateUi();
+    } catch (err) {
+      LogRuntimeError("PendingJoinActivate/prematchRoster/" + String(player.id), err);
+    }
+  }
+
   try {
     settleJoinedPlayerForCurrentPhase(player, pending.isReconnect ? "join_reconnect" : "join_first_time");
+  } catch (err) {
+    LogRuntimeError("PendingJoinActivate/settle/" + String(player.id), err);
+
+    if (!isPrematchAdmission) {
+      // Preserve the stricter quarantine behavior for live joins. Prematch is
+      // intentionally fail-open because input/health calls can fail before a
+      // soldier exists on the deployment screen.
+      serverPlayers.delete(player.id);
+      delete playerActivatedSessionTokenByPlayerId[player.id];
+      pending.stableSamples = 0;
+      pendingPlayerSessionById[player.id] = pending;
+      try { mod.EnablePlayerDeploy(pending.player, false); } catch (_errDeployLock) {}
+      throw err;
+    }
+  }
+
+  try {
     mod.DisplayHighlightedWorldLogMessage(
       pending.isReconnect
         ? mod.Message(mod.stringkeys.PlayerReconnected, player.player, player.id)
         : mod.Message(mod.stringkeys.PlayerJoined, player.player, player.id)
     );
-  } catch (err) {
-    serverPlayers.delete(player.id);
-    delete playerActivatedSessionTokenByPlayerId[player.id];
-    pending.stableSamples = 0;
-    pendingPlayerSessionById[player.id] = pending;
-    try { mod.EnablePlayerDeploy(pending.player, false); } catch (_errDeployLock) {}
-    throw err;
-  }
+  } catch (_errJoinLog) {}
+
   delete disconnectedPlayerSnapshotById[player.id];
 
   if (pending.deployAckSeen) {
@@ -21582,8 +21630,15 @@ function processPendingPlayerSessions(): boolean {
       pending.stableSamples = 1;
     }
     pending.nextRetryAtMs = nowMs;
-    if (pending.stableSamples < PLAYER_JOIN_REQUIRED_STABLE_SAMPLES) continue;
-    if (nowMs - pending.joinedAtMs < PLAYER_JOIN_STABILIZE_MS) continue;
+
+    // The prematch deploy screen is already a stable admission boundary. Waiting
+    // two seconds and two samples here can deadlock the host: no roster entry and
+    // no deploy event to help the pending session advance. Live joins retain the
+    // full quarantine delay and sample requirement.
+    const isPrematchAdmission = !gameModeStarted || gameStatus === -1 || gameStatus === 0;
+    const requiredStableSamples = isPrematchAdmission ? 1 : PLAYER_JOIN_REQUIRED_STABLE_SAMPLES;
+    if (pending.stableSamples < requiredStableSamples) continue;
+    if (!isPrematchAdmission && nowMs - pending.joinedAtMs < PLAYER_JOIN_STABILIZE_MS) continue;
 
     activatePendingPlayerSession(pending);
     return true;
@@ -24076,6 +24131,13 @@ function ResetRoundGameplayState(): void {
 
 function resetLifecycleStateForFreshMatchStart(): void {
   resetUniversalPlayerLifecycleQueues(true);
+  // OnPlayerJoinGame can run before OnGameModeStarted for the hosting player.
+  // A fresh mode start must invalidate old sessions, then explicitly bootstrap
+  // every player who is still connected. Leaving stale Player wrappers here
+  // makes the active-session filter hide them from prematch UI and lifecycle work.
+  serverPlayers.clear();
+  playerSessionTokenByPlayerId = {};
+  playerDisconnectedAtTickByPlayerId = {};
   clearRuntimeBotState(true);
   initialization[0] = false;
   initialization[1] = false;
@@ -24269,6 +24331,7 @@ function ReturnToPreMatchState(): void {
 
   // --- Spawns back to prematch HQs ---
   ConfigurePreMatchSpawns();
+  forceEnablePrematchDeploymentForKnownPlayers("ReturnToPreMatchState");
 
   // --- Make sure prematch roster UI reflects the new prematch state immediately ---
   refreshPrematchReadyStateUi();
@@ -24353,7 +24416,7 @@ function InitializePreMatch(): void {
   SafeSetWidgetVisibleByName("LiveContainer", false);
 
   ConfigurePreMatchSpawns();
-
+  forceEnablePrematchDeploymentForKnownPlayers("InitializePreMatch");
 
   refreshPrematchReadyStateUi();
 
@@ -26164,9 +26227,145 @@ function startMainLoopTimer(): void {
   }, MAIN_LOOP_INTERVAL_MS);
 }
 
+function forceEnablePrematchDeploymentForKnownPlayers(
+  source: string,
+  extraHandles: mod.Player[] = []
+): void {
+  if (gameStatus !== -1 && gameStatus !== 0) return;
+
+  // Manual ready-up spawning requires both the deploy spawn mode and the global
+  // deploy gate. Per-player EnablePlayerDeploy(true) cannot override a global
+  // gate that was left disabled by an earlier lifecycle phase.
+  try {
+    mod.SetSpawnMode(mod.SpawnModes.Deploy);
+  } catch (err) {
+    LogRuntimeError("PrematchDeploy/SetSpawnMode/" + source, err);
+  }
+  try {
+    mod.EnableAllPlayerDeploy(true);
+  } catch (err) {
+    LogRuntimeError("PrematchDeploy/EnableAll/" + source, err);
+  }
+
+  const unlockedByPlayerId: { [playerId: number]: boolean | undefined } = {};
+  const unlock = (player: mod.Player | undefined): void => {
+    if (!player) return;
+    const playerId = tryGetSafeEventPlayerIdOnly(player);
+    if (playerId === undefined || unlockedByPlayerId[playerId] === true) return;
+    unlockedByPlayerId[playerId] = true;
+    try {
+      mod.SetRedeployTime(player, 0);
+    } catch (_errRedeploy) {}
+    try {
+      mod.EnablePlayerDeploy(player, true);
+    } catch (err) {
+      LogRuntimeError("PrematchDeploy/EnablePlayer/" + source + "/" + String(playerId), err);
+    }
+  };
+
+  for (let i = 0; i < extraHandles.length; i++) unlock(extraHandles[i]);
+  for (const key in pendingPlayerSessionById) unlock(pendingPlayerSessionById[Number(key)]?.player);
+  serverPlayers.forEach((p) => unlock(p.player));
+}
+
+function collectConnectedHumanPlayerHandlesForGameModeStart(): mod.Player[] {
+  const handlesByPlayerId: { [playerId: number]: mod.Player | undefined } = {};
+
+  const rememberHandle = (player: mod.Player | undefined): void => {
+    if (!player) return;
+    const playerId = tryGetSafeEventPlayerIdOnly(player);
+    if (playerId === undefined) return;
+    try {
+      if (isBotBackfillPlayerSafe(player) || isCipherRuntimeBotPlayerId(playerId)) return;
+    } catch (_errBotCheck) {}
+    handlesByPlayerId[playerId] = player;
+  };
+
+  // Preserve handles delivered before OnGameModeStarted. The startup reset below
+  // intentionally clears these lifecycle tables, so collect them first.
+  for (const key in pendingPlayerSessionById) {
+    rememberHandle(pendingPlayerSessionById[Number(key)]?.player);
+  }
+  serverPlayers.forEach((player) => rememberHandle(player.player));
+
+  // Also reconcile against the authoritative engine list in case the join event
+  // was delivered before this script's callback table was fully active.
+  try {
+    const allPlayers = mod.AllPlayers();
+    const playerCount = mod.CountOf(allPlayers);
+    for (let i = 0; i < playerCount; i++) {
+      rememberHandle(mod.ValueInArray(allPlayers, i) as mod.Player);
+    }
+  } catch (err) {
+    LogRuntimeError("GameModeStart/CollectConnectedPlayers", err);
+  }
+
+  const handles: mod.Player[] = [];
+  for (const key in handlesByPlayerId) {
+    const handle = handlesByPlayerId[Number(key)];
+    if (handle) handles.push(handle);
+  }
+  return handles;
+}
+
+function bootstrapConnectedHumanPlayersForGameModeStart(startupHandles: mod.Player[]): void {
+  const nowMs = Date.now();
+
+  for (let i = 0; i < startupHandles.length; i++) {
+    const eventPlayer = startupHandles[i];
+    const playerId = tryGetSafeEventPlayerIdOnly(eventPlayer);
+    if (playerId === undefined) continue;
+
+    const identity = tryGetSafeEventPlayerIdentity(eventPlayer);
+    if (identity?.isBot === true || isCipherRuntimeBotPlayerId(playerId)) continue;
+
+    const sessionToken = beginPlayerSessionForJoin(playerId);
+    const stableTeamId = identity && (identity.teamId === 1 || identity.teamId === 2)
+      ? identity.teamId
+      : 0;
+    const pending: PendingPlayerSession = {
+      playerId,
+      player: eventPlayer,
+      sessionToken,
+      // This is not a new network join; it is recovery of a player already present
+      // when OnGameModeStarted reset the runtime. Do not add another two-second delay.
+      joinedAtMs: nowMs - PLAYER_JOIN_STABILIZE_MS,
+      stableTeamId,
+      stableSamples: stableTeamId > 0 ? PLAYER_JOIN_REQUIRED_STABLE_SAMPLES : 0,
+      nextRetryAtMs: 0,
+      isReconnect: false,
+      deployAckSeen: false,
+      watchdogLogged: false,
+    };
+    pendingPlayerSessionById[playerId] = pending;
+
+    if (stableTeamId > 0) {
+      try {
+        activatePendingPlayerSession(pending);
+        continue;
+      } catch (err) {
+        LogRuntimeError("GameModeStart/ActivateConnectedPlayer/" + String(playerId), err);
+      }
+    }
+
+    // Never strand the initial host on "Deployment unavailable" while waiting
+    // for the team handle to stabilize. A deploy acknowledgement updates the
+    // pending handle and the normal supervisor completes activation safely.
+    try {
+      mod.EnablePlayerDeploy(eventPlayer, true);
+    } catch (err) {
+      LogRuntimeError("GameModeStart/UnlockConnectedPlayer/" + String(playerId), err);
+    }
+  }
+}
+
 function Mode_OnGameModeStarted(): void {
+  const startupPlayerHandles = collectConnectedHumanPlayerHandlesForGameModeStart();
   initializePerformanceStatsLoggingOnce();
-  startMainLoopTimer();
+  // Do not let the interval supervisor race the fresh-start reset and player
+  // bootstrap. It is started only after prematch deployment and roster state are
+  // fully restored.
+  stopMainLoopTimer();
   resetLifecycleStateForFreshMatchStart();
   SetDepthAboveGameUI("PreMatchContainer");
   SetDepthAboveGameUI(PREMATCH_PANEL_WIDGET_NAME);
@@ -26197,12 +26396,16 @@ function Mode_OnGameModeStarted(): void {
   gameModeStarted = true;
 
   ConfigurePreMatchSpawns();
+  ShowPrematchUi();
+  forceEnablePrematchDeploymentForKnownPlayers("OnGameModeStarted_before_bootstrap", startupPlayerHandles);
+  bootstrapConnectedHumanPlayersForGameModeStart(startupPlayerHandles);
+  forceEnablePrematchDeploymentForKnownPlayers("OnGameModeStarted_after_bootstrap", startupPlayerHandles);
 
   for (let i = 0; i < fireVfx.length; i++) {
     mod.EnableVFX(fireVfx[i], true);
   }
-  ShowPrematchUi();
   refreshPrematchReadyStateUi();
+  startMainLoopTimer();
 }
 function Mode_OnGameModeEnding(): void {
   stopMainLoopTimer();
@@ -26545,9 +26748,37 @@ function Mode_OnPlayerJoinGame(eventPlayer: mod.Player): void {
       deployAckSeen: false,
       watchdogLogged: false,
     };
+    const keepPrematchDeployAvailable = !gameModeStarted || gameStatus === -1 || gameStatus === 0;
     try {
-      mod.EnablePlayerDeploy(eventPlayer, false);
+      // Midmatch joins remain quarantined until their handle/team is stable.
+      // Prematch joins are unlocked globally and per player so the host can use
+      // the authored ready-up HQ immediately.
+      mod.EnablePlayerDeploy(eventPlayer, keepPrematchDeployAvailable);
     } catch (_errDeployLock) {}
+
+    if (keepPrematchDeployAvailable) {
+      forceEnablePrematchDeploymentForKnownPlayers("OnPlayerJoinGame", [eventPlayer]);
+      const prematchPending = pendingPlayerSessionById[joiningId];
+      const identity = tryGetSafeEventPlayerIdentity(eventPlayer);
+      if (
+        prematchPending &&
+        identity &&
+        !identity.isBot &&
+        (identity.teamId === 1 || identity.teamId === 2) &&
+        isCurrentPlayerSession(joiningId, prematchPending.sessionToken)
+      ) {
+        prematchPending.stableTeamId = identity.teamId;
+        prematchPending.stableSamples = 1;
+        prematchPending.joinedAtMs = Date.now() - PLAYER_JOIN_STABILIZE_MS;
+        try {
+          activatePendingPlayerSession(prematchPending);
+        } catch (err) {
+          // The periodic supervisor retries, but deployment remains available.
+          LogRuntimeError("OnPlayerJoinGame/PrematchActivate/" + String(joiningId), err);
+          forceEnablePrematchDeploymentForKnownPlayers("OnPlayerJoinGame_retry", [eventPlayer]);
+        }
+      }
+    }
   } catch (err) {
     LogRuntimeError("OnPlayerJoinGame", err);
   }
