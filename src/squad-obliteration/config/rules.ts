@@ -15,7 +15,6 @@ export const RULES = {
     objectiveArmedDestroySeconds: 45,
     bombReturnToBaseSeconds: 30,
     timerLanes: {
-        disabledMcomEnforceMs: 500,
         phaseSecondMs: 1000,
         liveFastMs: 100,
         liveSlowMs: 300,

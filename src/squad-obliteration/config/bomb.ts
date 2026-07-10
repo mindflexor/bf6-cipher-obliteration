@@ -1,11 +1,9 @@
 import { WORLD_IDS } from './world-ids.ts';
 
 export const BOMB_CONFIG = {
-    pickupTriggerId: WORLD_IDS.areaTriggers.bombPickup,
-    anchorSectorId: 3100,
+    anchorSectorId: WORLD_IDS.key.sector,
     // Overload-style cipher key spawning uses exactly three center anchors.
-    anchorObjectIds: [3101, 3102, 3103],
-    quadBikeSpawnObjectId: 0,
+    anchorObjectIds: WORLD_IDS.key.anchors,
     liveStartInitialSpawnDelaySeconds: 20,
     objectiveDestroyRespawnDelaySeconds: 0,
     cipherKeyDeliveryRespawnDelaySeconds: 20,

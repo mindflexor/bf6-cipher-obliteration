@@ -1,9 +1,6 @@
 export type PlayerScoreboardSnapshot = [number, number, number, number, number];
 
 export interface PlayerUiState {
-    friendlyCapture?: mod.UIWidget | null;
-    enemyCapture?: mod.UIWidget | null;
-    progressBar?: mod.UIWidget | null;
     friendlyScore?: mod.UIWidget | null;
     enemyScore?: mod.UIWidget | null;
     friendlyScorePad?: mod.UIWidget | null;
@@ -15,14 +12,10 @@ export interface PlayerUiState {
     objectiveHoldFillDisarming?: mod.UIWidget | null;
     objectiveHoldTextArming?: mod.UIWidget | null;
     objectiveHoldTextDisarming?: mod.UIWidget | null;
-    activeFlagContainer?: mod.UIWidget | null;
-    activeFlagFriendly?: mod.UIWidget | null;
-    activeFlagEnemy?: mod.UIWidget | null;
-    activeFlag?: mod.UIWidget | null;
     flagWidgets: Record<string, mod.UIWidget | null>;
 }
 
-export class PlayerState {
+export class PlayerSessionState {
     public constructor(
         public player: mod.Player,
         public id: number,
@@ -31,7 +24,9 @@ export class PlayerState {
 
     public isDeployed = false;
     public isReady = false;
-    public activeCapturePoint: mod.CapturePoint | null = null;
+    public sessionGeneration = 0;
+    public lifeGeneration = 0;
+    public transitionToken = 0;
     public ui: PlayerUiState = {
         flagWidgets: {},
     };
@@ -42,14 +37,6 @@ export class PlayerState {
 
     public setTeam(team: mod.Team): void {
         this.team = team;
-    }
-
-    public setCapturePoint(capturePoint: mod.CapturePoint | null): void {
-        this.activeCapturePoint = capturePoint;
-    }
-
-    public getCapturePoint(): mod.CapturePoint | null {
-        return this.activeCapturePoint;
     }
 
     public toggleReady(): boolean {
@@ -71,7 +58,6 @@ export class PlayerState {
         this._scoreboard = [0, 0, 0, 0, 0];
         this.isDeployed = false;
         this.isReady = false;
-        this.activeCapturePoint = null;
         this._firstDeployPending = true;
     }
 
@@ -99,3 +85,5 @@ export class PlayerState {
         return [...this._scoreboard] as PlayerScoreboardSnapshot;
     }
 }
+
+export { PlayerSessionState as PlayerState };

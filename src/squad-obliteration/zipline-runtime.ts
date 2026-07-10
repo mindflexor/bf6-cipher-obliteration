@@ -1,7 +1,7 @@
 import { Timers } from 'bf6-portal-utils/timers/index.ts';
 
 import type { ZiplineDefinition } from './config/zipline.ts';
-import { isSquadObliterationLivePhase } from './runtime/mode-runtime.ts';
+import { isCipherLivePhase } from './runtime/mode-runtime.ts';
 import type { ModeContext } from './state/mode-context.ts';
 
 const ZERO_VECTOR = mod.CreateVector(0, 0, 0);
@@ -76,7 +76,7 @@ class ZiplineRuntimeFacade {
         if (!this._started) return;
         if (!this.ensureInitialized()) return;
 
-        const livePhaseNow = isSquadObliterationLivePhase();
+        const livePhaseNow = isCipherLivePhase();
 
         if (livePhaseNow === this._livePhaseActive) return;
 

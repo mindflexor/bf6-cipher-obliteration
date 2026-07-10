@@ -12,7 +12,7 @@ import { installSchedulerModule } from './scheduler-module.ts';
 import { installSpawnRoutingModule } from './spawn-routing-module.ts';
 import { installUiModule } from './ui-module.ts';
 
-export function installSquadObliterationModules(context: ModeContext): void {
+export function installCipherModules(context: ModeContext): void {
     installLifecycleModule(context);
     installAdminModule(context);
     installBotModule(context);

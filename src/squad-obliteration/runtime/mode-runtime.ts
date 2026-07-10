@@ -1,28 +1,27 @@
 /* =================================================================================================
-   Mind Flexor - Squad Obliteration Game Mode Script
+   Mind Flexor - Cipher Obliteration Game Mode Script
    -------------------------------------------------------------------------------------------------
    
 
    Description:
-     - Implements a 3-flag Domination / Conquest-Small style mode:
+     - Implements a four-lane, key-delivery Cipher mode:
          * Prematch ready-up flow (team switch + ready interactions)
          * Countdown -> Pre-live -> Live -> Postmatch state machine
-         * Ticket system with bleed for 2/3 flag control + death ticket loss (after first live deploy)
-         * Capture UI (flag letters, on-point counts, progress bar) + remaining time + postmatch overlay
+         * Two-key node overloads, timed halves, sudden death, and postmatch
+         * Cipher A-D HUD, key state, remaining time, and postmatch overlay
          * Fixed live HQ enforcement by half
-         * Safe-spawn recycling (enemy proximity check) with squad-spawn bypass probing
-         * Capture audio (ticks, contested VO, captured stingers) + countdown heartbeat + match start stinger
-         * Optional damage zone (AreaTrigger -> periodic damage)
+         * Generation-guarded anchor routing with native squad-spawn bypass
+         * Key/objective audio, countdown heartbeat, and match start stinger
 
    Usage / Notes:
      - This script assumes specific CapturePoint IDs, HQ IDs, InteractPoint IDs, WorldIcon IDs,
-       and Godot PlayerSpawner ObjIds already placed in your level.
+       and authored Cairo anchors already placed in the level.
      - Keep IDs in sync with your map placement.
 
    Licensing / Credits:
      - Licensed under MIT (see root LICENSE).
      - Primary mode implementation: Enoc Bernal (mindflexor).
-     - Credits: BattlefieldDad, Mancour, uberdubersoldat, and dfk_7677 for legacy logic inspiration.
+     - Credits: BattlefieldDad, Mancour, uberdubersoldat, and dfk_7677 for gameplay inspiration.
      - Template and utilities foundation credit: Michael De Luca.
 
    Version:
@@ -30,18 +29,73 @@
 ================================================================================================= */
 
 import { BOMB_CONFIG } from '../config/bomb.ts';
-import { SQUAD_OBJECTIVE_CONFIGS } from '../config/objectives.ts';
+import { CIPHER_OBJECTIVE_CONFIGS } from '../config/objectives.ts';
 import { RULES } from '../config/rules.ts';
 import { SPAWN_ROUTING_CONFIG } from '../config/spawn-routing.ts';
 import { WORLD_IDS } from '../config/world-ids.ts';
 import { modlib } from '../utils/mod-compat.ts';
-import { Timers } from 'bf6-portal-utils/timers/index.ts';
 
 /* =================================================================================================
    1) CORE CONFIGURATION
 ================================================================================================= */
 
 const TICK_RATE = RULES.tickRate;        // OngoingGlobal is treated as configured ticks/sec
+
+type CipherScheduledTask = {
+  id: number;
+  deadlineSeconds: number;
+  context: string;
+  run: () => void;
+};
+
+let cipherScheduledTaskSequence = 0;
+let cipherScheduledTasks: CipherScheduledTask[] = [];
+let cipherCancelledScheduledTaskIds: { [taskId: number]: boolean | undefined } = {};
+
+function scheduleCipherGlobalTask(delaySeconds: number, context: string, run: () => void): number {
+  cipherScheduledTaskSequence += 1;
+  cipherScheduledTasks.push({
+    id: cipherScheduledTaskSequence,
+    deadlineSeconds: getCurrentSchedulerNowSeconds() + mod.Max(0, delaySeconds),
+    context,
+    run,
+  });
+  return cipherScheduledTaskSequence;
+}
+
+function cancelCipherGlobalTask(taskId: number | undefined): void {
+  if (taskId === undefined) return;
+  cipherCancelledScheduledTaskIds[taskId] = true;
+}
+
+function processCipherScheduledTasks(nowSeconds: number): void {
+  if (cipherScheduledTasks.length === 0) return;
+  const remaining: CipherScheduledTask[] = [];
+  let processed = 0;
+  for (let i = 0; i < cipherScheduledTasks.length; i++) {
+    const task = cipherScheduledTasks[i];
+    if (cipherCancelledScheduledTaskIds[task.id] === true) {
+      delete cipherCancelledScheduledTaskIds[task.id];
+      continue;
+    }
+    if (task.deadlineSeconds > nowSeconds || processed >= 12) {
+      remaining.push(task);
+      continue;
+    }
+    processed += 1;
+    try {
+      task.run();
+    } catch (err) {
+      LogRuntimeError("ScheduledTask/" + task.context, err);
+    }
+  }
+  cipherScheduledTasks = remaining;
+}
+
+function resetCipherScheduledTasks(): void {
+  cipherScheduledTasks = [];
+  cipherCancelledScheduledTaskIds = {};
+}
 
 const USE_ENGINE_TIME_SCHEDULER = true;
 const DEBUG_PERF_TELEMETRY = false;
@@ -56,8 +110,8 @@ const CIPHER_RUNTIME_BOT_RESPAWN_DELAY_SECONDS = 1.0;
 const CIPHER_RUNTIME_BOT_MANDOWN_REVIVE_WINDOW_SECONDS = 5.0;
 const CIPHER_RUNTIME_BOT_DEATH_RESPAWN_DELAY_SECONDS = CIPHER_RUNTIME_BOT_MANDOWN_REVIVE_WINDOW_SECONDS;
 const BOT_LIVE_SPAWN_INITIAL_DELAY_SECONDS = 0.25;
-const CIPHER_RUNTIME_BOT_TEAM1_SPAWNER_ID = 8085;
-const CIPHER_RUNTIME_BOT_TEAM2_SPAWNER_ID = 8086;
+const CIPHER_RUNTIME_BOT_TEAM1_SPAWNER_ID = WORLD_IDS.bots.team1Spawner;
+const CIPHER_RUNTIME_BOT_TEAM2_SPAWNER_ID = WORLD_IDS.bots.team2Spawner;
 const CIPHER_RUNTIME_BOT_STAGED_SPAWN_INTERVAL_TICKS = TICK_RATE;
 const BOT_OBJECTIVE_MOVE_FAIL_RETRY_SECONDS = 2.0;
 const BOT_OBJECTIVE_MOVE_SUCCESS_RECHECK_SECONDS = 0.35;
@@ -104,11 +158,11 @@ const LIVE_SCORE_PANEL_LEFT = 26;
 const LIVE_SCORE_PANEL_TOP = 92;
 const LIVE_SCORE_PANEL_WIDTH = 308;
 const LIVE_SCORE_PANEL_HEIGHT = 122;
-const LIVE_SCORE_FLAG_SIZE = 44;
-const LIVE_SCORE_FLAG_GAP = 6;
-const LIVE_SCORE_FLAG_ROW_WIDTH = (LIVE_SCORE_FLAG_SIZE * 4) + (LIVE_SCORE_FLAG_GAP * 3);
-const LIVE_SCORE_FLAG_ROW_LEFT = LIVE_SCORE_PANEL_LEFT + ((LIVE_SCORE_PANEL_WIDTH - LIVE_SCORE_FLAG_ROW_WIDTH) / 2);
-const LIVE_SCORE_FLAG_ROW_TOP = LIVE_SCORE_PANEL_TOP + 3;
+const LIVE_SCORE_NODE_SIZE = 44;
+const LIVE_SCORE_NODE_GAP = 6;
+const LIVE_SCORE_NODE_ROW_WIDTH = (LIVE_SCORE_NODE_SIZE * 4) + (LIVE_SCORE_NODE_GAP * 3);
+const LIVE_SCORE_NODE_ROW_LEFT = LIVE_SCORE_PANEL_LEFT + ((LIVE_SCORE_PANEL_WIDTH - LIVE_SCORE_NODE_ROW_WIDTH) / 2);
+const LIVE_SCORE_NODE_ROW_TOP = LIVE_SCORE_PANEL_TOP + 3;
 const LIVE_SCORE_ROW_CENTER_Y = LIVE_SCORE_PANEL_TOP + 63;
 const LIVE_HUD_SCORE_WIDTH = 64;
 const LIVE_HUD_SCORE_HEIGHT = 38;
@@ -160,12 +214,6 @@ const ENABLE_DAMAGE_SMOOTHING = false;   // set to false to disable smoothing
 const ENABLE_STRINGKEY_DEBUG_WORLD_LOGS = false;
 
 
-const CAPTURE_TIME = 0.5;                 // seconds to capture neutral -> owned
-const NEUTRALIZE_TIME = 0.5;              // seconds to neutralize owned -> neutral
-// 2 players => 2x speed => time / 2
-// cap it (keep BF4-ish, avoids insane speeds)
-const OBJECTIVE_CAPTURE_LOCKED_CAPTURE_TIME = 9999;
-const OBJECTIVE_CAPTURE_LOCKED_NEUTRALIZE_TIME = 9999;
 const OBJECTIVE_INTERACT_HOLD_SECONDS = RULES.objectiveInteractHoldSeconds;
 const OBJECTIVE_INTERACT_HOLD_TICKS = OBJECTIVE_INTERACT_HOLD_SECONDS * TICK_RATE;
 const OBJECTIVE_SCORE_HOLD_SECONDS = RULES.objectiveArmedDestroySeconds;
@@ -182,10 +230,6 @@ const COLOR_ENEMY = mod.CreateVector(
     72 / 255,
     58 / 255
 );
-/* Capture progress float tolerances */
-const PROGRESS_EPSILON = 0.02;
-const PROGRESS_FULL = 1 - PROGRESS_EPSILON;
-const PROGRESS_EMPTY = PROGRESS_EPSILON;
 
 /* =================================================================================================
    2) TEAM / PHASE STATE
@@ -317,7 +361,6 @@ const CIPHER_TRANSITION_PREDEPLOY_STAGE_SECONDS = 10;
 const CIPHER_TRANSITION_HUMAN_UNDEPLOY_WORK_PER_TICK = 1;
 const CIPHER_TRANSITION_DEPLOY_RECONCILE_PLAYERS_PER_TICK = 4;
 const CIPHER_TRANSITION_FORCE_DEPLOY_PLAYERS_PER_TICK = 1;
-const CIPHER_TRANSITION_CLOCK_FALLBACK_STALE_MS = 150;
 const CIPHER_TRANSITION_BOT_UNSPAWN_WORK_PER_TICK = 1;
 const CIPHER_TRANSITION_OBJECTIVE_EVENT_SUPPRESS_SECONDS = 0.35;
 
@@ -443,8 +486,6 @@ let postmatchEndTimer: number | undefined = undefined;
 let postmatchEndToken = 0;
 let transitionFallbackActive = false;
 let transitionFallbackNextAllowedTick = 0;
-let mainLoopLastPulseAtMs = 0;
-let ongoingGlobalFallbackLastPulseAtMs = 0;
 let transitionWarnedByKey: { [key: string]: boolean } = {};
 let liveTransitionCheckpointSeenByKey: { [key: string]: boolean } = {};
 let hqEnableWarnedById: { [hqId: number]: boolean } = {};
@@ -464,7 +505,6 @@ let transitionSpawnExpectedTransitionTokenByPlayerId: { [playerId: number]: numb
 let transitionSpawnWarnedByKey: { [key: string]: boolean } = {};
 let objectiveEngineWarnedByKey: { [key: string]: boolean } = {};
 const TRANSITION_SPAWN_MIN_RETRY_TICKS = mod.Max(1, mod.Floor(0.1 * TICK_RATE));
-const TRANSITION_SPAWN_INFLIGHT_TIMEOUT_TICKS = mod.Max(1, mod.Floor(1.5 * TICK_RATE));
 const DEBUG_TRANSITION_SPAWN_DIAGNOSTICS = false;
 const PREMATCH_SWITCH_DEBOUNCE_TICKS = 6;
 const PREMATCH_READY_DEBOUNCE_TICKS = PREMATCH_SWITCH_DEBOUNCE_TICKS;
@@ -519,23 +559,17 @@ const MANAGED_CIPHER_HQ_IDS: number[] = [
   TEAM2_LIVE_HQ,
 ];
 
-/* Per-flag HQs */
-/* Two-flag combos */
-/* All three flags */
-/* No flags */
 /* CapturePoint IDs */
-const CP_A_ID = 201;
-const CP_B_ID = 202;
-const CP_C_ID = 203;
-const CP_D_ID = 204;
-const CP_A_SECOND_HALF_ID = 301;
-const CP_B_SECOND_HALF_ID = 302;
-const CP_C_SECOND_HALF_ID = 303;
-const CP_D_SECOND_HALF_ID = 304;
-const AUTHORED_FIRST_HALF_SECTOR_ID = 200;
-const AUTHORED_SECOND_HALF_SECTOR_ID = 300;
-const LEGACY_OBJECTIVE_SURFACE_SECTOR_IDS: number[] = [];
-const LEGACY_OBJECTIVE_SURFACE_CP_IDS: number[] = [];
+const CP_A_ID = WORLD_IDS.capturePoints.a;
+const CP_B_ID = WORLD_IDS.capturePoints.b;
+const CP_C_ID = WORLD_IDS.capturePoints.c;
+const CP_D_ID = WORLD_IDS.capturePoints.d;
+const CP_A_SECOND_HALF_ID = WORLD_IDS.capturePoints.aSecondHalf;
+const CP_B_SECOND_HALF_ID = WORLD_IDS.capturePoints.bSecondHalf;
+const CP_C_SECOND_HALF_ID = WORLD_IDS.capturePoints.cSecondHalf;
+const CP_D_SECOND_HALF_ID = WORLD_IDS.capturePoints.dSecondHalf;
+const AUTHORED_FIRST_HALF_SECTOR_ID = WORLD_IDS.objectiveSectors.firstHalf;
+const AUTHORED_SECOND_HALF_SECTOR_ID = WORLD_IDS.objectiveSectors.secondHalf;
 const FIRST_HALF_OBJECTIVE_CP_IDS: number[] = [CP_A_ID, CP_B_ID, CP_C_ID, CP_D_ID];
 const SECOND_HALF_OBJECTIVE_CP_IDS: number[] = [
   CP_A_SECOND_HALF_ID,
@@ -545,12 +579,11 @@ const SECOND_HALF_OBJECTIVE_CP_IDS: number[] = [
 ];
 const ALL_OBJECTIVE_CP_IDS: number[] = FIRST_HALF_OBJECTIVE_CP_IDS.concat(SECOND_HALF_OBJECTIVE_CP_IDS);
 const OBJECTIVE_LOGICAL_CP_ID_BY_SURFACE_CP_ID: { [cpId: number]: number | undefined } = {};
-const OBJECTIVE_SURFACE_ONLY_CP_IDS: number[] = LEGACY_OBJECTIVE_SURFACE_CP_IDS.slice();
-const ALL_SCRIPTED_OBJECTIVE_CP_IDS: number[] = ALL_OBJECTIVE_CP_IDS.concat(LEGACY_OBJECTIVE_SURFACE_CP_IDS);
+const ALL_SCRIPTED_OBJECTIVE_CP_IDS: number[] = ALL_OBJECTIVE_CP_IDS;
 const OBJECTIVE_SURFACE_SECTOR_IDS: number[] = [
   AUTHORED_FIRST_HALF_SECTOR_ID,
   AUTHORED_SECOND_HALF_SECTOR_ID,
-].concat(LEGACY_OBJECTIVE_SURFACE_SECTOR_IDS);
+];
 
 for (let i = 0; i < ALL_OBJECTIVE_CP_IDS.length; i++) {
   const cpId = ALL_OBJECTIVE_CP_IDS[i];
@@ -565,7 +598,6 @@ type TopHudLane = "A" | "B" | "C" | "D";
 type ObjectiveAttemptKind = "arm" | "disarm";
 type ObjectiveDefinition = {
   cpId: number;
-  mcomId?: number;
   lane: ObjectiveLetter;
   displayLane: ObjectiveLetter;
   half: RuntimeObjectiveHalf;
@@ -576,9 +608,8 @@ type ObjectiveDefinition = {
   countsForRouting: boolean;
 };
 
-const OBJECTIVE_DEFINITIONS: ObjectiveDefinition[] = SQUAD_OBJECTIVE_CONFIGS.map((config) => ({
+const OBJECTIVE_DEFINITIONS: ObjectiveDefinition[] = CIPHER_OBJECTIVE_CONFIGS.map((config) => ({
   cpId: config.cpId,
-  mcomId: config.mcomId,
   lane: config.lane,
   displayLane: config.displayLane ?? config.lane,
   half: config.half,
@@ -590,11 +621,9 @@ const OBJECTIVE_DEFINITIONS: ObjectiveDefinition[] = SQUAD_OBJECTIVE_CONFIGS.map
 }));
 
 let objectiveDefByCpId: { [cpId: number]: ObjectiveDefinition } = {};
-let objectiveDefByMcomId: { [mcomId: number]: ObjectiveDefinition } = {};
 for (let i = 0; i < OBJECTIVE_DEFINITIONS.length; i++) {
   const def = OBJECTIVE_DEFINITIONS[i];
   objectiveDefByCpId[def.cpId] = def;
-  if (def.mcomId !== undefined) objectiveDefByMcomId[def.mcomId] = def;
 }
 
 
@@ -619,10 +648,10 @@ function getCipherTeamSideForCurrentHalf(team: mod.Team): CipherMapSide | undefi
 const TOP_HUD_LANES: TopHudLane[] = ["A", "B", "C", "D"];
 
 /* Prematch InteractPoints (switch team + ready) */
-const IP_T1_SWITCH = 2001;
-const IP_T1_READY = 2002;
-const IP_T2_SWITCH = 2003;
-const IP_T2_READY = 2004;
+const IP_T1_SWITCH = WORLD_IDS.interactPoints.team1Switch;
+const IP_T1_READY = WORLD_IDS.interactPoints.team1Ready;
+const IP_T2_SWITCH = WORLD_IDS.interactPoints.team2Switch;
+const IP_T2_READY = WORLD_IDS.interactPoints.team2Ready;
 
 /* Live spectator InteractPoint */
 const OBJECTIVE_INTERACT_POINT_ID_BY_CP_ID: { [cpId: number]: number } =
@@ -703,17 +732,13 @@ function resolveCurrentHalfObjectiveCpIdFromInteractPoint(interactId: number): n
 }
 
 /* Prematch WorldIcons */
-const WORLDICON_T1_SWITCH = 5001;
-const WORLDICON_T1_READY = 5002;
-const WORLDICON_T2_SWITCH = 5003;
-const WORLDICON_T2_READY = 5004;
+const WORLDICON_T1_SWITCH = WORLD_IDS.worldIcons.team1Switch;
+const WORLDICON_T1_READY = WORLD_IDS.worldIcons.team1Ready;
+const WORLDICON_T2_SWITCH = WORLD_IDS.worldIcons.team2Switch;
+const WORLDICON_T2_READY = WORLD_IDS.worldIcons.team2Ready;
 
-/* Damage zone AreaTrigger */
-const DAMAGE_TRIGGER_ID = WORLD_IDS.areaTriggers.damage;
 const RESTRICTED_AREA_TRIGGER = WORLD_IDS.areaTriggers.restricted;
 const COMBAT_BOUNDARY_TRIGGER_ID = WORLD_IDS.areaTriggers.combatBoundary;
-const TEAM1_HQ_PROTECTION_TRIGGER_ID = WORLD_IDS.areaTriggers.team1HqProtection;
-const TEAM2_HQ_PROTECTION_TRIGGER_ID = WORLD_IDS.areaTriggers.team2HqProtection;
 const PREMATCH_HEALTH_AREA_TRIGGER_ID = WORLD_IDS.areaTriggers.prematchHealth;
 const PREMATCH_HEALTH_NORMAL_MAX = 100;
 const PREMATCH_HEALTH_OUTSIDE_MAX = 100;
@@ -722,15 +747,10 @@ const RESTRICTED_AREA_LETHAL_CONFIRM_DELAY_MS = 1;
 const RESTRICTED_AREA_UI_ACTIVATION_DELAY_SECONDS = 0.66;
 const RESTRICTED_AREA_TRIGGER_IDS: number[] = [
   RESTRICTED_AREA_TRIGGER,
-  TEAM1_HQ_PROTECTION_TRIGGER_ID,
-  TEAM2_HQ_PROTECTION_TRIGGER_ID,
 ];
 const BOMB_LOOT_GADGET: mod.Gadgets = mod.Gadgets.Misc_PortalGadget;
-const BOMB_PICKUP_TRIGGER_ID = BOMB_CONFIG.pickupTriggerId;
-const BOMB_USE_PICKUP_AREA_TRIGGER_AUTHORITY = false;
 const BOMB_ANCHOR_SECTOR_ID = BOMB_CONFIG.anchorSectorId;
 const BOMB_ANCHOR_OBJECT_IDS = BOMB_CONFIG.anchorObjectIds;
-const BOMB_QUAD_BIKE_SPAWN_OBJECT_ID = BOMB_CONFIG.quadBikeSpawnObjectId;
 
 type BombBaseSlotConfig = {
   anchorObjectId: number;
@@ -742,9 +762,6 @@ const BOMB_BASE_SLOT_CONFIGS: BombBaseSlotConfig[] = BOMB_ANCHOR_OBJECT_IDS.map(
 const BOMB_DEFAULT_BASE_SLOT_INDEX = 0;
 const BOMB_RUNTIME_LOOT_SPAWNER_ASSET: mod.RuntimeSpawn_Common = mod.RuntimeSpawn_Common.LootSpawner;
 const BOMB_RUNTIME_LOOT_SPAWNER_SCALE = mod.CreateVector(1, 1, 1);
-const BOMB_QUAD_BIKE_RUNTIME_SPAWNER_ASSET: mod.RuntimeSpawn_Common = mod.RuntimeSpawn_Common.VehicleSpawner;
-const BOMB_QUAD_BIKE_VEHICLE_TYPE: mod.VehicleList = mod.VehicleList.Quadbike;
-const BOMB_QUAD_BIKE_ROTATION_FALLBACK = mod.CreateVector(0, 0, 0);
 const BOMB_PLAYER_DROPPED_RELOCATION_DELAY_SECONDS = BOMB_CONFIG.playerDroppedRelocationDelaySeconds;
 const BOMB_PLAYER_DROPPED_EXPLOSION_RESPAWN_DELAY_SECONDS = BOMB_CONFIG.playerDroppedExplosionRespawnDelaySeconds;
 const CIPHER_KEY_DELIVERY_RESPAWN_DELAY_SECONDS = BOMB_CONFIG.cipherKeyDeliveryRespawnDelaySeconds;
@@ -791,33 +808,7 @@ const BOMB_DEPLOY_LOADOUT_SLOT_SETTLE_SECONDS = 0.1;
 const BOMB_GADGET_ONE_RESTORE_INSERT_SETTLE_SECONDS = 0.5;
 const DEBUG_BOMB_PICKUP = false;
 
-const OBJECTIVE_MCOM_ID_BY_CP_ID: { [cpId: number]: number } = {};
-const OBJECTIVE_CP_ID_BY_MCOM_ID: { [mcomId: number]: number } = {};
-let objectiveResolvedMcomIdByCpId: { [cpId: number]: number | undefined } = {};
-for (let i = 0; i < OBJECTIVE_DEFINITIONS.length; i++) {
-  const def = OBJECTIVE_DEFINITIONS[i];
-  if (def.mcomId === undefined) continue;
-  OBJECTIVE_MCOM_ID_BY_CP_ID[def.cpId] = def.mcomId;
-  OBJECTIVE_CP_ID_BY_MCOM_ID[def.mcomId] = def.cpId;
-  objectiveResolvedMcomIdByCpId[def.cpId] = def.mcomId;
-}
-const HARD_DISABLED_OBJECTIVE_MCOM_IDS: number[] = [7101, 7102, 7103, 7104];
-const EXPECTED_OBJECTIVE_MCOM_IDS: number[] = HARD_DISABLED_OBJECTIVE_MCOM_IDS.slice();
-const HARD_DISABLED_OBJECTIVE_MCOM_DROP_Y = -300;
-const hardObjectiveMcomMovedBelowMapById: { [mcomId: number]: boolean } = {};
-const hardObjectiveMcomInitialPositionById: { [mcomId: number]: mod.Vector | undefined } = {};
-const hardObjectiveMcomMoveWarnedByKey: { [key: string]: boolean } = {};
 
-const DAMAGE_PER_PULSE = 8;
-const DAMAGE_INTERVAL_SECONDS = 0.25;
-const DAMAGE_ZONE_PULSE_INTERVAL_MS = mod.Max(1, mod.Floor(DAMAGE_INTERVAL_SECONDS * 1000));
-
-/* Fire VFX enabled at match start */ 
-const FIRE_IDS = [
-  331, 332, 333, 334, 335, 336, 337, 338, 339, 340,
-  341, 342, 343, 344, 345, 346, 347, 348, 349,
-];
-const fireVfx: mod.VFX[] = FIRE_IDS.map((id) => mod.GetVFX(id));
 const OBJECTIVE_AWARD_CP_IDS: number[] = [
   CP_A_ID,
   CP_B_ID,
@@ -828,48 +819,14 @@ const OBJECTIVE_AWARD_CP_IDS: number[] = [
   CP_C_SECOND_HALF_ID,
   CP_D_SECOND_HALF_ID,
 ];
-const OBJECTIVE_AWARD_VFX_ID_BY_CP_ID: { [cpId: number]: number } = {
-  [CP_A_ID]: 8101,
-  [CP_B_ID]: 8102,
-  [CP_C_ID]: 8103,
-  [CP_D_ID]: 8201,
-  [CP_A_SECOND_HALF_ID]: 8101,
-  [CP_B_SECOND_HALF_ID]: 8102,
-  [CP_C_SECOND_HALF_ID]: 8103,
-  [CP_D_SECOND_HALF_ID]: 8201,
-};
-const OBJECTIVE_ARMED_WORLDICON_ID_BY_CP_ID: { [cpId: number]: number } = {
-  [CP_A_ID]: 221,
-  [CP_B_ID]: 222,
-  [CP_C_ID]: 223,
-  [CP_D_ID]: 321,
-  [CP_A_SECOND_HALF_ID]: 221,
-  [CP_B_SECOND_HALF_ID]: 222,
-  [CP_C_SECOND_HALF_ID]: 223,
-  [CP_D_SECOND_HALF_ID]: 321,
-};
+const OBJECTIVE_AWARD_VFX_ID_BY_CP_ID = WORLD_IDS.objectiveVisuals.explosionVfxByCapturePoint;
+const OBJECTIVE_ARMED_WORLDICON_ID_BY_CP_ID = WORLD_IDS.objectiveVisuals.worldIconByCapturePoint;
 const OBJECTIVE_AWARD_PERSISTENT_FIRE_PRIMARY_NAME = "FX_Car_Fire_M_GS";
-const OBJECTIVE_AWARD_PERSISTENT_FIRE_PRIMARY_VFX_ID_BY_CP_ID: { [cpId: number]: number } = {
-  [CP_A_ID]: 211,
-  [CP_B_ID]: 212,
-  [CP_C_ID]: 213,
-  [CP_D_ID]: 311,
-  [CP_A_SECOND_HALF_ID]: 211,
-  [CP_B_SECOND_HALF_ID]: 212,
-  [CP_C_SECOND_HALF_ID]: 213,
-  [CP_D_SECOND_HALF_ID]: 311,
-};
+const OBJECTIVE_AWARD_PERSISTENT_FIRE_PRIMARY_VFX_ID_BY_CP_ID =
+  WORLD_IDS.objectiveVisuals.primaryVfxByCapturePoint;
 const OBJECTIVE_AWARD_PERSISTENT_FIRE_SECONDARY_NAME = "FX_CarFire_FrameCrawl";
-const OBJECTIVE_AWARD_PERSISTENT_FIRE_SECONDARY_VFX_ID_BY_CP_ID: { [cpId: number]: number } = {
-  [CP_A_ID]: 611,
-  [CP_B_ID]: 612,
-  [CP_C_ID]: 613,
-  [CP_D_ID]: 711,
-  [CP_A_SECOND_HALF_ID]: 611,
-  [CP_B_SECOND_HALF_ID]: 612,
-  [CP_C_SECOND_HALF_ID]: 613,
-  [CP_D_SECOND_HALF_ID]: 711,
-};
+const OBJECTIVE_AWARD_PERSISTENT_FIRE_SECONDARY_VFX_ID_BY_CP_ID =
+  WORLD_IDS.objectiveVisuals.secondaryVfxByCapturePoint;
 const OBJECTIVE_AWARD_BURST_LIFETIME_SECONDS = 4.0;
 const OBJECTIVE_AWARD_BURST_ROTATION = mod.CreateVector(0, 0, 0);
 const OBJECTIVE_DISABLE_EMP_HIT_ASSET: mod.RuntimeSpawn_Common =
@@ -955,177 +912,37 @@ CIPHER_NODE_POLYGON_VERTEX_OFFSETS_BY_CP_ID[CP_B_SECOND_HALF_ID] = CIPHER_NODE_P
 CIPHER_NODE_POLYGON_VERTEX_OFFSETS_BY_CP_ID[CP_C_SECOND_HALF_ID] = CIPHER_NODE_POLYGON_VERTEX_OFFSETS_BY_CP_ID[CP_C_ID];
 CIPHER_NODE_POLYGON_VERTEX_OFFSETS_BY_CP_ID[CP_D_SECOND_HALF_ID] = CIPHER_NODE_POLYGON_VERTEX_OFFSETS_BY_CP_ID[CP_D_ID];
 
-type ObjectiveMcomSfxRole = "alarmSimple" | "alarmLeadout" | "arming" | "arm" | "defused" | "defusing";
-type ObjectiveMcomSfxConfig = {
-  anchorObjectId: number;
-  alarmSimple: mod.RuntimeSpawn_Common;
-  alarmLeadout: mod.RuntimeSpawn_Common;
-  arming: mod.RuntimeSpawn_Common;
-  arm: mod.RuntimeSpawn_Common;
-  defused: mod.RuntimeSpawn_Common;
-  defusing: mod.RuntimeSpawn_Common;
-};
-
-const OBJECTIVE_AWARD_ALARM_LEADOUT_SECONDS = OBJECTIVE_SCORE_HOLD_SECONDS;
-const OBJECTIVE_MCOM_SFX_VOLUME = 1.0;
-const OBJECTIVE_MCOM_SFX_ATTENUATION_RANGE = 120;
-const OBJECTIVE_MCOM_SFX_SPAWN_ROTATION = mod.CreateVector(0, 0, 0);
-const OBJECTIVE_ATTEMPT_PLAYER_SFX_VOLUME = 1.0;
-const OBJECTIVE_ATTEMPT_PLAYER_SFX_ATTENUATION_RANGE = 8;
-const OBJECTIVE_ATTEMPT_PLAYER_SFX_CLEANUP_SECONDS = 2.5;
-const OBJECTIVE_MCOM_SFX_ROLES: ObjectiveMcomSfxRole[] = [
-  "alarmSimple",
-  "alarmLeadout",
-  "arming",
-  "arm",
-  "defused",
-  "defusing",
-];
-const OBJECTIVE_ATTEMPT_ARM_COMPLETE_ASSET: mod.RuntimeSpawn_Common =
-  mod.RuntimeSpawn_Common.SFX_GameModes_Rush_Armed_OneShot3D;
-const OBJECTIVE_ATTEMPT_DEFUSE_COMPLETE_ASSET: mod.RuntimeSpawn_Common =
-  mod.RuntimeSpawn_Common.SFX_GameModes_Rush_Defused_OneShot3D;
-const OBJECTIVE_MCOM_SFX_ALARM_SIMPLE_ASSET: mod.RuntimeSpawn_Common =
-  mod.RuntimeSpawn_Common.SFX_GameModes_Rush_Alarm_SimpleLoop3D;
-const OBJECTIVE_MCOM_SFX_ALARM_LEADOUT_ASSET: mod.RuntimeSpawn_Common =
-  mod.RuntimeSpawn_Common.SFX_GameModes_Rush_Alarm_Leadout_SimpleLoop3D;
-const OBJECTIVE_MCOM_SFX_ARMING_ASSET: mod.RuntimeSpawn_Common =
-  mod.RuntimeSpawn_Common.SFX_GameModes_Rush_Arm_SimpleLoop3D;
-const OBJECTIVE_MCOM_SFX_ARM_ASSET: mod.RuntimeSpawn_Common =
-  mod.RuntimeSpawn_Common.SFX_GameModes_Rush_Armed_OneShot3D;
-const OBJECTIVE_MCOM_SFX_DEFUSED_ASSET: mod.RuntimeSpawn_Common =
-  mod.RuntimeSpawn_Common.SFX_GameModes_Rush_Defused_OneShot3D;
-const OBJECTIVE_MCOM_SFX_DEFUSING_ASSET: mod.RuntimeSpawn_Common =
-  mod.RuntimeSpawn_Common.SFX_GameModes_Rush_Defusing_SimpleLoop3D;
-
-const OBJECTIVE_MCOM_SFX_BY_CP_ID: { [cpId: number]: ObjectiveMcomSfxConfig } = {
-  [CP_A_ID]: {
-    anchorObjectId: 215,
-    alarmSimple: OBJECTIVE_MCOM_SFX_ALARM_SIMPLE_ASSET,
-    alarmLeadout: OBJECTIVE_MCOM_SFX_ALARM_LEADOUT_ASSET,
-    arming: OBJECTIVE_MCOM_SFX_ARMING_ASSET,
-    arm: OBJECTIVE_MCOM_SFX_ARM_ASSET,
-    defused: OBJECTIVE_MCOM_SFX_DEFUSED_ASSET,
-    defusing: OBJECTIVE_MCOM_SFX_DEFUSING_ASSET,
-  },
-  [CP_B_ID]: {
-    anchorObjectId: 216,
-    alarmSimple: OBJECTIVE_MCOM_SFX_ALARM_SIMPLE_ASSET,
-    alarmLeadout: OBJECTIVE_MCOM_SFX_ALARM_LEADOUT_ASSET,
-    arming: OBJECTIVE_MCOM_SFX_ARMING_ASSET,
-    arm: OBJECTIVE_MCOM_SFX_ARM_ASSET,
-    defused: OBJECTIVE_MCOM_SFX_DEFUSED_ASSET,
-    defusing: OBJECTIVE_MCOM_SFX_DEFUSING_ASSET,
-  },
-  [CP_C_ID]: {
-    anchorObjectId: 217,
-    alarmSimple: OBJECTIVE_MCOM_SFX_ALARM_SIMPLE_ASSET,
-    alarmLeadout: OBJECTIVE_MCOM_SFX_ALARM_LEADOUT_ASSET,
-    arming: OBJECTIVE_MCOM_SFX_ARMING_ASSET,
-    arm: OBJECTIVE_MCOM_SFX_ARM_ASSET,
-    defused: OBJECTIVE_MCOM_SFX_DEFUSED_ASSET,
-    defusing: OBJECTIVE_MCOM_SFX_DEFUSING_ASSET,
-  },
-  [CP_D_ID]: {
-    anchorObjectId: 218,
-    alarmSimple: OBJECTIVE_MCOM_SFX_ALARM_SIMPLE_ASSET,
-    alarmLeadout: OBJECTIVE_MCOM_SFX_ALARM_LEADOUT_ASSET,
-    arming: OBJECTIVE_MCOM_SFX_ARMING_ASSET,
-    arm: OBJECTIVE_MCOM_SFX_ARM_ASSET,
-    defused: OBJECTIVE_MCOM_SFX_DEFUSED_ASSET,
-    defusing: OBJECTIVE_MCOM_SFX_DEFUSING_ASSET,
-  },
-  [CP_A_SECOND_HALF_ID]: {
-    anchorObjectId: 215,
-    alarmSimple: OBJECTIVE_MCOM_SFX_ALARM_SIMPLE_ASSET,
-    alarmLeadout: OBJECTIVE_MCOM_SFX_ALARM_LEADOUT_ASSET,
-    arming: OBJECTIVE_MCOM_SFX_ARMING_ASSET,
-    arm: OBJECTIVE_MCOM_SFX_ARM_ASSET,
-    defused: OBJECTIVE_MCOM_SFX_DEFUSED_ASSET,
-    defusing: OBJECTIVE_MCOM_SFX_DEFUSING_ASSET,
-  },
-  [CP_B_SECOND_HALF_ID]: {
-    anchorObjectId: 216,
-    alarmSimple: OBJECTIVE_MCOM_SFX_ALARM_SIMPLE_ASSET,
-    alarmLeadout: OBJECTIVE_MCOM_SFX_ALARM_LEADOUT_ASSET,
-    arming: OBJECTIVE_MCOM_SFX_ARMING_ASSET,
-    arm: OBJECTIVE_MCOM_SFX_ARM_ASSET,
-    defused: OBJECTIVE_MCOM_SFX_DEFUSED_ASSET,
-    defusing: OBJECTIVE_MCOM_SFX_DEFUSING_ASSET,
-  },
-  [CP_C_SECOND_HALF_ID]: {
-    anchorObjectId: 217,
-    alarmSimple: OBJECTIVE_MCOM_SFX_ALARM_SIMPLE_ASSET,
-    alarmLeadout: OBJECTIVE_MCOM_SFX_ALARM_LEADOUT_ASSET,
-    arming: OBJECTIVE_MCOM_SFX_ARMING_ASSET,
-    arm: OBJECTIVE_MCOM_SFX_ARM_ASSET,
-    defused: OBJECTIVE_MCOM_SFX_DEFUSED_ASSET,
-    defusing: OBJECTIVE_MCOM_SFX_DEFUSING_ASSET,
-  },
-  [CP_D_SECOND_HALF_ID]: {
-    anchorObjectId: 218,
-    alarmSimple: OBJECTIVE_MCOM_SFX_ALARM_SIMPLE_ASSET,
-    alarmLeadout: OBJECTIVE_MCOM_SFX_ALARM_LEADOUT_ASSET,
-    arming: OBJECTIVE_MCOM_SFX_ARMING_ASSET,
-    arm: OBJECTIVE_MCOM_SFX_ARM_ASSET,
-    defused: OBJECTIVE_MCOM_SFX_DEFUSED_ASSET,
-    defusing: OBJECTIVE_MCOM_SFX_DEFUSING_ASSET,
-  },
-};
-
-
 /* =================================================================================================
-   4) FIXED LIVE HQ + SAFE SPAWN (GODOT PLAYERSPAWNERS)
+   4) FIXED LIVE HQ + CIPHER ANCHOR ROUTING
 ================================================================================================= */
 
 /*
-  Godot PlayerSpawner ObjId mapping.
+  Cairo HQ and anchor mapping.
   Fill arrays with the ObjIds you placed in Godot.
 */
-/* Current HQ routing for each team (safe-spawn and spawn routing use this) */
-/* Player routing + safe-spawn state */
-// Pending route chosen at deploy time; only committed after a successful safe-spawn check.
-
-let safeSpawnUnsafePending: { [playerId: number]: boolean } = {};
-let safeSpawnUnsafeSpawnerObjId: { [playerId: number]: number } = {};
-let safeSpawnUnsafeHqObjIdByPlayerId: { [playerId: number]: number } = {};
-let safeSpawnPendingCheck: { [playerId: number]: boolean } = {};
-let safeSpawnForcedUndeploy: { [playerId: number]: boolean } = {};
-let safeSpawnGenerationByPlayerId: { [playerId: number]: number } = {};
-let safeSpawnCheckQueuedGenerationByPlayerId: { [playerId: number]: number | undefined } = {};
-let safeSpawnForcedQueuedGenerationByPlayerId: { [playerId: number]: number | undefined } = {};
-
-/* Safe spawn tuning */
-const SAFE_SPAWN_CHECK_DELAY_SECONDS = SPAWN_ROUTING_CONFIG.safeSpawnCheckDelaySeconds;
+// The selected route is owned by the upcoming session/life generation.
 const CIPHER_SPAWN_ENEMY_DANGER_RADIUS_METERS = 18;
-const SAFE_SPAWN_ENEMY_RADIUS_METERS = CIPHER_SPAWN_ENEMY_DANGER_RADIUS_METERS;
 const CIPHER_RESPAWN_ROUTE_EVALUATION_SECONDS = SPAWN_ROUTING_CONFIG.routeEvaluationDurationSeconds;
 const CIPHER_RESPAWN_ROUTE_TICK_SECONDS = SPAWN_ROUTING_CONFIG.routeEvaluationTickSeconds;
 const CIPHER_RESPAWN_OBJECTIVE_PRESSURE_RADIUS_METERS = SPAWN_ROUTING_CONFIG.objectivePressureRadiusMeters;
 const CIPHER_RESPAWN_CANDIDATE_SAFETY_RADIUS_METERS = SPAWN_ROUTING_CONFIG.queuedCandidateSafetyRadiusMeters;
 const CIPHER_RESPAWN_REROUTE_SAFETY_RADIUS_METERS = SPAWN_ROUTING_CONFIG.rerouteSafetyRadiusMeters;
-const CIPHER_RESPAWN_ROUTE_TICK_MS = mod.Max(1, CIPHER_RESPAWN_ROUTE_TICK_SECONDS * 1000);
 
-// This is the number of unsafe attempts allowed before we stop forcing recycle attempts.
-const SAFE_SPAWN_CHECK_DELAY_TICKS = mod.Max(1, mod.Ceiling(SAFE_SPAWN_CHECK_DELAY_SECONDS * TICK_RATE));
-const SAFE_SPAWN_CHECK_QUEUE_BUDGET_PER_TICK = 2;
-const LIVE_SAFE_SPAWN_TEAM1_HQ_IDS: number[] = [TEAM1_INITIAL_HQ, TEAM1_LIVE_HQ];
-const LIVE_SAFE_SPAWN_TEAM2_HQ_IDS: number[] = [TEAM2_INITIAL_HQ, TEAM2_LIVE_HQ];
 
 const CIPHER_PRESENCE_TRIGGER_ZONE_BY_ID: { [triggerId: number]: CipherPresenceZone } = {
-  901: "northWest",
-  902: "northEast",
-  903: "southWest",
-  904: "southEast",
+  [WORLD_IDS.presenceTriggers.northWest]: "northWest",
+  [WORLD_IDS.presenceTriggers.northEast]: "northEast",
+  [WORLD_IDS.presenceTriggers.southWest]: "southWest",
+  [WORLD_IDS.presenceTriggers.southEast]: "southEast",
 };
-const CIPHER_NORTH_EAST_NORTH_ANCHORS: number[] = [1411, 1412, 1413, 1414, 1415];
-const CIPHER_NORTH_EAST_SOUTH_ANCHORS: number[] = [1421, 1422, 1423, 1424, 1425];
-const CIPHER_NORTH_WEST_NORTH_ANCHORS: number[] = [2311, 2312, 2313, 2314, 2315];
-const CIPHER_NORTH_WEST_SOUTH_ANCHORS: number[] = [2321, 2322, 2323, 2324, 2325];
-const CIPHER_SOUTH_EAST_NORTH_ANCHORS: number[] = [3411, 3412, 3413, 3414, 3415];
-const CIPHER_SOUTH_EAST_SOUTH_ANCHORS: number[] = [3421, 3422, 3423, 3424, 3425];
-const CIPHER_SOUTH_WEST_NORTH_ANCHORS: number[] = [4311, 4312, 4313, 4314, 4315];
-const CIPHER_SOUTH_WEST_SOUTH_ANCHORS: number[] = [4321, 4322, 4323, 4324, 4325];
+const CIPHER_NORTH_EAST_NORTH_ANCHORS = WORLD_IDS.respawnAnchors.northEastNorth;
+const CIPHER_NORTH_EAST_SOUTH_ANCHORS = WORLD_IDS.respawnAnchors.northEastSouth;
+const CIPHER_NORTH_WEST_NORTH_ANCHORS = WORLD_IDS.respawnAnchors.northWestNorth;
+const CIPHER_NORTH_WEST_SOUTH_ANCHORS = WORLD_IDS.respawnAnchors.northWestSouth;
+const CIPHER_SOUTH_EAST_NORTH_ANCHORS = WORLD_IDS.respawnAnchors.southEastNorth;
+const CIPHER_SOUTH_EAST_SOUTH_ANCHORS = WORLD_IDS.respawnAnchors.southEastSouth;
+const CIPHER_SOUTH_WEST_NORTH_ANCHORS = WORLD_IDS.respawnAnchors.southWestNorth;
+const CIPHER_SOUTH_WEST_SOUTH_ANCHORS = WORLD_IDS.respawnAnchors.southWestSouth;
 const CIPHER_FIRST_DEPLOY_NORTH_ANCHORS: number[] = WORLD_IDS.firstDeployAnchors.north;
 const CIPHER_FIRST_DEPLOY_SOUTH_ANCHORS: number[] = WORLD_IDS.firstDeployAnchors.south;
 const CIPHER_ANCHOR_COOLDOWN_SECONDS = 12;
@@ -1152,6 +969,7 @@ type CipherSpawnJob = {
   expectedGameStatus: number;
   expectedMatchStage: CipherMatchStage;
   expectedTransitionToken: number;
+  lifeGeneration: number;
 };
 type CipherRespawnRouteJob = {
   token: number;
@@ -1161,29 +979,11 @@ type CipherRespawnRouteJob = {
   currentSecond: number;
   currentCandidate?: CipherQueuedSpawnAnchor;
   finalizedCandidate?: CipherQueuedSpawnAnchor;
-  timerHandle?: number;
+  nextEvaluationAtSec: number;
   dangerDetected: boolean;
   sessionToken: number | undefined;
   expectedMatchStage: CipherMatchStage;
-};
-type SafeSpawnCheckQueueItem = {
-  playerId: number;
-  generation: number;
-  dueTick: number;
-  sessionToken: number | undefined;
-  expectedMatchStage: CipherMatchStage;
-};
-type ForcedSafeSpawnStage = "undeploy" | "spawn";
-type ForcedSafeSpawnQueueItem = {
-  playerId: number;
-  generation: number;
-  hqObjId: number;
-  spawnerObjId: number;
-  stage: ForcedSafeSpawnStage;
-  dueTick: number;
-  waitTicks: number;
-  sessionToken: number | undefined;
-  expectedMatchStage: CipherMatchStage;
+  lifeGeneration: number;
 };
 
 let cipherPresenceZoneActivePlayersByZone: { [zone: string]: { [playerId: number]: mod.Team } } = {};
@@ -1211,13 +1011,9 @@ const CIPHER_SPAWN_JOBS_PER_TICK = 4;
 const CIPHER_TRANSITION_SPAWN_JOBS_PER_TICK = 6;
 const CIPHER_SPAWN_RETRY_WINDOW_SECONDS = 0.75;
 const CIPHER_TRANSITION_SPAWN_RETRY_WINDOW_SECONDS = 2.0;
-let safeSpawnCheckQueue: SafeSpawnCheckQueueItem[] = [];
-let safeSpawnForcedQueue: ForcedSafeSpawnQueueItem[] = [];
-
-
 /* Squad-spawn bypass probing */
 const SQUAD_SPAWN_DISTANCE = 8;
-const SQUAD_SPAWN_BYPASS_LIFETIME_SECONDS = 1.0;
+const SQUAD_SPAWN_BYPASS_LIFETIME_SECONDS = SPAWN_ROUTING_CONFIG.squadSpawnBypassLifetimeSeconds;
 
 let squadSpawnBypass: { [playerId: number]: boolean } = {};
 
@@ -1226,97 +1022,6 @@ function getObjectiveDef(cpId: number): ObjectiveDefinition | undefined {
   return objectiveDefByCpId[cpId];
 }
 
-
-function refreshObjectiveResolvedMcomAliases(context: string): void {
-  objectiveDefByMcomId = {};
-  objectiveResolvedMcomIdByCpId = {};
-
-  for (const mcomIdKey in OBJECTIVE_CP_ID_BY_MCOM_ID) {
-    delete OBJECTIVE_CP_ID_BY_MCOM_ID[mcomIdKey];
-  }
-
-  for (let i = 0; i < OBJECTIVE_DEFINITIONS.length; i++) {
-    const def = OBJECTIVE_DEFINITIONS[i];
-    if (def.mcomId === undefined) continue;
-    objectiveDefByMcomId[def.mcomId] = def;
-    OBJECTIVE_CP_ID_BY_MCOM_ID[def.mcomId] = def.cpId;
-    objectiveResolvedMcomIdByCpId[def.cpId] = def.mcomId;
-  }
-
-  for (let i = 0; i < OBJECTIVE_DEFINITIONS.length; i++) {
-    const def = OBJECTIVE_DEFINITIONS[i];
-    const configuredMcomId = def.mcomId;
-    if (configuredMcomId === undefined) continue;
-    let resolvedMcomId = configuredMcomId;
-
-    try {
-      resolvedMcomId = mod.GetObjId(mod.GetMCOM(configuredMcomId));
-    } catch (_err) {}
-
-    objectiveResolvedMcomIdByCpId[def.cpId] = resolvedMcomId;
-    objectiveDefByMcomId[resolvedMcomId] = def;
-    OBJECTIVE_CP_ID_BY_MCOM_ID[resolvedMcomId] = def.cpId;
-
-    if (resolvedMcomId !== configuredMcomId) {
-      emitObjectiveNativeEventFlow(
-        mod.Message(
-          "[OBJECTIVE MCOM ALIAS] cp/lane/configured/resolved/context {}",
-          String(def.cpId) +
-            "/" +
-            def.lane +
-            "/" +
-            String(configuredMcomId) +
-            "/" +
-            String(resolvedMcomId) +
-            "/" +
-            context
-        )
-      );
-    }
-  }
-}
-
-function getObjectiveResolvedMcomIdByCpId(cpId: number): number | undefined {
-  return objectiveResolvedMcomIdByCpId[cpId];
-}
-
-function resolveObjectiveCpIdFromMcomEvent(eventMCOM: mod.MCOM): number | undefined {
-  return OBJECTIVE_CP_ID_BY_MCOM_ID[getObjIdSafe(eventMCOM)];
-}
-
-function logObjectiveNativeEventFlow(phase: string, eventMCOM: mod.MCOM, cpId: number | undefined): void {
-  if (!DEBUG_OBJECTIVE_NATIVE_EVENT_FLOW) return;
-
-  const rawMcomId = getObjIdSafe(eventMCOM);
-  const def = cpId !== undefined ? getObjectiveDef(cpId) : undefined;
-  const configuredMcomId = cpId !== undefined ? OBJECTIVE_MCOM_ID_BY_CP_ID[cpId] ?? -1 : -1;
-  const resolvedMcomId = cpId !== undefined ? getObjectiveResolvedMcomIdByCpId(cpId) ?? configuredMcomId : -1;
-  const pendingActive = cpId !== undefined && isObjectivePendingAwardActive(cpId) ? 1 : 0;
-  const disabledAfterAward = cpId !== undefined && isObjectiveDisabledAfterAward(cpId) ? 1 : 0;
-
-  emitObjectiveNativeEventFlow(
-    mod.Message(
-      "[OBJECTIVE EVENT] phase/raw/cp/lane/configured/resolved/pending/disabled/carrier {}",
-      phase +
-        "/" +
-        String(rawMcomId) +
-        "/" +
-        String(cpId ?? -1) +
-        "/" +
-        String(def?.lane ?? "?") +
-        "/" +
-        String(configuredMcomId) +
-        "/" +
-        String(resolvedMcomId) +
-        "/" +
-        String(pendingActive) +
-        "/" +
-        String(disabledAfterAward) +
-        "/" +
-        String(bombCarrierPlayerId ?? -1)
-    )
-  );
-}
 
 let objectivePendingAwardStartTickByCpId: { [cpId: number]: number | undefined } = {};
 let objectivePendingAwardStartAtSecByCpId: { [cpId: number]: number | undefined } = {};
@@ -1351,11 +1056,6 @@ let objectiveCapturePointObjectiveEnabledByCpId: { [cpId: number]: boolean | und
 let objectiveSurfaceSectorObjectiveEnabledBySectorId: { [sectorId: number]: boolean | undefined } = {};
 let objectiveSurfaceSyncInProgress = false;
 let objectiveSurfaceSyncQueued = false;
-let objectiveMcomObjectiveEnabledByCpId: { [cpId: number]: boolean | undefined } = {};
-let objectiveMcomSfxHandleByKey: { [key: string]: any } = {};
-let objectiveMcomSfxUnavailableByKey: { [key: string]: boolean } = {};
-let objectiveMcomSfxMissingWarnedByKey: { [key: string]: boolean } = {};
-let objectiveMcomSfxEnabledByKey: { [key: string]: boolean } = {};
 let bombAnchorSectorMissingWarned = false;
 let bombAnchorObjectMissingWarnedById: { [objectId: number]: boolean } = {};
 let bombBaseWorldIconMissingWarnedById: { [worldIconId: number]: boolean } = {};
@@ -1492,18 +1192,13 @@ let bombDeployLoadoutApplyTokenCounter = 0;
 let bombCarrierRestoreInsertTokenByPlayerId: { [playerId: number]: number } = {};
 let bombCarrierRestoreInsertTokenCounter = 0;
 let bombPickupTransferInProgress = false;
-let bombPickupTriggerInitialPosition: mod.Vector | undefined = undefined;
 let bombStaticLootSpawnerInitialPosition: mod.Vector | undefined = undefined;
-let bombPickupTriggerEnabled = false;
+let bombBasePickupEnabled = false;
 let bombBaseRuntimeLootSpawnerObject: mod.Object | undefined = undefined;
 let bombBaseRuntimeLootSpawnerHandle: mod.LootSpawner | undefined = undefined;
 let bombBaseRuntimeLootSpawnerObjectId: number | undefined = undefined;
 let bombBaseRuntimeWorldIconObject: mod.Object | undefined = undefined;
 let bombBaseRuntimeWorldIconHandle: mod.WorldIcon | undefined = undefined;
-let bombQuadBikeRuntimeSpawnerObject: mod.Object | undefined = undefined;
-let bombQuadBikeRuntimeSpawnerHandle: mod.VehicleSpawner | undefined = undefined;
-let bombQuadBikeLiveSpawnAttempted = false;
-let bombQuadBikeAnchorMissingWarned = false;
 let bombActiveBaseSlotIndex = BOMB_DEFAULT_BASE_SLOT_INDEX;
 let bombBaseCachedPosition: mod.Vector | undefined = undefined;
 let bombBaseLandingAnchorPosition: mod.Vector | undefined = undefined;
@@ -1636,8 +1331,6 @@ let perfTelemetryIconLaneRuns = 0;
 let perfTelemetryEndgameLaneRuns = 0;
 let perfTelemetryDamageLaneRuns = 0;
 let perfTelemetryBombPickupScanMaxCandidates = 0;
-let bombPickupTriggerMissingWarned = false;
-let bombPickupTriggerMoveWarned = false;
 let bombBaseBeepLoopMissingWarned = false;
 let bombDroppedBeepLoopMissingWarned = false;
 let bombCarrierBeepLoopMissingWarned = false;
@@ -1828,34 +1521,6 @@ function getObjectPositionSafeValidated(target: unknown, _context: string): Vali
   }
 }
 
-function warnBombPickupTriggerMissingOnce(reason: string): void {
-  if (!shouldEmitStringKeyDebugWorldLogs()) return;
-  if (bombPickupTriggerMissingWarned) return;
-  bombPickupTriggerMissingWarned = true;
-  emitStringKeyDebugWorldLog(
-    mod.Message("[BOMB TRIGGER] Trigger {} unavailable ({})", BOMB_PICKUP_TRIGGER_ID, reason)
-  );
-}
-
-function warnBombPickupTriggerMoveFailureOnce(reason: string): void {
-  if (!shouldEmitStringKeyDebugWorldLogs()) return;
-  if (bombPickupTriggerMoveWarned) return;
-  bombPickupTriggerMoveWarned = true;
-  emitStringKeyDebugWorldLog(
-    mod.Message("[BOMB TRIGGER] Trigger {} move failed ({})", BOMB_PICKUP_TRIGGER_ID, reason)
-  );
-}
-
-function resolveBombPickupTriggerSafe(): mod.AreaTrigger | undefined {
-  if (!BOMB_USE_PICKUP_AREA_TRIGGER_AUTHORITY) return undefined;
-  try {
-    return mod.GetAreaTrigger(BOMB_PICKUP_TRIGGER_ID);
-  } catch (_err) {
-    warnBombPickupTriggerMissingOnce("GetAreaTrigger failed");
-    return undefined;
-  }
-}
-
 function getBombBaseSlotConfig(slotIndex: number): BombBaseSlotConfig | undefined {
   if (slotIndex < 0 || slotIndex >= BOMB_BASE_SLOT_CONFIGS.length) return undefined;
   return BOMB_BASE_SLOT_CONFIGS[slotIndex];
@@ -1882,19 +1547,6 @@ function warnBombAnchorObjectMissingOnce(anchorObjectId: number, reason: string)
   bombAnchorObjectMissingWarnedById[anchorObjectId] = true;
   emitStringKeyDebugWorldLog(
     mod.Message("[BOMB BASE] Anchor object {} unavailable ({})", anchorObjectId, reason)
-  );
-}
-
-function warnBombQuadBikeAnchorMissingOnce(anchorObjectId: number, reason: string): void {
-  if (!shouldEmitStringKeyDebugWorldLogs()) return;
-  if (bombQuadBikeAnchorMissingWarned) return;
-  bombQuadBikeAnchorMissingWarned = true;
-  emitStringKeyDebugWorldLog(
-    mod.Message(
-      "[QUAD BIKE] Required spawn object {} unavailable ({})",
-      anchorObjectId,
-      reason
-    )
   );
 }
 
@@ -1972,30 +1624,6 @@ function resolveSpatialObjectTransformById(
   }
 }
 
-function tryResolveQuadBikeSpawnObjectTransform(): ObjectAnchorTransformResult | undefined {
-  if (BOMB_QUAD_BIKE_SPAWN_OBJECT_ID <= 0) return undefined;
-
-  const transform = resolveSpatialObjectTransformById(
-    BOMB_QUAD_BIKE_SPAWN_OBJECT_ID,
-    warnBombQuadBikeAnchorMissingOnce
-  );
-  if (!transform.position) return undefined;
-
-  const origin = mod.CreateVector(0, 0, 0);
-  const distanceFromOrigin = mod.DistanceBetween(transform.position, origin);
-  if (!Number.isFinite(distanceFromOrigin) || distanceFromOrigin <= 0.01) {
-    warnBombQuadBikeAnchorMissingOnce(BOMB_QUAD_BIKE_SPAWN_OBJECT_ID, "position_invalid");
-    return undefined;
-  }
-
-  return transform;
-}
-
-function validateRequiredQuadBikeAnchorConfigurationOnce(): void {
-  if (BOMB_QUAD_BIKE_SPAWN_OBJECT_ID <= 0) return;
-  void tryResolveQuadBikeSpawnObjectTransform();
-}
-
 function tryGetBombAnchorObjectTransformById(
   anchorObjectId: number,
   context: string
@@ -2050,32 +1678,18 @@ function tryGetActiveBasePickupAnchor(): mod.Vector | undefined {
   return anchor;
 }
 
-function moveObjectToAbsolutePositionSafe(targetObject: mod.Object, targetPosition: mod.Vector, context: string): boolean {
+function moveObjectToAbsolutePositionSafe(targetObject: mod.Object, targetPosition: mod.Vector, _context: string): boolean {
   try {
     const currentPosition = mod.GetObjectPosition(targetObject);
     const delta = mod.Subtract(targetPosition, currentPosition);
     mod.MoveObject(targetObject, delta);
     return true;
   } catch (_err) {
-    if (context === "bomb_trigger") {
-      warnBombPickupTriggerMoveFailureOnce("MoveObject/GetObjectPosition failed");
-    }
     return false;
   }
 }
 
 function cacheBombPickupWorldAnchorPositions(): void {
-  if (BOMB_USE_PICKUP_AREA_TRIGGER_AUTHORITY && !bombPickupTriggerInitialPosition) {
-    const trigger = resolveBombPickupTriggerSafe();
-    if (trigger) {
-      try {
-        bombPickupTriggerInitialPosition = mod.GetObjectPosition(trigger as unknown as mod.Object);
-      } catch (_err) {
-        warnBombPickupTriggerMissingOnce("GetObjectPosition failed");
-      }
-    }
-  }
-
   if (!bombStaticLootSpawnerInitialPosition) {
     bombStaticLootSpawnerInitialPosition = bombBaseLandingAnchorPosition ?? bombBaseCachedPosition;
   }
@@ -2083,52 +1697,19 @@ function cacheBombPickupWorldAnchorPositions(): void {
   const fallbackPos =
     bombBaseLandingAnchorPosition ??
     bombBaseCachedPosition ??
-    bombStaticLootSpawnerInitialPosition ??
-    bombPickupTriggerInitialPosition;
+    bombStaticLootSpawnerInitialPosition;
   if (fallbackPos) {
     if (!bombBaseCachedPosition) bombBaseCachedPosition = fallbackPos;
   }
 }
 
-function setBombPickupTriggerEnabled(enabled: boolean): void {
-  bombPickupTriggerEnabled = enabled;
-  if (!BOMB_USE_PICKUP_AREA_TRIGGER_AUTHORITY) return;
-
-  const trigger = resolveBombPickupTriggerSafe();
-  if (!trigger) {
-    bombPickupTriggerEnabled = false;
-    return;
-  }
-
-  try {
-    mod.EnableAreaTrigger(trigger, enabled);
-  } catch (_err) {
-    warnBombPickupTriggerMissingOnce("EnableAreaTrigger failed");
-    bombPickupTriggerEnabled = false;
-  }
+function setBombBasePickupEnabled(enabled: boolean): void {
+  bombBasePickupEnabled = enabled;
 }
 
-function moveBombPickupTriggerToPosition(targetPosition: mod.Vector, enableAfterMove: boolean): boolean {
+function setBombBasePickupPosition(targetPosition: mod.Vector, enableAfterMove: boolean): boolean {
   bombBaseCachedPosition = targetPosition;
-  if (!BOMB_USE_PICKUP_AREA_TRIGGER_AUTHORITY) {
-    setBombPickupTriggerEnabled(enableAfterMove);
-    return true;
-  }
-
-  const trigger = resolveBombPickupTriggerSafe();
-  if (!trigger) {
-    bombPickupTriggerEnabled = false;
-    return false;
-  }
-
-  const moved = moveObjectToAbsolutePositionSafe(
-    trigger as unknown as mod.Object,
-    targetPosition,
-    "bomb_trigger"
-  );
-  if (!moved) return false;
-
-  setBombPickupTriggerEnabled(enableAfterMove);
+  setBombBasePickupEnabled(enableAfterMove);
   return true;
 }
 
@@ -2415,17 +1996,6 @@ function clearBombBaseRuntimeWorldIcon(): void {
   bombBaseRuntimeWorldIconHandle = undefined;
 }
 
-function clearBombQuadBikeRuntimeSpawner(): void {
-  if (bombQuadBikeRuntimeSpawnerObject) {
-    unspawnObjectSafe(bombQuadBikeRuntimeSpawnerObject, "quad bike runtime spawner object", false);
-  } else if (bombQuadBikeRuntimeSpawnerHandle) {
-    unspawnObjectSafe(bombQuadBikeRuntimeSpawnerHandle as unknown, "quad bike runtime spawner handle", false);
-  }
-
-  bombQuadBikeRuntimeSpawnerObject = undefined;
-  bombQuadBikeRuntimeSpawnerHandle = undefined;
-}
-
 function tryResolveDroppedBombAnchorPosition(): mod.Vector | undefined {
   return bombDroppedPickupAnchorPosition;
 }
@@ -2511,7 +2081,7 @@ function ensureDroppedBombRuntimeWorldIconVisibleIfNeeded(): void {
 
 function hasBaseBombAuthorityOrPending(): boolean {
   return (
-    bombPickupTriggerEnabled ||
+    bombBasePickupEnabled ||
     bombBaseRuntimeLootSpawnerObject !== undefined ||
     bombBaseRuntimeLootSpawnerHandle !== undefined
   );
@@ -2547,7 +2117,7 @@ function ensureBaseBombRuntimeWorldIconVisibleIfNeeded(): void {
   if (!hasBaseBombAuthorityOrPending()) return;
   const basePos = resolveBaseBombAudioAnchorPosition();
   if (!basePos) return;
-  spawnOrReassertBaseBombRuntimeWorldIcon(basePos, bombPickupTriggerEnabled);
+  spawnOrReassertBaseBombRuntimeWorldIcon(basePos, bombBasePickupEnabled);
 }
 
 
@@ -2571,7 +2141,7 @@ function setBombBaseAvailabilityState(hasBaseBomb: boolean): void {
   clearBombDroppedBeepLoop();
   clearBombCarrierBeepLoop();
   bombBaseCachedPosition = basePos;
-  spawnOrReassertBaseBombRuntimeWorldIcon(basePos, bombPickupTriggerEnabled);
+  spawnOrReassertBaseBombRuntimeWorldIcon(basePos, bombBasePickupEnabled);
   spawnOrMoveCipherNativeMinimapBomb(basePos, "base_available");
   startBombBaseBeepLoopAtPosition(basePos);
 }
@@ -3118,27 +2688,23 @@ function tryPlayRuntimeSfxSource3D(
   return undefined;
 }
 
-async function cleanupRuntimeSfxSourceAfterDelay(
+function scheduleRuntimeSfxSourceCleanup(
   spawnedSource: RuntimeSfxSourceSpawnValidation,
   activeHandle: mod.SFX | undefined,
   delaySeconds: number,
   context: string
-): Promise<void> {
-  await mod.Wait(delaySeconds);
-
-  if (spawnedSource.object) {
-    unspawnObjectSafe(spawnedSource.object, context, false);
-    return;
-  }
-
-  if (spawnedSource.spawned) {
-    unspawnObjectSafe(spawnedSource.spawned, context, false);
-    return;
-  }
-
-  if (activeHandle) {
-    unspawnObjectSafe(activeHandle as unknown, context, false);
-  }
+): void {
+  scheduleCipherGlobalTask(delaySeconds, "sfx_cleanup/" + context, () => {
+    if (spawnedSource.object) {
+      unspawnObjectSafe(spawnedSource.object, context, false);
+      return;
+    }
+    if (spawnedSource.spawned) {
+      unspawnObjectSafe(spawnedSource.spawned, context, false);
+      return;
+    }
+    if (activeHandle) unspawnObjectSafe(activeHandle as unknown, context, false);
+  });
 }
 
 function playRuntimeOneShotSfxAtPosition(
@@ -3165,7 +2731,7 @@ function playRuntimeOneShotSfxAtPosition(
     return false;
   }
 
-  void cleanupRuntimeSfxSourceAfterDelay(
+  scheduleRuntimeSfxSourceCleanup(
     spawnedSource,
     activeHandle,
     cleanupSeconds,
@@ -3794,8 +3360,8 @@ function getObjectiveAnchorPosition(cpId: number): mod.Vector | undefined {
 }
 
 function getObjectiveFallbackPosition(cpId: number): mod.Vector | undefined {
-  const mcomPos = tryGetObjectiveMcomPosition(cpId);
-  if (mcomPos) return mcomPos;
+  const objectivePos = getObjectiveAnchorPosition(cpId);
+  if (objectivePos) return objectivePos;
 
   const capturePoint = resolveObjectiveCapturePointHandleByCpId(cpId, "getObjectiveFallbackPosition");
   if (!capturePoint) return undefined;
@@ -4832,10 +4398,6 @@ function chooseCipherSpawnAnchorForPlayer(
 }
 
 function cancelCipherRespawnRouteJobForPlayer(playerId: number): void {
-  const job = cipherRespawnRouteJobByPlayerId[playerId];
-  if (job?.timerHandle !== undefined) {
-    Timers.clearInterval(job.timerHandle);
-  }
   delete cipherRespawnRouteJobByPlayerId[playerId];
 }
 
@@ -4860,6 +4422,7 @@ function invalidateCipherRespawnRouteJobForPlayer(playerId: number): void {
 function isCipherRespawnRouteJobCurrent(job: CipherRespawnRouteJob): boolean {
   if (cipherRespawnRouteTokenByPlayerId[job.playerId] !== job.token) return false;
   if (!isCurrentPlayerSession(job.playerId, job.sessionToken)) return false;
+  if (job.lifeGeneration !== getPlayerLifeGeneration(job.playerId)) return false;
   if (gameStatus !== 3) return false;
   if (cipherMatchStage !== job.expectedMatchStage) return false;
   if (isCipherLiveTransitionActive()) return false;
@@ -4986,6 +4549,7 @@ function sealCipherRespawnRouteJobForDeploy(playerId: number, source: string): v
   if (!job) return;
   if (
     !isCurrentPlayerSession(playerId, job.sessionToken) ||
+    job.lifeGeneration !== getPlayerLifeGeneration(playerId) ||
     gameStatus !== 3 ||
     cipherMatchStage !== job.expectedMatchStage ||
     isCipherLiveTransitionActive()
@@ -4994,12 +4558,20 @@ function sealCipherRespawnRouteJobForDeploy(playerId: number, source: string): v
     return;
   }
 
-  // Seal before recordPlayerDeployedMinimal flips isDeployed=true. Otherwise the timer
-  // invalidates itself and discards the route selected during the respawn countdown.
-  finalizeCipherRespawnRouteJobForPlayer(playerId, source);
+  const sp = serverPlayers.get(playerId);
+  if (!sp || !mod.IsPlayerValid(sp.player)) {
+    invalidateCipherRespawnRouteJobForPlayer(playerId);
+    return;
+  }
+  const candidate = job.finalizedCandidate ?? job.currentCandidate;
+  if (candidate && isCipherQueuedSpawnAnchorValidForTeam(candidate, mod.GetTeam(sp.player))) {
+    cipherQueuedAnchorByPlayerId[playerId] = candidate;
+  }
+  void source;
+  cancelCipherRespawnRouteJobForPlayer(playerId);
 }
 
-function tickCipherRespawnRouteJob(playerId: number, token: number): void {
+function tickCipherRespawnRouteJob(playerId: number, token: number, nowSec: number): void {
   const job = cipherRespawnRouteJobByPlayerId[playerId];
   if (!job || job.token !== token) return;
   if (!isCipherRespawnRouteJobCurrent(job)) {
@@ -5015,6 +4587,7 @@ function tickCipherRespawnRouteJob(playerId: number, token: number): void {
 
   const team = mod.GetTeam(sp.player);
   job.currentSecond += 1;
+  job.nextEvaluationAtSec = nowSec + CIPHER_RESPAWN_ROUTE_TICK_SECONDS;
 
   if (job.currentSecond === 1) {
     job.currentCandidate = selectCipherRespawnRouteCandidate(
@@ -5065,12 +4638,23 @@ function tickCipherRespawnRouteJob(playerId: number, token: number): void {
   }
 }
 
+function processCipherRespawnRouteJobs(nowSec: number): void {
+  let processed = 0;
+  const budget = 2;
+  for (const playerIdKey in cipherRespawnRouteJobByPlayerId) {
+    if (processed >= budget) break;
+    const job = cipherRespawnRouteJobByPlayerId[Number(playerIdKey)];
+    if (!job || nowSec < job.nextEvaluationAtSec) continue;
+    processed += 1;
+    tickCipherRespawnRouteJob(job.playerId, job.token, nowSec);
+  }
+}
+
 function shouldStartCipherRespawnRouteJobForPlayer(playerId: number, wasDeployed: boolean): boolean {
   if (!wasDeployed) return false;
   if (gameStatus !== 3) return false;
   if (isCipherLiveTransitionActive()) return false;
   if (isCipherSuddenDeathActive()) return false;
-  if (safeSpawnForcedUndeploy[playerId] === true || safeSpawnUnsafePending[playerId] === true) return false;
   if (isCipherRuntimeBotPlayerId(playerId)) return false;
 
   const sp = serverPlayers.get(playerId);
@@ -5088,18 +4672,20 @@ function startCipherRespawnRouteJobForPlayer(playerId: number, wasDeployed: bool
 
   const team = mod.GetTeam(sp.player);
   const token = nextCipherRespawnRouteToken(playerId);
+  const nowSec = getCurrentSchedulerNowSeconds();
   const job: CipherRespawnRouteJob = {
     token,
     playerId,
     teamId: modlib.getTeamId(team),
-    startedAtSec: getCurrentSchedulerNowSeconds(),
+    startedAtSec: nowSec,
     currentSecond: 0,
+    nextEvaluationAtSec: nowSec + CIPHER_RESPAWN_ROUTE_TICK_SECONDS,
     dangerDetected: false,
     sessionToken: ensurePlayerSessionToken(playerId),
     expectedMatchStage: cipherMatchStage,
+    lifeGeneration: getPlayerLifeGeneration(playerId),
   };
 
-  job.timerHandle = Timers.setInterval(() => tickCipherRespawnRouteJob(playerId, token), CIPHER_RESPAWN_ROUTE_TICK_MS);
   cipherRespawnRouteJobByPlayerId[playerId] = job;
   void source;
 }
@@ -5201,6 +4787,7 @@ function enqueueCipherSpawnJob(playerId: number, kind: CipherSpawnJobKind, urgen
     expectedGameStatus: gameStatus,
     expectedMatchStage: cipherMatchStage,
     expectedTransitionToken: getQueuedPlayerWorkTransitionToken(),
+    lifeGeneration: getPlayerLifeGeneration(playerId),
   };
   if (urgent) {
     cipherUrgentSpawnJobs.push(job);
@@ -5247,7 +4834,7 @@ function processCipherSpawnJobs(source: string): void {
       job.expectedGameStatus,
       job.expectedMatchStage,
       job.expectedTransitionToken
-    )) {
+    ) || job.lifeGeneration !== getPlayerLifeGeneration(job.playerId)) {
       continue;
     }
 
@@ -5271,6 +4858,7 @@ function processCipherSpawnJobs(source: string): void {
         expectedGameStatus: job.expectedGameStatus,
         expectedMatchStage: job.expectedMatchStage,
         expectedTransitionToken: job.expectedTransitionToken,
+        lifeGeneration: job.lifeGeneration,
       };
       cipherPendingSpawnJobs.push(retryJob);
     }
@@ -5654,13 +5242,13 @@ function scheduleDynamicBaseBombRespawnRetry(
   );
 }
 
-async function respawnBombAtDynamicLocationNow(
+function respawnBombAtDynamicLocationNow(
   context: string,
   announcementMode: BombSpawnAnnouncementMode,
   showHighlightMessage: boolean,
   spawnStrategy: BombDynamicSpawnStrategy = "player_biased",
   reservedCandidate?: BombBaseAnchorCandidate
-): Promise<boolean> {
+): boolean {
   if (gameStatus !== 3) return false;
 
   clearBombCarrierState();
@@ -5676,7 +5264,7 @@ async function respawnBombAtDynamicLocationNow(
   bombBaseLandingAnchorPosition = undefined;
   bombBaseCachedPosition = undefined;
   bombStaticLootSpawnerInitialPosition = undefined;
-  setBombPickupTriggerEnabled(false);
+  setBombBasePickupEnabled(false);
   setAllBaseWorldIconsEnabled(false);
   tryUnspawnAllLootForBombFlow(context + "_dynamic_respawn");
 
@@ -5719,14 +5307,14 @@ async function respawnBombAtDynamicLocationNow(
     bombBaseCachedPosition = candidate.anchorPos;
     bombStaticLootSpawnerInitialPosition = candidate.anchorPos;
 
-    const movedPickupTrigger = moveBombPickupTriggerToPosition(candidate.anchorPos, true);
+    const movedPickupTrigger = setBombBasePickupPosition(candidate.anchorPos, true);
     if (!movedPickupTrigger) {
       clearBombBaseRuntimeLootSpawner();
       bombActiveBaseSlotIndex = BOMB_DEFAULT_BASE_SLOT_INDEX;
       bombBaseLandingAnchorPosition = undefined;
       bombBaseCachedPosition = undefined;
       bombStaticLootSpawnerInitialPosition = undefined;
-      setBombPickupTriggerEnabled(false);
+      setBombBasePickupEnabled(false);
       lastFailureReason = "pickup_trigger_move_failed(anchor=" + String(candidate.anchorObjectId) + ")";
       continue;
     }
@@ -5815,7 +5403,7 @@ function isBombCarrierRestoreInsertPlayerEligible(playerId: number, player: mod.
   return currentObjId >= 0 && currentObjId === restoreObjId;
 }
 
-async function restoreBombCarrierReplacementEquipmentForPlayerAfterDelay(
+function restoreBombCarrierReplacementEquipmentForPlayer(
   playerId: number,
   player: mod.Player,
   replacedSlot: mod.InventorySlots | undefined,
@@ -5823,9 +5411,7 @@ async function restoreBombCarrierReplacementEquipmentForPlayerAfterDelay(
   restoreAmmoState: BombRestoreAmmoState | undefined,
   reason: string,
   token: number
-): Promise<void> {
-  await mod.Wait(BOMB_GADGET_ONE_RESTORE_INSERT_SETTLE_SECONDS);
-
+): void {
   if (!isBombCarrierRestoreInsertCurrent(playerId, token)) return;
   if (!isBombCarrierRestoreInsertPlayerEligible(playerId, player)) {
     clearBombCarrierDeployRestoreCacheForPlayer(playerId);
@@ -5870,15 +5456,17 @@ function scheduleBombCarrierReplacementEquipmentRestoreForPlayer(
 
   if (previousEquipment !== undefined) {
     const token = beginBombCarrierRestoreInsertForPlayer(playerId);
-    void restoreBombCarrierReplacementEquipmentForPlayerAfterDelay(
-      playerId,
-      player,
-      replacedSlot,
-      previousEquipment,
-      restoreAmmoState,
-      reason,
-      token
-    );
+    scheduleCipherGlobalTask(BOMB_GADGET_ONE_RESTORE_INSERT_SETTLE_SECONDS, "key_equipment_restore/" + reason, () => {
+      restoreBombCarrierReplacementEquipmentForPlayer(
+        playerId,
+        player,
+        replacedSlot,
+        previousEquipment,
+        restoreAmmoState,
+        reason,
+        token
+      );
+    });
     return true;
   }
 
@@ -5921,7 +5509,7 @@ function invalidateBombReturnToBaseTimer(): void {
 function invalidateDeferredBombSpawnTimer(): void {
   bombDeferredBaseSpawnToken += 1;
   cipherDeferredLiveStartKeyToken += 1;
-  Timers.clearTimeout(cipherDeferredLiveStartKeyTimerHandle);
+  cancelCipherGlobalTask(cipherDeferredLiveStartKeyTimerHandle);
   cipherDeferredLiveStartKeyTimerHandle = undefined;
   resetCipherLiveKeyWatchdog();
   clearNextKeyUnlockCountdown("invalidateDeferredBombSpawnTimer", true);
@@ -6020,22 +5608,22 @@ function scheduleDeferredBombRespawnAfterDelay(
   if (!showNextKeyUnlockCountdown) {
     clearNextKeyUnlockCountdown(context + "_no_countdown", true);
   }
-  void runDeferredBombRespawnAfterDelay(
-    myToken,
-    delaySeconds,
-    context,
-    announcementMode,
-    showHighlightMessage,
-    spawnStrategy,
-    reservedCandidate,
-    reservedCountdownToken,
-    labelMode
-  );
+  scheduleCipherGlobalTask(delaySeconds, "key_respawn/" + context, () => {
+    runDeferredBombRespawn(
+      myToken,
+      context,
+      announcementMode,
+      showHighlightMessage,
+      spawnStrategy,
+      reservedCandidate,
+      reservedCountdownToken,
+      labelMode
+    );
+  });
 }
 
-async function runDeferredBombRespawnAfterDelay(
+function runDeferredBombRespawn(
   token: number,
-  delaySeconds: number,
   context: string,
   announcementMode: BombSpawnAnnouncementMode,
   showHighlightMessage: boolean,
@@ -6043,11 +5631,7 @@ async function runDeferredBombRespawnAfterDelay(
   reservedCandidate?: BombBaseAnchorCandidate,
   reservedCountdownToken: number = 0,
   labelMode: NextKeyUnlockLabelMode = "next_key"
-): Promise<void> {
-  if (delaySeconds > 0) {
-    await mod.Wait(delaySeconds);
-  }
-
+): void {
   if (bombDeferredBaseSpawnToken !== token) {
     if (reservedCountdownToken > 0 && nextKeyUnlockCountdownToken === reservedCountdownToken) {
       clearNextKeyUnlockCountdown(context + "_stale_token", true);
@@ -6066,7 +5650,7 @@ async function runDeferredBombRespawnAfterDelay(
   }
 
   clearNextKeyUnlockCountdown(context + "_spawn_attempt", true);
-  const spawned = await respawnBombAtDynamicLocationNow(
+  const spawned = respawnBombAtDynamicLocationNow(
     context,
     announcementMode,
     showHighlightMessage,
@@ -6135,7 +5719,7 @@ function clearBombCarrierState(): void {
   clearBombBeepModeState();
   forceReleaseCipherNativeBombCarrier("clear_bomb_carrier_state");
   bombCarrierPlayerId = undefined;
-  if (!hasDroppedBombRuntimeObjects() && !bombPickupTriggerEnabled) {
+  if (!hasDroppedBombRuntimeObjects() && !bombBasePickupEnabled) {
     clearCipherNativeMinimapBomb("clear_carrier_state");
   }
   bombCarrierUiStateVersion++;
@@ -6206,8 +5790,8 @@ function tryResolveObjectiveDestroyExplosionPosition(cpId: number): mod.Vector |
   const storedPos = objectiveDestroyExplosionPositionByCpId[cpId];
   if (storedPos) return storedPos;
 
-  const mcomPos = tryGetObjectiveMcomPosition(cpId);
-  if (mcomPos) return mcomPos;
+  const objectivePos = getObjectiveAnchorPosition(cpId);
+  if (objectivePos) return objectivePos;
 
   const awardAnchorPos = tryGetObjectiveAwardAnchorPosition(cpId);
   if (awardAnchorPos) return awardAnchorPos;
@@ -6241,7 +5825,7 @@ function playDroppedBombReturnExplosionAtPosition(pos: mod.Vector): void {
         mod.EnableWorldIconText(icon, true);
       } catch (_errIcon) {}
     }
-    void cleanupRuntimeFxAfterDelay(iconSpawn.object as unknown as mod.VFX | mod.Object, 1.5);
+    scheduleRuntimeFxCleanup(iconSpawn.object as unknown as mod.VFX | mod.Object, 1.5);
   }
 
   playRuntimeOneShotSfxAtPosition(
@@ -6260,12 +5844,14 @@ function scheduleBombReturnToBaseAfterDelay(): void {
   bombDroppedReturnDeadlineAtSec = getCurrentSchedulerNowSeconds() + BOMB_PLAYER_DROPPED_RELOCATION_DELAY_SECONDS;
   bombDroppedWorldIconLastShownSeconds = -1;
   updateDroppedBombWorldIconCountdown();
-  void returnBombToBaseAfterDelay(myToken);
+  scheduleCipherGlobalTask(
+    BOMB_PLAYER_DROPPED_RELOCATION_DELAY_SECONDS,
+    "dropped_key_return",
+    () => returnBombToBase(myToken)
+  );
 }
 
-async function returnBombToBaseAfterDelay(token: number): Promise<void> {
-  await mod.Wait(BOMB_PLAYER_DROPPED_RELOCATION_DELAY_SECONDS);
-
+function returnBombToBase(token: number): void {
   if (bombReturnToBaseToken !== token) return;
   if (gameStatus !== 3) return;
   if (bombCarrierPlayerId !== undefined) return;
@@ -6399,7 +5985,7 @@ function transferBombToPlayerAsCarrier(
       clearBombBaseRuntimeLootSpawner();
       clearBombBaseRuntimeWorldIcon();
     }
-    setBombPickupTriggerEnabled(false);
+    setBombBasePickupEnabled(false);
     setBombBaseAvailabilityState(false);
 
     removeBombEquipmentSafe(sp.player);
@@ -6434,7 +6020,7 @@ function transferBombToPlayerAsCarrierAfterDisarm(playerId: number): boolean {
   clearDroppedBombRuntimeObjects();
   clearBombBaseRuntimeLootSpawner();
   clearBombCarrierState();
-  setBombPickupTriggerEnabled(false);
+  setBombBasePickupEnabled(false);
   setBombBaseAvailabilityState(false);
   invalidateBombReturnToBaseTimer();
   return transferBombToPlayerAsCarrier(sp, false, "objective_disarm");
@@ -6442,7 +6028,7 @@ function transferBombToPlayerAsCarrierAfterDisarm(playerId: number): boolean {
 
 function clearDeferredBombCarrierDropTimer(): void {
   if (deferredBombCarrierDropTimer !== undefined) {
-    Timers.clearTimeout(deferredBombCarrierDropTimer);
+    cancelCipherGlobalTask(deferredBombCarrierDropTimer);
   }
 
   deferredBombCarrierDropTimer = undefined;
@@ -6533,7 +6119,7 @@ function completeDisconnectedBombCarrierDrop(
     dropNowSec + BOMB_DROPPED_RECLAIM_PREVIOUS_CARRIER_COOLDOWN_SECONDS;
   bombDroppedReclaimBlockedUntilSec = dropNowSec + 1.25;
 
-  setBombPickupTriggerEnabled(false);
+  setBombBasePickupEnabled(false);
 
   const nativeDropPos = getCipherNativeMinimapBombPosition(dropPos);
   if (nativeDropPos) {
@@ -6567,7 +6153,7 @@ function scheduleBombCarrierDropAfterCombatEvent(
 
   // Do not drop the key directly inside OnMandown/OnPlayerDied/OnPlayerUndeploy.
   // Those event stacks are high-risk because they are already mutating soldier/combat state.
-  deferredBombCarrierDropTimer = Timers.setTimeout(() => {
+  deferredBombCarrierDropTimer = scheduleCipherGlobalTask(0.15, "carrier_drop/" + reason, () => {
     if (token !== deferredBombCarrierDropToken) return;
     deferredBombCarrierDropTimer = undefined;
 
@@ -6586,7 +6172,7 @@ function scheduleBombCarrierDropAfterCombatEvent(
       if (!finalDropPosition) {
         clearBombCarrierState();
         clearDroppedBombRuntimeObjects();
-        setBombPickupTriggerEnabled(false);
+        setBombBasePickupEnabled(false);
         setBombBaseAvailabilityState(false);
         scheduleDeferredBombRespawnAfterDelay(
           0,
@@ -6607,14 +6193,14 @@ function scheduleBombCarrierDropAfterCombatEvent(
       try {
         clearBombCarrierState();
         clearDroppedBombRuntimeObjects();
-        setBombPickupTriggerEnabled(false);
+        setBombBasePickupEnabled(false);
         setBombBaseAvailabilityState(false);
         scheduleDeferredBombRespawnAfterDelay(0, "deferred_carrier_drop_failed", "new_location_found", true);
       } catch (fallbackErr) {
         LogRuntimeError("DeferredBombCarrierDropFallback/" + reason, fallbackErr);
       }
     }
-  }, 150);
+  });
 }
 
 function forceBombDropFromCarrier(playerId: number, reason: string, dropPositionOverride?: mod.Vector): void {
@@ -6721,7 +6307,7 @@ function forceBombDropFromCarrier(playerId: number, reason: string, dropPosition
   // This gives the native Bomb marker time to visibly drop before radius pickup resumes.
   bombDroppedReclaimBlockedUntilSec = dropNowSec + 1.25;
 
-  setBombPickupTriggerEnabled(false);
+  setBombBasePickupEnabled(false);
 
   const nativeDropPos = getCipherNativeMinimapBombPosition(dropPos);
   if (nativeDropPos) {
@@ -6776,9 +6362,6 @@ function resetBombCarrierRuntimeState(hideBaseIcon: boolean, preserveDeployResto
   bombCarrierRestoreInsertTokenByPlayerId = {};
   bombCarrierRestoreInsertTokenCounter += 1;
   bombActiveBaseSlotIndex = BOMB_DEFAULT_BASE_SLOT_INDEX;
-  clearBombQuadBikeRuntimeSpawner();
-  bombQuadBikeLiveSpawnAttempted = false;
-  bombQuadBikeAnchorMissingWarned = false;
   clearBombBaseRuntimeLootSpawner();
   clearBombBaseRuntimeWorldIcon();
   clearBombBaseBeepLoop();
@@ -6798,48 +6381,12 @@ function resetBombCarrierRuntimeState(hideBaseIcon: boolean, preserveDeployResto
   bombDroppedSourceKind = "none";
   clearDroppedBombRuntimeObjects();
   lastKnownLivePositionByPlayerId = {};
-  setBombPickupTriggerEnabled(false);
+  setBombBasePickupEnabled(false);
   cacheBombPickupWorldAnchorPositions();
   setAllBaseWorldIconsEnabled(false);
 
   if (hideBaseIcon) {
     setBombBaseAvailabilityState(false);
-  }
-}
-
-function trySpawnLiveQuadBikeFromConfiguredCapturePoint(): void {
-  if (bombQuadBikeLiveSpawnAttempted) return;
-  if (BOMB_QUAD_BIKE_SPAWN_OBJECT_ID <= 0) return;
-
-  const spawnTransform = tryResolveQuadBikeSpawnObjectTransform();
-  if (!spawnTransform || !spawnTransform.position) return;
-
-  bombQuadBikeLiveSpawnAttempted = true;
-
-  const spawnResult = spawnRuntimeCommonObjectSafe(
-    BOMB_QUAD_BIKE_RUNTIME_SPAWNER_ASSET,
-    spawnTransform.position,
-    spawnTransform.rotation ?? BOMB_QUAD_BIKE_ROTATION_FALLBACK,
-    "quad_bike_vehicle_spawner"
-  );
-  if (!spawnResult.object) return;
-
-  bombQuadBikeRuntimeSpawnerObject = spawnResult.object;
-
-  const vehicleSpawner = resolveRuntimeVehicleSpawnerHandle(spawnResult.object);
-  if (!vehicleSpawner) {
-    clearBombQuadBikeRuntimeSpawner();
-    return;
-  }
-
-  bombQuadBikeRuntimeSpawnerHandle = vehicleSpawner;
-
-  try {
-    mod.SetVehicleSpawnerVehicleType(vehicleSpawner, BOMB_QUAD_BIKE_VEHICLE_TYPE);
-    mod.SetVehicleSpawnerAutoSpawn(vehicleSpawner, false);
-    mod.ForceVehicleSpawnerSpawn(vehicleSpawner);
-  } catch (_err) {
-    clearBombQuadBikeRuntimeSpawner();
   }
 }
 
@@ -6889,11 +6436,11 @@ function EvaluateBaseBombPickupFromActiveBaseSlotRadius(): void {
   if (gameStatus !== 3) return;
   if (bombCarrierPlayerId !== undefined) return;
   if (hasDroppedBombRuntimeObjects()) return;
-  if (!bombPickupTriggerEnabled) return;
+  if (!bombBasePickupEnabled) return;
 
   const baseAnchor = tryGetActiveBasePickupAnchor();
   if (!baseAnchor) {
-    setBombPickupTriggerEnabled(false);
+    setBombBasePickupEnabled(false);
     setBombBaseAvailabilityState(false);
     return;
   }
@@ -6909,7 +6456,7 @@ function EvaluateBaseBombPickupFromActiveBaseSlotRadius(): void {
   invalidateBombReturnToBaseTimer();
   transferBombToPlayerAsCarrier(winner, false, "base_radius_active_slot");
 
-  setBombPickupTriggerEnabled(false);
+  setBombBasePickupEnabled(false);
   setBombBaseAvailabilityState(false);
 }
 
@@ -6928,7 +6475,7 @@ function EvaluateDroppedBombReclaimFromAnchor(): void {
   invalidateBombReturnToBaseTimer();
   transferBombToPlayerAsCarrier(winner, true, "dropped_radius");
 
-  setBombPickupTriggerEnabled(false);
+  setBombBasePickupEnabled(false);
   setBombBaseAvailabilityState(false);
 }
 
@@ -6941,7 +6488,7 @@ function EvaluateResponsiveBombPickupRadiusScans(): void {
     return;
   }
 
-  if (bombPickupTriggerEnabled) {
+  if (bombBasePickupEnabled) {
     EvaluateBaseBombPickupFromActiveBaseSlotRadius();
   }
 }
@@ -6960,351 +6507,6 @@ function spawnBombPickupObjectAtLiveStart(): boolean {
   );
   emitLiveTransitionCheckpoint("bomb_live_start_schedule_exit");
   return true;
-}
-
-function getObjectiveMcomSfxConfig(cpId: number): ObjectiveMcomSfxConfig | undefined {
-  return OBJECTIVE_MCOM_SFX_BY_CP_ID[cpId];
-}
-
-function getObjectiveMcomSfxKey(cpId: number, role: ObjectiveMcomSfxRole): string {
-  return String(cpId) + ":" + role;
-}
-
-function getObjectiveMcomSfxAsset(cpId: number, role: ObjectiveMcomSfxRole): mod.RuntimeSpawn_Common | undefined {
-  const cfg = getObjectiveMcomSfxConfig(cpId);
-  if (!cfg) return undefined;
-  return cfg[role];
-}
-
-function tryGetObjectiveMcomPosition(cpId: number): mod.Vector | undefined {
-  const mcomId = OBJECTIVE_MCOM_ID_BY_CP_ID[cpId];
-  if (!mcomId) return undefined;
-  try {
-    const objectiveMcom = mod.GetMCOM(mcomId) as unknown as mod.Object;
-    return mod.GetObjectPosition(objectiveMcom);
-  } catch (_err) {
-    return undefined;
-  }
-}
-
-function tryGetObjectiveMcomSfxAnchorPosition(cpId: number): mod.Vector | undefined {
-  const cfg = getObjectiveMcomSfxConfig(cpId);
-  const anchorId = cfg?.anchorObjectId;
-  if (!anchorId) return undefined;
-
-  try {
-    const spatialAnchor = mod.GetSpatialObject(anchorId) as unknown as mod.Object;
-    return mod.GetObjectPosition(spatialAnchor);
-  } catch (_err) {}
-
-  try {
-    const vfxAnchor = mod.GetVFX(anchorId) as unknown as mod.Object;
-    return mod.GetObjectPosition(vfxAnchor);
-  } catch (_err) {}
-
-  return undefined;
-}
-
-function tryGetObjectiveMcomSfxPositionForCp(cpId: number): mod.Vector | undefined {
-  // Primary: explicit CP -> MCOM mapping (most reliable for this objective flow).
-  const mcomPos = tryGetObjectiveMcomPosition(cpId);
-  if (mcomPos) return mcomPos;
-
-  // Fallback: configured CP anchor object.
-  const anchorPos = tryGetObjectiveMcomSfxAnchorPosition(cpId);
-  if (anchorPos) return anchorPos;
-
-  // Final fallback: configured objective world-position anchor.
-  return getObjectiveAnchorPosition(cpId);
-}
-
-function warnObjectiveMcomSfxMissingOnce(cpId: number, role: ObjectiveMcomSfxRole, reason: string): void {
-  if (!shouldEmitStringKeyDebugWorldLogs()) return;
-  const key = getObjectiveMcomSfxKey(cpId, role);
-  if (objectiveMcomSfxMissingWarnedByKey[key] === true) return;
-  objectiveMcomSfxMissingWarnedByKey[key] = true;
-  emitStringKeyDebugWorldLog(
-    mod.Message("[OBJECTIVE MCOM SFX] cp {} role {} unavailable ({})", cpId, role, reason)
-  );
-}
-
-function ensureObjectiveMcomSfxHandleForCpRole(cpId: number, role: ObjectiveMcomSfxRole, spawnPos: mod.Vector): any | undefined {
-  const key = getObjectiveMcomSfxKey(cpId, role);
-  if (objectiveMcomSfxUnavailableByKey[key] === true) return undefined;
-
-  const existing = objectiveMcomSfxHandleByKey[key];
-  if (existing) return existing;
-
-  const asset = getObjectiveMcomSfxAsset(cpId, role);
-  if (!asset) {
-    objectiveMcomSfxUnavailableByKey[key] = true;
-    warnObjectiveMcomSfxMissingOnce(cpId, role, "missing asset config");
-    return undefined;
-  }
-
-  try {
-    const spawned = mod.SpawnObject(
-      asset,
-      spawnPos,
-      OBJECTIVE_MCOM_SFX_SPAWN_ROTATION
-    );
-
-    if (mod.IsType(spawned, mod.Types.SFX) || mod.IsType(spawned, mod.Types.Object)) {
-      objectiveMcomSfxHandleByKey[key] = spawned;
-      return spawned;
-    }
-
-    objectiveMcomSfxUnavailableByKey[key] = true;
-    warnObjectiveMcomSfxMissingOnce(cpId, role, "spawn returned unsupported type");
-    return undefined;
-  } catch (_err) {
-    objectiveMcomSfxUnavailableByKey[key] = true;
-    warnObjectiveMcomSfxMissingOnce(cpId, role, "SpawnObject failed");
-    return undefined;
-  }
-}
-
-function ensureObjectiveMcomSfxSpawned(): void {
-  for (let i = 0; i < OBJECTIVE_DEFINITIONS.length; i++) {
-    const cpId = OBJECTIVE_DEFINITIONS[i].cpId;
-    const spawnPos = tryGetObjectiveMcomSfxPositionForCp(cpId);
-    if (!spawnPos) {
-      for (let j = 0; j < OBJECTIVE_MCOM_SFX_ROLES.length; j++) {
-        const role = OBJECTIVE_MCOM_SFX_ROLES[j];
-        warnObjectiveMcomSfxMissingOnce(cpId, role, "missing MCOM/anchor/capturepoint position");
-      }
-      continue;
-    }
-
-    for (let j = 0; j < OBJECTIVE_MCOM_SFX_ROLES.length; j++) {
-      const role = OBJECTIVE_MCOM_SFX_ROLES[j];
-      ensureObjectiveMcomSfxHandleForCpRole(cpId, role, spawnPos);
-    }
-  }
-}
-
-function playObjectiveMcomSfxForCpRole(
-  cpId: number,
-  role: ObjectiveMcomSfxRole,
-  receiver?: mod.Player
-): boolean {
-  const key = getObjectiveMcomSfxKey(cpId, role);
-  if (objectiveMcomSfxUnavailableByKey[key] === true) return false;
-
-  const pos = tryGetObjectiveMcomSfxPositionForCp(cpId);
-  if (!pos) {
-    warnObjectiveMcomSfxMissingOnce(cpId, role, "missing MCOM/anchor/capturepoint position");
-    objectiveMcomSfxEnabledByKey[key] = false;
-    return false;
-  }
-
-  const handle = ensureObjectiveMcomSfxHandleForCpRole(cpId, role, pos);
-  if (!handle) return false;
-
-  let played = false;
-  const attenuationRange =
-    role === "alarmSimple" || role === "alarmLeadout"
-      ? OBJECTIVE_MCOM_SFX_ATTENUATION_RANGE
-      : OBJECTIVE_ATTEMPT_PLAYER_SFX_ATTENUATION_RANGE;
-
-  try {
-    mod.PlaySound(handle, OBJECTIVE_MCOM_SFX_VOLUME, pos, attenuationRange);
-    played = true;
-  } catch (_err3dWorld) {
-    try {
-      mod.PlaySound(handle, OBJECTIVE_MCOM_SFX_VOLUME);
-      played = true;
-    } catch (_errFallbackWorld) {}
-  }
-
-  if (receiver && mod.IsPlayerValid(receiver)) {
-    try {
-      mod.PlaySound(
-        handle,
-        OBJECTIVE_MCOM_SFX_VOLUME,
-        pos,
-        attenuationRange,
-        receiver
-      );
-      played = true;
-    } catch (_err3dReceiver) {
-      try {
-        mod.PlaySound(handle, OBJECTIVE_MCOM_SFX_VOLUME, receiver);
-        played = true;
-      } catch (_errFallbackReceiver) {}
-    }
-  }
-
-  if (played) return true;
-
-  try {
-    mod.PlaySound(handle, OBJECTIVE_MCOM_SFX_VOLUME);
-    return true;
-  } catch (_errFallback) {
-    objectiveMcomSfxEnabledByKey[key] = false;
-    warnObjectiveMcomSfxMissingOnce(cpId, role, "PlaySound failed (3D + fallback)");
-    return false;
-  }
-}
-
-function stopObjectiveMcomSfxForCpRole(cpId: number, role: ObjectiveMcomSfxRole): void {
-  const key = getObjectiveMcomSfxKey(cpId, role);
-  if (objectiveMcomSfxUnavailableByKey[key] === true) return;
-
-  const handle = objectiveMcomSfxHandleByKey[key];
-  if (!handle) {
-    objectiveMcomSfxEnabledByKey[key] = false;
-    return;
-  }
-
-  try {
-    mod.StopSound(handle);
-  } catch (_err) {
-    objectiveMcomSfxUnavailableByKey[key] = true;
-    warnObjectiveMcomSfxMissingOnce(cpId, role, "StopSound failed");
-  }
-
-  objectiveMcomSfxEnabledByKey[key] = false;
-}
-
-function setObjectiveMcomSfxEnabledForCp(
-  cpId: number,
-  role: ObjectiveMcomSfxRole,
-  enabled: boolean,
-  receiver?: mod.Player
-): void {
-  const key = getObjectiveMcomSfxKey(cpId, role);
-  const current = objectiveMcomSfxEnabledByKey[key] === true;
-  if (current === enabled) return;
-
-  if (enabled) {
-    if (playObjectiveMcomSfxForCpRole(cpId, role, receiver)) {
-      objectiveMcomSfxEnabledByKey[key] = true;
-    }
-    return;
-  }
-
-  stopObjectiveMcomSfxForCpRole(cpId, role);
-}
-
-
-function stopObjectiveMcomAttemptLoopSfxForCp(cpId: number): void {
-  setObjectiveMcomSfxEnabledForCp(cpId, "arming", false);
-  setObjectiveMcomSfxEnabledForCp(cpId, "defusing", false);
-}
-
-function stopAllObjectiveMcomSfxForCp(cpId: number): void {
-  for (let i = 0; i < OBJECTIVE_MCOM_SFX_ROLES.length; i++) {
-    stopObjectiveMcomSfxForCpRole(cpId, OBJECTIVE_MCOM_SFX_ROLES[i]);
-  }
-}
-
-function StopAllObjectiveMcomSfx(): void {
-  for (let i = 0; i < OBJECTIVE_DEFINITIONS.length; i++) {
-    stopAllObjectiveMcomSfxForCp(OBJECTIVE_DEFINITIONS[i].cpId);
-  }
-  stopObjectiveAttemptLocalArmingSfxForAllPlayers();
-  stopObjectiveAttemptLocalDefusingSfxForAllPlayers();
-}
-
-function resetObjectiveMcomSfxRuntimeState(): void {
-  for (const key in objectiveMcomSfxHandleByKey) {
-    const handle = objectiveMcomSfxHandleByKey[key];
-    if (!handle) continue;
-    try {
-      mod.StopSound(handle);
-    } catch (_err) {}
-  }
-
-  objectiveMcomSfxHandleByKey = {};
-  objectiveMcomSfxUnavailableByKey = {};
-  objectiveMcomSfxMissingWarnedByKey = {};
-  objectiveMcomSfxEnabledByKey = {};
-}
-
-function getObjectiveAttemptCompleteAsset(kind: "arm" | "defused"): mod.RuntimeSpawn_Common {
-  return kind === "defused" ? OBJECTIVE_ATTEMPT_DEFUSE_COMPLETE_ASSET : OBJECTIVE_ATTEMPT_ARM_COMPLETE_ASSET;
-}
-
-function playObjectiveAttemptCompletionSfxForPlayer(
-  playerId: number | undefined,
-  kind: "arm" | "defused",
-  fallbackPos?: mod.Vector
-): void {
-  let pos = fallbackPos;
-  if (playerId !== undefined) {
-    const sp = serverPlayers.get(playerId);
-    if (sp && mod.IsPlayerValid(sp.player)) {
-      pos = tryGetPlayerPositionSafe(sp.player) ?? pos;
-    }
-  }
-
-  if (!pos) return;
-
-  playRuntimeOneShotSfxAtPosition(
-    getObjectiveAttemptCompleteAsset(kind),
-    pos,
-    OBJECTIVE_ATTEMPT_PLAYER_SFX_VOLUME,
-    OBJECTIVE_ATTEMPT_PLAYER_SFX_ATTENUATION_RANGE,
-    OBJECTIVE_ATTEMPT_PLAYER_SFX_CLEANUP_SECONDS,
-    "objective_attempt_complete_" + kind + "_" + String(playerId ?? -1)
-  );
-}
-
-function playObjectiveAttemptLocalSfx(receiver: mod.Player, kind: "arming" | "arm" | "defused" | "defusing"): void {
-  if (!mod.IsPlayerValid(receiver)) return;
-
-  let handle: any = null;
-  if (kind === "arming") handle = SFX_ObjectiveArmingLocal;
-  else if (kind === "arm") handle = SFX_ObjectiveArmLocal;
-  else if (kind === "defused") handle = SFX_ObjectiveDefusedLocal;
-  else handle = SFX_ObjectiveDefusingLocal;
-
-  if (!handle) return;
-
-  try {
-    mod.PlaySound(handle, OBJECTIVE_MCOM_SFX_VOLUME, receiver);
-  } catch (_errLocalTargeted) {
-    try {
-      mod.PlaySound(handle, OBJECTIVE_MCOM_SFX_VOLUME);
-    } catch (_errLocalFallback) {}
-  }
-}
-
-function stopObjectiveAttemptLocalArmingSfxForPlayer(receiver: mod.Player): void {
-  if (!SFX_ObjectiveArmingLocal) return;
-  if (!mod.IsPlayerValid(receiver)) return;
-  try {
-    mod.StopSound(SFX_ObjectiveArmingLocal, receiver);
-  } catch (_errStop) {}
-}
-
-function stopObjectiveAttemptLocalDefusingSfxForPlayer(receiver: mod.Player): void {
-  if (!SFX_ObjectiveDefusingLocal) return;
-  if (!mod.IsPlayerValid(receiver)) return;
-  try {
-    mod.StopSound(SFX_ObjectiveDefusingLocal, receiver);
-  } catch (_errStop) {}
-}
-
-function stopObjectiveAttemptLocalArmingSfxForAllPlayers(): void {
-  if (!SFX_ObjectiveArmingLocal) return;
-  serverPlayers.forEach((sp) => {
-    if (!sp || !mod.IsPlayerValid(sp.player)) return;
-    try {
-      mod.StopSound(SFX_ObjectiveArmingLocal, sp.player);
-    } catch (_errStopAll) {}
-  });
-}
-
-function stopObjectiveAttemptLocalDefusingSfxForAllPlayers(): void {
-  if (!SFX_ObjectiveDefusingLocal) return;
-  serverPlayers.forEach((sp) => {
-    if (!sp || !mod.IsPlayerValid(sp.player)) return;
-    try {
-      mod.StopSound(SFX_ObjectiveDefusingLocal, sp.player);
-    } catch (_errStopAll) {}
-  });
 }
 
 function disableObjectiveSafely(objective: any): void {
@@ -7440,7 +6642,6 @@ function disableAllScriptedObjectiveCapturePointSurfaces(context: string, force:
   for (let i = 0; i < ALL_SCRIPTED_OBJECTIVE_CP_IDS.length; i++) {
     const cpId = ALL_SCRIPTED_OBJECTIVE_CP_IDS[i];
     const owner = getExpectedScriptObjectiveCapturePointOwner(cpId);
-    applyObjectiveLockedCaptureTiming(cpId);
     setObjectiveAuthoritativeOwner(cpId, owner, context + "_owner");
     safeEnableCapturePointObjectiveByCpId(cpId, false, context + "_cp", force);
     ensureObjectiveEngineOwnerMatchesScript(cpId, context + "_cp");
@@ -7454,9 +6655,9 @@ function applyScriptedObjectiveCapturePointSurface(
   context: string,
   force: boolean = false
 ): void {
-  applyObjectiveLockedCaptureTiming(cpId);
+  void enabled;
   setObjectiveAuthoritativeOwner(cpId, owner, context + "_owner");
-  safeEnableCapturePointObjectiveByCpId(cpId, enabled, context + "_cp", force);
+  safeEnableCapturePointObjectiveByCpId(cpId, false, context + "_display_only_cp", force);
   ensureObjectiveEngineOwnerMatchesScript(cpId, context + "_cp");
 }
 
@@ -7515,163 +6716,8 @@ function disableAllObjectiveInteractPoints(_context: string): void {
   }
 }
 
-function safeSetCapturePointTimingByCpId(
-  cpId: number,
-  captureTime: number,
-  neutralizeTime: number,
-  context: string
-): void {
-  const capturePoint = resolveObjectiveCapturePointHandleByCpId(cpId, "SetCapturePointTiming/" + context);
-  if (!capturePoint) return;
-  try {
-    mod.SetCapturePointCapturingTime(capturePoint, captureTime);
-    mod.SetCapturePointNeutralizationTime(capturePoint, neutralizeTime);
-    mod.SetMaxCaptureMultiplier(capturePoint, 1);
-  } catch (err) {
-    warnObjectiveEngineCallOnce(
-      "set_timing/" + context + "/" + String(cpId),
-      mod.Message("[OBJECTIVE ENGINE] SetCapturePointTiming failed cp/context {}", String(cpId) + "/" + context)
-    );
-    LogRuntimeError("SetCapturePointTiming/" + context + "/" + String(cpId), err);
-  }
-}
-
-function safeEnableObjectiveMcomByCpId(
-  cpId: number,
-  enabled: boolean,
-  context: string,
-  force: boolean = false
-): void {
-  const mcomId = OBJECTIVE_MCOM_ID_BY_CP_ID[cpId];
-  if (!mcomId) return;
-  if (enabled && isHardDisabledObjectiveMcomId(mcomId)) enabled = false;
-  if (!force && objectiveMcomObjectiveEnabledByCpId[cpId] === enabled) return;
-  try {
-    mod.EnableGameModeObjective(mod.GetMCOM(mcomId), enabled);
-    objectiveMcomObjectiveEnabledByCpId[cpId] = enabled;
-  } catch (err) {
-    warnObjectiveEngineCallOnce(
-      "enable_mcom/" + context + "/" + String(cpId),
-      mod.Message(
-        "[OBJECTIVE ENGINE] EnableGameModeObjective failed cp/context/enabled {}",
-        String(cpId) + "/" + context + "/" + (enabled ? "1" : "0")
-      )
-    );
-    LogRuntimeError("EnableGameModeObjectiveMCOM/" + context + "/" + String(cpId), err);
-  }
-}
-
-function isHardDisabledObjectiveMcomId(mcomId: number): boolean {
-  return HARD_DISABLED_OBJECTIVE_MCOM_IDS.indexOf(mcomId) >= 0;
-}
-
-function disableHardObjectiveMcoms(context: string): void {
-  for (let i = 0; i < HARD_DISABLED_OBJECTIVE_MCOM_IDS.length; i++) {
-    const mcomId = HARD_DISABLED_OBJECTIVE_MCOM_IDS[i];
-    try {
-      mod.EnableGameModeObjective(mod.GetMCOM(mcomId), false);
-    } catch (err) {
-      warnObjectiveEngineCallOnce(
-        "hard_disable_mcom/" + context + "/" + String(mcomId),
-        mod.Message("[OBJECTIVE ENGINE] hard-disable MCOM failed id/context {}", String(mcomId) + "/" + context)
-      );
-      LogRuntimeError("HardDisableObjectiveMCOM/" + context + "/" + String(mcomId), err);
-    }
-  }
-
-  for (let i = 0; i < OBJECTIVE_DEFINITIONS.length; i++) {
-    const def = OBJECTIVE_DEFINITIONS[i];
-    if (def.mcomId !== undefined && isHardDisabledObjectiveMcomId(def.mcomId)) {
-      objectiveMcomObjectiveEnabledByCpId[def.cpId] = false;
-    }
-  }
-}
-
-function warnHardObjectiveMcomMoveOnce(mcomId: number, context: string, reason: string, err?: unknown): void {
-  const key = String(mcomId) + "/" + reason;
-  if (hardObjectiveMcomMoveWarnedByKey[key] === true) return;
-  hardObjectiveMcomMoveWarnedByKey[key] = true;
-  if (err !== undefined) {
-    LogRuntimeError("MoveHardObjectiveMCOM/" + context + "/" + String(mcomId) + "/" + reason, err);
-    return;
-  }
-  warnObjectiveEngineCallOnce(
-    "move_hard_mcom/" + context + "/" + String(mcomId) + "/" + reason,
-    mod.Message("[OBJECTIVE ENGINE] move-down MCOM skipped id/context/reason {}", String(mcomId) + "/" + context + "/" + reason)
-  );
-}
-
-function moveHardObjectiveMcomsBelowMapOnce(context: string): void {
-  const delta = mod.CreateVector(0, HARD_DISABLED_OBJECTIVE_MCOM_DROP_Y, 0);
-
-  for (let i = 0; i < HARD_DISABLED_OBJECTIVE_MCOM_IDS.length; i++) {
-    const mcomId = HARD_DISABLED_OBJECTIVE_MCOM_IDS[i];
-    if (hardObjectiveMcomMovedBelowMapById[mcomId] === true) continue;
-
-    let mcomObject: mod.Object | undefined = undefined;
-    try {
-      mcomObject = mod.GetMCOM(mcomId) as unknown as mod.Object;
-    } catch (err) {
-      warnHardObjectiveMcomMoveOnce(mcomId, context, "missing", err);
-      continue;
-    }
-
-    try {
-      hardObjectiveMcomInitialPositionById[mcomId] = mod.GetObjectPosition(mcomObject);
-      mod.MoveObject(mcomObject, delta);
-      hardObjectiveMcomMovedBelowMapById[mcomId] = true;
-    } catch (err) {
-      warnHardObjectiveMcomMoveOnce(mcomId, context, "move_failed", err);
-    }
-  }
-}
-
-function safeSetObjectiveMcomOwnerByCpId(cpId: number, owner: mod.Team, context: string): void {
-  const mcomId = OBJECTIVE_MCOM_ID_BY_CP_ID[cpId];
-  if (!mcomId) return;
-  try {
-    mod.SetMCOMOwner(mod.GetMCOM(mcomId), owner);
-  } catch (err) {
-    warnObjectiveEngineCallOnce(
-      "set_mcom_owner/" + context + "/" + String(cpId),
-      mod.Message("[OBJECTIVE ENGINE] SetMCOMOwner failed cp/context {}", String(cpId) + "/" + context)
-    );
-    LogRuntimeError("SetMCOMOwner/" + context + "/" + String(cpId), err);
-  }
-}
-
-function safeSetObjectiveMcomFuseTimeByCpId(cpId: number, seconds: number, context: string): void {
-  const mcomId = OBJECTIVE_MCOM_ID_BY_CP_ID[cpId];
-  if (!mcomId) return;
-  try {
-    mod.SetMCOMFuseTime(mod.GetMCOM(mcomId), seconds);
-  } catch (err) {
-    warnObjectiveEngineCallOnce(
-      "set_mcom_fuse/" + context + "/" + String(cpId),
-      mod.Message("[OBJECTIVE ENGINE] SetMCOMFuseTime failed cp/context {}", String(cpId) + "/" + context)
-    );
-    LogRuntimeError("SetMCOMFuseTime/" + context + "/" + String(cpId), err);
-  }
-}
-
-function setObjectiveNativeMcomObjectivesEnabled(enabled: boolean, context: string): void {
-  for (let i = 0; i < OBJECTIVE_DEFINITIONS.length; i++) {
-    safeEnableObjectiveMcomByCpId(OBJECTIVE_DEFINITIONS[i].cpId, enabled, context);
-  }
-  disableHardObjectiveMcoms(context + "_hard_disable");
-}
-
 function syncDisabledBombAnchorObjectives(): void {
   disableSectorObjectiveByIdSafe(BOMB_ANCHOR_SECTOR_ID);
-}
-
-function seedObjectiveNativeMcomState(context: string): void {
-  for (let i = 0; i < OBJECTIVE_DEFINITIONS.length; i++) {
-    const def = OBJECTIVE_DEFINITIONS[i];
-    safeSetObjectiveMcomFuseTimeByCpId(def.cpId, OBJECTIVE_SCORE_HOLD_SECONDS, context);
-    safeSetObjectiveMcomOwnerByCpId(def.cpId, getObjectiveDefendingTeamForCurrentHalf(def.cpId), context);
-  }
-  disableHardObjectiveMcoms(context + "_hard_disable");
 }
 
 function safeSetObjectiveCapturePointOwnerByCpId(cpId: number, owner: mod.Team, context: string): void {
@@ -7760,15 +6806,6 @@ function ensureObjectiveEngineOwnerMatchesScript(
   return true;
 }
 
-function applyObjectiveLockedCaptureTiming(cpId: number): void {
-  safeSetCapturePointTimingByCpId(
-    cpId,
-    OBJECTIVE_CAPTURE_LOCKED_CAPTURE_TIME,
-    OBJECTIVE_CAPTURE_LOCKED_NEUTRALIZE_TIME,
-    "applyObjectiveLockedCaptureTiming"
-  );
-}
-
 function clearObjectivePendingAward(cpId: number): void {
   objectivePendingAwardStartTickByCpId[cpId] = undefined;
   objectivePendingAwardStartAtSecByCpId[cpId] = undefined;
@@ -7776,8 +6813,6 @@ function clearObjectivePendingAward(cpId: number): void {
   objectivePendingAwardTeamByCpId[cpId] = teamNeutral;
   objectivePendingAwardTokenByCpId[cpId] = undefined;
   clearObjectiveDestroyExplosionPosition(cpId);
-  setObjectiveMcomSfxEnabledForCp(cpId, "alarmSimple", false);
-  setObjectiveMcomSfxEnabledForCp(cpId, "alarmLeadout", false);
   syncObjectiveArmedPendingVisualStateForCp(cpId);
 }
 
@@ -7806,7 +6841,6 @@ function resetCipherNodeStates(context: string): void {
 
   if (gameStatus === 3) {
     updateCipherCounterWorldIcons(true);
-    UpdateTopFlagColorsForAllPlayers();
   }
 }
 
@@ -7830,9 +6864,6 @@ function clearAllCipherNodeRebootState(
     clearObjectiveSuccessfulArmContext(cpId);
     setObjectiveAwardVfxEnabled(cpId, false);
     clearCipherNodeVisualsForCp(cpId);
-    stopObjectiveMcomAttemptLoopSfxForCp(cpId);
-    setObjectiveMcomSfxEnabledForCp(cpId, "alarmSimple", false);
-    setObjectiveMcomSfxEnabledForCp(cpId, "alarmLeadout", false);
   }
 
   cipherCounterWorldIconLastShownByCpId = {};
@@ -7845,7 +6876,6 @@ function clearAllCipherNodeRebootState(
 
   if (refreshLiveIcons && gameStatus === 3 && !isCipherLiveTransitionActive()) {
     updateCipherCounterWorldIcons(true);
-    UpdateTopFlagColorsForAllPlayers();
   }
 
   cipherTransitionLastCheckpoint = "node_cleanup/" + reason;
@@ -7891,21 +6921,11 @@ function startCipherNodeReboot(cpId: number, attackingTeam: mod.Team, context: s
   cipherNodeRebootTokenByCpId[cpId] = token;
 
   const cp = serverCapturePoints[cpId];
-  if (cp) {
-    (cp as any)._capturingTeam = teamNeutral;
-    (cp as any)._captureProgress = 0;
-    (cp as any)._previousCaptureProgress = 0;
-    cp.clearOnPoint();
-  }
 
   if (isObjectiveCaptureAttemptActive(cpId)) endObjectiveCaptureAttempt(cpId);
   safeEnableCapturePointObjectiveByCpId(cpId, false, "startCipherNodeReboot/" + context, true);
-  safeEnableObjectiveMcomByCpId(cpId, false, "startCipherNodeReboot/" + context, true);
   setObjectiveCaptureInteractEnabled(cpId, false);
   setObjectiveAwardVfxEnabled(cpId, false);
-  stopObjectiveMcomAttemptLoopSfxForCp(cpId);
-  setObjectiveMcomSfxEnabledForCp(cpId, "alarmSimple", false);
-  setObjectiveMcomSfxEnabledForCp(cpId, "alarmLeadout", false);
   setObjectiveAuthoritativeOwner(
     cpId,
     getObjectiveDefendingTeamForCurrentHalf(cpId),
@@ -7940,14 +6960,9 @@ function startCipherNodeReboot(cpId: number, attackingTeam: mod.Team, context: s
   clearBotObjectiveAssignments();
   updateCipherCounterWorldIconForCp(cpId, true);
   syncLiveHybridObjectiveSurfaceState("startCipherNodeReboot/" + context, true);
-  scheduleDelayedObjectiveSurfaceReassert("startCipherNodeReboot/" + context);
-  UpdateTopFlagColorsForAllPlayers();
-
-  void reactivateCipherNode(cpId, token, context);
 }
 
-async function reactivateCipherNode(cpId: number, token: number, context: string): Promise<void> {
-  await mod.Wait(NODE_OVERLOAD_COOLDOWN_SECONDS);
+function reactivateCipherNode(cpId: number, token: number, context: string): void {
   if (gameStatus !== 3) return;
   if (cipherNodeRebootTokenByCpId[cpId] !== token) return;
   if (!isCipherNodeRebooting(cpId)) return;
@@ -7972,7 +6987,6 @@ async function reactivateCipherNode(cpId: number, token: number, context: string
   setObjectiveAwardVfxEnabled(cpId, false);
   syncObjectiveArmedPendingVisualStateForCp(cpId);
   syncLiveHybridObjectiveSurfaceState("reactivateCipherNode/" + context, true);
-  scheduleDelayedObjectiveSurfaceReassert("reactivateCipherNode/" + context);
   updateCipherCounterWorldIconForCp(cpId, true);
 
   const cp = serverCapturePoints[cpId];
@@ -7980,7 +6994,15 @@ async function reactivateCipherNode(cpId: number, token: number, context: string
   modlib.ShowHighlightedGameModeMessage(mod.Message((mod.stringkeys as any).CipherNodeRebooted, symbol), team1);
   modlib.ShowHighlightedGameModeMessage(mod.Message((mod.stringkeys as any).CipherNodeRebooted, symbol), team2);
 
-  UpdateTopFlagColorsForAllPlayers();
+}
+
+function evaluateCipherNodeRebootDeadlines(nowSec: number): void {
+  for (let i = 0; i < OBJECTIVE_DEFINITIONS.length; i++) {
+    const cpId = OBJECTIVE_DEFINITIONS[i].cpId;
+    const deadline = cipherNodeRebootUntilSecByCpId[cpId];
+    if (deadline === undefined || !Number.isFinite(deadline) || nowSec < deadline) continue;
+    reactivateCipherNode(cpId, cipherNodeRebootTokenByCpId[cpId] ?? 0, "scheduler_deadline");
+  }
 }
 
 function isObjectiveCaptureAttemptActive(cpId: number): boolean {
@@ -8000,19 +7022,6 @@ function setObjectiveCaptureInteractEnabled(cpId: number, enabled: boolean): voi
 
 function isPlayerInsideObjectiveAreaForCp(playerId: number, cpId: number): boolean {
   if (!isObjectiveActiveForCurrentHalf(cpId)) return false;
-
-  const sp = serverPlayers.get(playerId);
-  if (sp) {
-    const activeCapturePoint = sp.getCapturePoint();
-    if (activeCapturePoint) {
-      try {
-        if (mod.GetObjId(activeCapturePoint) === cpId) return true;
-      } catch (_err) {}
-    }
-  }
-
-  const cp = serverCapturePoints[cpId];
-  if (cp && cp.getPlayerIdsOnPoint().indexOf(playerId) >= 0) return true;
 
   const triggerId = OBJECTIVE_AREA_TRIGGER_ID_BY_CP_ID[cpId];
   if (!(triggerId > 0)) return false;
@@ -8118,19 +7127,12 @@ function beginObjectiveCaptureAttempt(cpId: number, playerId: number, kind: Obje
   objectiveCaptureAttemptStartAtSecByCpId[cpId] = getCurrentSchedulerNowSeconds();
   objectiveCaptureAttemptPlayerIdByCpId[cpId] = playerId;
 
-  stopObjectiveMcomAttemptLoopSfxForCp(cpId);
 
   if (mod.IsPlayerValid(sp.player)) {
-    stopObjectiveAttemptLocalArmingSfxForPlayer(sp.player);
-    stopObjectiveAttemptLocalDefusingSfxForPlayer(sp.player);
   }
 
   if (kind === "disarm" && mod.IsPlayerValid(sp.player)) {
-    setObjectiveMcomSfxEnabledForCp(cpId, "defusing", true, sp.player);
-    playObjectiveAttemptLocalSfx(sp.player, "defusing");
   } else if (mod.IsPlayerValid(sp.player)) {
-    setObjectiveMcomSfxEnabledForCp(cpId, "arming", true, sp.player);
-    playObjectiveAttemptLocalSfx(sp.player, "arming");
   }
 
   setObjectiveCaptureInteractEnabled(cpId, false);
@@ -8138,7 +7140,6 @@ function beginObjectiveCaptureAttempt(cpId: number, playerId: number, kind: Obje
 }
 
 function endObjectiveCaptureAttempt(cpId: number): void {
-  stopObjectiveMcomAttemptLoopSfxForCp(cpId);
 
   const attemptPlayerId = objectiveCaptureAttemptPlayerIdByCpId[cpId];
   const attemptPlayer = attemptPlayerId !== undefined ? serverPlayers.get(attemptPlayerId) : undefined;
@@ -8152,8 +7153,6 @@ function endObjectiveCaptureAttempt(cpId: number): void {
   setObjectiveCaptureInteractEnabled(cpId, false);
 
   if (attemptPlayer && mod.IsPlayerValid(attemptPlayer.player)) {
-    stopObjectiveAttemptLocalArmingSfxForPlayer(attemptPlayer.player);
-    stopObjectiveAttemptLocalDefusingSfxForPlayer(attemptPlayer.player);
     UpdateObjectiveHoldProgressUiForPlayer(attemptPlayer);
   }
 }
@@ -8283,7 +7282,6 @@ function buildDesiredLiveHybridObjectiveSurfaceLayers(
     const cpId = OBJECTIVE_DEFINITIONS[i].cpId;
     if (!isObjectiveCpId(cpId)) continue;
 
-    safeEnableObjectiveMcomByCpId(cpId, false, "syncLiveHybridObjectiveSurfaceState/" + context, force);
 
     const desiredLayer = getDesiredObjectiveSurfaceLayer(cpId);
     if (!desiredLayer) continue;
@@ -8395,22 +7393,8 @@ function syncLiveHybridObjectiveSurfaceStatePass(context: string, force: boolean
     );
   }
 
-  disableHardObjectiveMcoms("syncLiveHybridObjectiveSurfaceState/" + context);
   UpdateObjectiveCaptureInteractionState();
 }
-
-async function reassertObjectiveSurfaceAfterDelay(context: string, delaySeconds: number): Promise<void> {
-  await mod.Wait(delaySeconds);
-  if (gameStatus !== 0 && gameStatus !== 2 && gameStatus !== 3) return;
-  syncLiveHybridObjectiveSurfaceState("delayed_reassert/" + context + "/" + String(delaySeconds), true);
-  serverPlayers.forEach((p) => UpdateTopFlagColorsForPlayer(p));
-}
-
-function scheduleDelayedObjectiveSurfaceReassert(context: string): void {
-  void reassertObjectiveSurfaceAfterDelay(context, 0.2);
-  void reassertObjectiveSurfaceAfterDelay(context, 0.8);
-}
-
 
 function getObjectiveAwardAnchorIdByCpId(cpId: number): number | undefined {
   const vfxId = OBJECTIVE_AWARD_VFX_ID_BY_CP_ID[cpId];
@@ -8904,25 +7888,21 @@ function syncObjectiveArmedPendingVisualStateForCp(cpId: number): void {
 
   if (armedPending) {
     safeEnableCapturePointObjectiveByCpId(cpId, false, "syncObjectiveArmedPendingVisualStateForCp_armed");
-    safeEnableObjectiveMcomByCpId(cpId, false, "syncObjectiveArmedPendingVisualStateForCp_armed");
     return;
   }
 
   if (isCipherNodeRebooting(cpId)) {
     safeEnableCapturePointObjectiveByCpId(cpId, false, "syncObjectiveArmedPendingVisualStateForCp_rebooting");
-    safeEnableObjectiveMcomByCpId(cpId, false, "syncObjectiveArmedPendingVisualStateForCp_rebooting");
     return;
   }
 
   if (isObjectiveDisabledAfterAward(cpId)) {
     safeEnableCapturePointObjectiveByCpId(cpId, false, "syncObjectiveArmedPendingVisualStateForCp_disabled");
-    safeEnableObjectiveMcomByCpId(cpId, false, "syncObjectiveArmedPendingVisualStateForCp_disabled");
     return;
   }
 
   if (gameStatus === 3) {
-    safeEnableCapturePointObjectiveByCpId(cpId, true, "syncObjectiveArmedPendingVisualStateForCp_live");
-    safeEnableObjectiveMcomByCpId(cpId, false, "syncObjectiveArmedPendingVisualStateForCp_live");
+    safeEnableCapturePointObjectiveByCpId(cpId, false, "syncObjectiveArmedPendingVisualStateForCp_display_only");
   }
 }
 
@@ -8956,8 +7936,8 @@ function warnObjectiveAwardPersistentFireMissingOnce(cpId: number, fxName: strin
 function tryGetObjectiveAwardAnchorPosition(cpId: number): mod.Vector | undefined {
   const anchorId = getObjectiveAwardAnchorIdByCpId(cpId);
   if (!anchorId) {
-    const mcomPos = tryGetObjectiveMcomPosition(cpId);
-    if (mcomPos) return mcomPos;
+    const objectivePos = getObjectiveAnchorPosition(cpId);
+    if (objectivePos) return objectivePos;
     warnObjectiveAwardAnchorMissingOnce(cpId, anchorId);
     return getObjectiveAnchorPosition(cpId);
   }
@@ -8972,8 +7952,8 @@ function tryGetObjectiveAwardAnchorPosition(cpId: number): mod.Vector | undefine
     return mod.GetObjectPosition(spatialAnchor);
   } catch (_err) {}
 
-  const mcomPos = tryGetObjectiveMcomPosition(cpId);
-  if (mcomPos) return mcomPos;
+  const objectivePos = getObjectiveAnchorPosition(cpId);
+  if (objectivePos) return objectivePos;
 
   warnObjectiveAwardAnchorMissingOnce(cpId, anchorId);
   return getObjectiveAnchorPosition(cpId);
@@ -9011,24 +7991,19 @@ function spawnObjectiveAwardRuntimeFxAtPosition(
   return undefined;
 }
 
-async function cleanupRuntimeFxAfterDelay(
+function scheduleRuntimeFxCleanup(
   spawned: mod.VFX | mod.Object,
   delaySeconds: number
-): Promise<void> {
-  await mod.Wait(delaySeconds);
-
-  if (mod.IsType(spawned, mod.Types.VFX)) {
-    try {
-      mod.EnableVFX(spawned as mod.VFX, false);
-    } catch (_err) {}
-    return;
-  }
-
-  if (mod.IsType(spawned, mod.Types.Object)) {
-    try {
-      mod.UnspawnObject(spawned as mod.Object);
-    } catch (_err) {}
-  }
+): void {
+  scheduleCipherGlobalTask(delaySeconds, "runtime_fx_cleanup", () => {
+    if (mod.IsType(spawned, mod.Types.VFX)) {
+      try { mod.EnableVFX(spawned as mod.VFX, false); } catch (_err) {}
+      return;
+    }
+    if (mod.IsType(spawned, mod.Types.Object)) {
+      try { mod.UnspawnObject(spawned as mod.Object); } catch (_err) {}
+    }
+  });
 }
 
 function cleanupCipherNodeVisualHandle(spawned: mod.VFX | mod.Object | undefined): void {
@@ -9208,7 +8183,7 @@ async function cleanupObjectiveAwardBurstAfterDelay(
 function spawnObjectiveDisableFxOneShot(asset: mod.RuntimeSpawn_Common, pos: mod.Vector, lifetimeSeconds: number): void {
   const spawned = spawnObjectiveAwardRuntimeFxAtPosition(asset, pos);
   if (!spawned) return;
-  void cleanupRuntimeFxAfterDelay(spawned, lifetimeSeconds);
+  scheduleRuntimeFxCleanup(spawned, lifetimeSeconds);
 }
 
 function playObjectiveDisableEmpPresentationForCp(cpId: number, ownerTeam: mod.Team): void {
@@ -9227,8 +8202,8 @@ function playObjectiveDisableEmpPresentationForCp(cpId: number, ownerTeam: mod.T
   playRuntimeOneShotSfxAtPosition(
     OBJECTIVE_DISABLE_3D_SFX_ASSET,
     pos,
-    OBJECTIVE_MCOM_SFX_VOLUME,
-    OBJECTIVE_MCOM_SFX_ATTENUATION_RANGE,
+    1.0,
+    90,
     3.0,
     "objective_disable_emp_sfx"
   );
@@ -9248,12 +8223,8 @@ function disableObjectiveAfterAwardSuccess(cpId: number, ownerTeam: mod.Team): v
   objectiveDisabledAfterAwardByCpId[cpId] = true;
   objectiveDisabledOwnerTeamByCpId[cpId] = ownerTeam;
   safeEnableCapturePointObjectiveByCpId(cpId, false, "disableObjectiveAfterAwardSuccess", true);
-  safeEnableObjectiveMcomByCpId(cpId, false, "disableObjectiveAfterAwardSuccess");
   setObjectiveCaptureInteractEnabled(cpId, false);
   setObjectiveAwardVfxEnabled(cpId, false);
-  stopObjectiveMcomAttemptLoopSfxForCp(cpId);
-  setObjectiveMcomSfxEnabledForCp(cpId, "alarmSimple", false);
-  setObjectiveMcomSfxEnabledForCp(cpId, "alarmLeadout", false);
   playObjectiveDisableEmpPresentationForCp(cpId, ownerTeam);
   clearObjectivePendingAward(cpId);
   setObjectiveAuthoritativeOwner(
@@ -9264,7 +8235,6 @@ function disableObjectiveAfterAwardSuccess(cpId: number, ownerTeam: mod.Team): v
   clearObjectiveSuccessfulArmContext(cpId);
   clearBotObjectiveAssignments();
 
-  serverPlayers.forEach((p) => UpdateTopFlagColorsForPlayer(p));
 }
 
 function resetObjectiveDisableAndAwardFxState(): void {
@@ -9286,11 +8256,9 @@ function resetObjectiveDisableAndAwardFxState(): void {
 }
 
 function resetObjectiveRuntimeState(): void {
-  resetObjectiveMcomSfxRuntimeState();
   objectiveArmedWorldIconLastShownSecondsByCpId = {};
   objectiveCapturePointObjectiveEnabledByCpId = {};
   objectiveSurfaceSectorObjectiveEnabledBySectorId = {};
-  objectiveMcomObjectiveEnabledByCpId = {};
   objectiveCaptureInteractEnabledByCpId = {};
   objectiveCaptureAttemptEnabledByCpId = {};
   objectiveCaptureAttemptTeamByCpId = {};
@@ -9311,8 +8279,6 @@ function resetObjectiveRuntimeState(): void {
 
   for (let i = 0; i < OBJECTIVE_DEFINITIONS.length; i++) {
     const cpId = OBJECTIVE_DEFINITIONS[i].cpId;
-    const cp = serverCapturePoints[cpId];
-
     objectiveCaptureInteractEnabledByCpId[cpId] = false;
     objectiveCaptureAttemptEnabledByCpId[cpId] = false;
     objectiveCaptureAttemptTeamByCpId[cpId] = teamNeutral;
@@ -9327,20 +8293,13 @@ function resetObjectiveRuntimeState(): void {
     objectivePendingAwardTeamByCpId[cpId] = teamNeutral;
     objectivePendingAwardTokenByCpId[cpId] = undefined;
     objectiveDestroyExplosionPositionByCpId[cpId] = undefined;
-    if (!cp) continue;
-    (cp as any)._capturingTeam = teamNeutral;
-    (cp as any)._captureProgress = 0;
-    (cp as any)._previousCaptureProgress = 0;
-    applyObjectiveLockedCaptureTiming(cpId);
   }
 
-  if (audioInitialized) ensureObjectiveMcomSfxSpawned();
 }
 
 function EvaluatePostCaptureAwardTimers(): void {
   if (gameStatus !== 3) return;
-  // Cipher-key delivery disables MCOMs immediately on the second key.
-  // Keep the old pending-award lane dormant so no 00:45 armed countdown or alarm is reintroduced.
+  // Key delivery resolves immediately; no native objective countdown is involved.
 }
 
 function getObjectiveArmingTeam(cpId: number): mod.Team {
@@ -9377,7 +8336,7 @@ function clearCipherCarrierAfterDelivery(playerId: number | undefined): void {
 
   clearBombCarrierState();
   invalidateBombReturnToBaseTimer();
-  setBombPickupTriggerEnabled(false);
+  setBombBasePickupEnabled(false);
   setBombBaseAvailabilityState(false);
   clearBombBaseRuntimeLootSpawner();
   clearDroppedBombRuntimeObjects();
@@ -9439,7 +8398,7 @@ function resolveCipherDeliveryOutcome(scoringTeam: mod.Team): CipherDeliveryOutc
 }
 function clearDeferredCipherDeliveryTransitionTimer(): void {
   if (cipherDeliveryTransitionTimer !== undefined) {
-    Timers.clearTimeout(cipherDeliveryTransitionTimer);
+    cancelCipherGlobalTask(cipherDeliveryTransitionTimer);
   }
 
   cipherDeliveryTransitionTimer = undefined;
@@ -9469,7 +8428,7 @@ function scheduleCipherDeliveryPhaseTransition(
 
   // Never start halftime/postmatch/sudden-death directly inside the key-delivery stack.
   // Portal can freeze/crash when objective/UI/spawn/bot state is heavily mutated from that event path.
-  cipherDeliveryTransitionTimer = Timers.setTimeout(() => {
+  cipherDeliveryTransitionTimer = scheduleCipherGlobalTask(0.25, "delivery_transition/" + source, () => {
     if (token !== cipherDeliveryTransitionToken) return;
 
     cipherDeliveryTransitionTimer = undefined;
@@ -9498,7 +8457,7 @@ function scheduleCipherDeliveryPhaseTransition(
         LogRuntimeError("DeferredCipherDeliveryTransitionFallback/" + source + "/" + outcome, fallbackErr);
       }
     }
-  }, 250);
+  });
 }
 
 function beginCipherDeliveryPhaseTransition(outcome: CipherDeliveryOutcome, scoringTeam: mod.Team): void {
@@ -9534,8 +8493,6 @@ function finalizePendingObjectiveAwardsForImmediateTransition(context: string): 
   for (let i = 0; i < OBJECTIVE_DEFINITIONS.length; i++) {
     const cpId = OBJECTIVE_DEFINITIONS[i].cpId;
     if (!isObjectivePendingAwardActive(cpId)) continue;
-    setObjectiveMcomSfxEnabledForCp(cpId, "alarmSimple", false);
-    setObjectiveMcomSfxEnabledForCp(cpId, "alarmLeadout", false);
     clearObjectivePendingAward(cpId);
     logObjectiveDelayedAward(
       mod.Message("[OBJECTIVE AWARD] immediate transition clear cp/context {}", String(cpId) + "/" + context)
@@ -9573,10 +8530,8 @@ function handleCipherKeyDelivery(cpId: number, carrierPlayerId: number | undefin
 
   if (carrierPlayerId !== undefined) {
     const deliveryPos = getPlayerResolvedDropPosition(carrierPlayerId);
-    playObjectiveAttemptCompletionSfxForPlayer(carrierPlayerId, "arm", deliveryPos);
   }
 
-  playObjectiveOutcomeVoForTeams("arm", attackingTeam, symbol);
   clearCipherCarrierAfterDelivery(carrierPlayerId);
   UpdateScoreboard();
   SetUIScores();
@@ -9593,7 +8548,6 @@ function handleCipherKeyDelivery(cpId: number, carrierPlayerId: number | undefin
       true
     );
     syncLiveHybridObjectiveSurfaceState("handleCipherKeyDelivery", true);
-    scheduleDelayedObjectiveSurfaceReassert("handleCipherKeyDelivery");
   } else {
     // Do not switch sides/postmatch directly from the delivery stack.
     scheduleCipherDeliveryPhaseTransition(
@@ -9603,7 +8557,6 @@ function handleCipherKeyDelivery(cpId: number, carrierPlayerId: number | undefin
     );
   }
 
-  serverPlayers.forEach((p) => UpdateTopFlagColorsForPlayer(p));
 }
 
 function tryDeliverCipherKeyForCarrierAtObjective(playerId: number, cpId: number): boolean {
@@ -9667,25 +8620,14 @@ function handleObjectiveDefuseSuccess(cpId: number, defuserId: number | undefine
   const symbol = getObjectiveLaneSymbol(cpId, cp.symbol);
   const defuser = defuserId !== undefined ? serverPlayers.get(defuserId) : undefined;
   const attemptOutcomePos =
-    defuserId !== undefined ? getPlayerResolvedDropPosition(defuserId) : tryGetObjectiveMcomPosition(cpId);
+    defuserId !== undefined ? getPlayerResolvedDropPosition(defuserId) : getObjectiveAnchorPosition(cpId);
 
   clearObjectivePendingAward(cpId);
-  clearCaptureCredit(cpId);
 
-  (cp as any)._capturingTeam = teamNeutral;
-  (cp as any)._captureProgress = 0;
-  (cp as any)._previousCaptureProgress = 0;
-
-  stopObjectiveMcomAttemptLoopSfxForCp(cpId);
   if (defuser && mod.IsPlayerValid(defuser.player)) {
-    stopObjectiveAttemptLocalArmingSfxForPlayer(defuser.player);
-    stopObjectiveAttemptLocalDefusingSfxForPlayer(defuser.player);
   }
 
-  playObjectiveOutcomeVoForTeams("defuse", defendingTeam, symbol);
-  playObjectiveAttemptCompletionSfxForPlayer(defuserId, "defused", attemptOutcomePos);
   if (defuser && mod.IsPlayerValid(defuser.player)) {
-    playObjectiveAttemptLocalSfx(defuser.player, "defused");
   }
 
   if (defuser) {
@@ -9705,61 +8647,6 @@ function handleObjectiveDefuseSuccess(cpId: number, defuserId: number | undefine
 
   syncObjectiveArmedPendingVisualStateForCp(cpId);
   syncLiveHybridObjectiveSurfaceState("handleObjectiveDefuseSuccess", true);
-  serverPlayers.forEach((p) => UpdateTopFlagColorsForPlayer(p));
-}
-
-function UpdateObjectiveArmAlarmSfxState(): void {
-  if (gameStatus !== 3) {
-    StopAllObjectiveMcomSfx();
-    return;
-  }
-
-  const nowSec = getCurrentSchedulerNowSeconds();
-  const useEngineSeconds = USE_ENGINE_TIME_SCHEDULER && currentFrameHasEngineNowSec;
-  const leadoutTicks = OBJECTIVE_AWARD_ALARM_LEADOUT_SECONDS * TICK_RATE;
-
-  for (let i = 0; i < OBJECTIVE_DEFINITIONS.length; i++) {
-    const cpId = OBJECTIVE_DEFINITIONS[i].cpId;
-    const pendingTeam = objectivePendingAwardTeamByCpId[cpId] ?? teamNeutral;
-    const pendingStartTick = objectivePendingAwardStartTickByCpId[cpId];
-    const pendingStartAtSec = objectivePendingAwardStartAtSecByCpId[cpId];
-    const pendingDeadlineAtSec = objectivePendingAwardDeadlineAtSecByCpId[cpId];
-    const pendingToken = objectivePendingAwardTokenByCpId[cpId];
-
-    let enableSimple = false;
-    let enableLeadout = false;
-
-    if (
-      (pendingStartTick !== undefined || pendingStartAtSec !== undefined) &&
-      pendingToken !== undefined &&
-      !mod.Equals(pendingTeam, teamNeutral)
-    ) {
-      if (pendingDeadlineAtSec !== undefined) {
-        const remainingSec = pendingDeadlineAtSec - nowSec;
-        if (remainingSec > 0) {
-          if (remainingSec > OBJECTIVE_AWARD_ALARM_LEADOUT_SECONDS) enableSimple = true;
-          else enableLeadout = true;
-        }
-      } else if (useEngineSeconds && pendingStartAtSec !== undefined) {
-        const elapsedSec = nowSec - pendingStartAtSec;
-        const remainingSec = OBJECTIVE_SCORE_HOLD_SECONDS - elapsedSec;
-        if (remainingSec > 0) {
-          if (remainingSec > OBJECTIVE_AWARD_ALARM_LEADOUT_SECONDS) enableSimple = true;
-          else enableLeadout = true;
-        }
-      } else if (pendingStartTick !== undefined) {
-        const elapsed = serverTickCount - pendingStartTick;
-        const remaining = OBJECTIVE_SCORE_HOLD_TICKS - elapsed;
-        if (remaining > 0) {
-          if (remaining > leadoutTicks) enableSimple = true;
-          else enableLeadout = true;
-        }
-      }
-    }
-
-    setObjectiveMcomSfxEnabledForCp(cpId, "alarmSimple", enableSimple);
-    setObjectiveMcomSfxEnabledForCp(cpId, "alarmLeadout", enableLeadout);
-  }
 }
 
 function isObjectiveCpId(cpId: number): boolean {
@@ -9811,16 +8698,16 @@ function getObjectiveLaneSymbol(cpId: number, fallbackSymbol: string): Objective
   return "A";
 }
 
-function getFlagStringKey(lane: ObjectiveLetter): any {
+function getLaneStringKey(lane: ObjectiveLetter): any {
   if (lane === "A") return mod.stringkeys.FLAGA;
   if (lane === "B") return mod.stringkeys.FLAGB;
   if (lane === "C") return mod.stringkeys.FLAGC;
   return mod.stringkeys.FLAGD;
 }
 
-const TOP_HUD_FLAG_FILL_BASE_ALPHA = 0.5;
-const TOP_HUD_FLAG_TEXT_BASE_ALPHA = 1.0;
-const TOP_HUD_FLAG_OUTLINE_BASE_ALPHA = 1.0;
+const TOP_HUD_NODE_FILL_BASE_ALPHA = 0.5;
+const TOP_HUD_NODE_TEXT_BASE_ALPHA = 1.0;
+const TOP_HUD_NODE_OUTLINE_BASE_ALPHA = 1.0;
 const TOP_HUD_ARMED_PULSE_MIN_MULTIPLIER = 0.55;
 const TOP_HUD_ARMED_PULSE_MAX_MULTIPLIER = 1.0;
 const TOP_HUD_ARMED_PULSE_PERIOD_SECONDS = 1.1;
@@ -9882,25 +8769,7 @@ function ValidateObjectiveConfiguration(): void {
   const missingDefs: number[] = [];
   const missingWrappers: number[] = [];
   const idMismatches: string[] = [];
-  const missingMcomIds: number[] = [];
-  const mcomIdAliases: string[] = [];
-  const duplicateConfiguredMcomIds: number[] = [];
   const authoredSectorMismatches: string[] = [];
-  const hqProtectionTriggerMismatches: string[] = [];
-  const hqProtectionTriggerCollisions: string[] = [];
-  const seenConfiguredMcomIds: { [mcomId: number]: boolean } = {};
-
-  for (let i = 0; i < OBJECTIVE_DEFINITIONS.length; i++) {
-    const mcomId = OBJECTIVE_DEFINITIONS[i].mcomId;
-    if (mcomId === undefined) continue;
-    if (seenConfiguredMcomIds[mcomId] === true) {
-      if (duplicateConfiguredMcomIds.indexOf(mcomId) < 0) {
-        duplicateConfiguredMcomIds.push(mcomId);
-      }
-      continue;
-    }
-    seenConfiguredMcomIds[mcomId] = true;
-  }
 
   for (let i = 0; i < ALL_OBJECTIVE_CP_IDS.length; i++) {
     const cpId = ALL_OBJECTIVE_CP_IDS[i];
@@ -9908,19 +8777,6 @@ function ValidateObjectiveConfiguration(): void {
     if (!def) {
       missingDefs.push(cpId);
       continue;
-    }
-
-    if (def.mcomId !== undefined && objectiveDefByMcomId[def.mcomId] !== def) {
-      missingMcomIds.push(cpId);
-    } else if (def.mcomId !== undefined) {
-      try {
-        const resolvedMcomId = getObjectiveResolvedMcomIdByCpId(cpId) ?? mod.GetObjId(mod.GetMCOM(def.mcomId));
-        if (resolvedMcomId !== def.mcomId) {
-          mcomIdAliases.push(def.cpId + ":" + def.mcomId + "->" + resolvedMcomId);
-        }
-      } catch (_err) {
-        mcomIdAliases.push(def.cpId + ":" + def.mcomId + "->unresolved");
-      }
     }
 
     const cp = serverCapturePoints[cpId];
@@ -9947,24 +8803,6 @@ function ValidateObjectiveConfiguration(): void {
     }
   }
 
-  const surfaceValidationCpIds = OBJECTIVE_SURFACE_ONLY_CP_IDS;
-  for (let i = 0; i < surfaceValidationCpIds.length; i++) {
-    const cpId = surfaceValidationCpIds[i];
-    const capturePoint = resolveObjectiveCapturePointHandleByCpId(cpId, "validateObjectiveAuthoring/surface");
-    if (!capturePoint) continue;
-
-    let resolvedId = -1;
-    try {
-      resolvedId = mod.GetObjId(capturePoint);
-    } catch (_err) {
-      idMismatches.push(cpId + "->unresolved");
-      continue;
-    }
-    if (resolvedId !== cpId) {
-      idMismatches.push(cpId + "->" + resolvedId);
-    }
-  }
-
   const authoredSectorIds = OBJECTIVE_SURFACE_SECTOR_IDS;
   for (let i = 0; i < authoredSectorIds.length; i++) {
     const sectorId = authoredSectorIds[i];
@@ -9978,44 +8816,12 @@ function ValidateObjectiveConfiguration(): void {
     }
   }
 
-  const hqProtectionChecks = [
-    { label: "t1", id: TEAM1_HQ_PROTECTION_TRIGGER_ID },
-    { label: "t2", id: TEAM2_HQ_PROTECTION_TRIGGER_ID },
-  ];
-  for (let i = 0; i < hqProtectionChecks.length; i++) {
-    const check = hqProtectionChecks[i];
-    if (EXPECTED_OBJECTIVE_MCOM_IDS.indexOf(check.id) >= 0) {
-      const cpId = OBJECTIVE_CP_ID_BY_MCOM_ID[check.id];
-      hqProtectionTriggerCollisions.push(
-        check.label + ":" + check.id + "->mcom_cp_" + String(cpId ?? -1)
-      );
-    }
-
-    try {
-      const resolvedTriggerId = mod.GetObjId(mod.GetAreaTrigger(check.id));
-      if (resolvedTriggerId !== check.id) {
-        hqProtectionTriggerMismatches.push(check.label + ":" + check.id + "->" + resolvedTriggerId);
-      }
-    } catch (_err) {
-      hqProtectionTriggerMismatches.push(check.label + ":" + check.id + "->unresolved");
-    }
-  }
-
   if (
     missingDefs.length === 0 &&
     missingWrappers.length === 0 &&
     idMismatches.length === 0 &&
-    missingMcomIds.length === 0 &&
-    duplicateConfiguredMcomIds.length === 0 &&
-    authoredSectorMismatches.length === 0 &&
-    hqProtectionTriggerMismatches.length === 0 &&
-    hqProtectionTriggerCollisions.length === 0
+    authoredSectorMismatches.length === 0
   ) {
-    if (mcomIdAliases.length > 0) {
-      emitObjectiveNativeEventFlow(
-        mod.Message("[OBJECTIVE MCOM ALIAS] cp/lane/configured/resolved/context {}", mcomIdAliases.join(","))
-      );
-    }
     return;
   }
 
@@ -10023,26 +8829,19 @@ function ValidateObjectiveConfiguration(): void {
   objectiveConfigWarningShown = true;
   emitStringKeyDebugWorldLog(
     mod.Message(
-      "[OBJECTIVE CONFIG] CP defs/wrappers/mismatches {} | MCOM ids/mismatches/dupes {}",
+      "[OBJECTIVE CONFIG] CP defs/wrappers/mismatches {}",
       (missingDefs.length > 0 ? missingDefs.join(",") : "none") +
         "/" +
         (missingWrappers.length > 0 ? missingWrappers.join(",") : "none") +
         "/" +
-        (idMismatches.length > 0 ? idMismatches.join(",") : "none"),
-      (missingMcomIds.length > 0 ? missingMcomIds.join(",") : "none") +
-        "/" +
-        (mcomIdAliases.length > 0 ? mcomIdAliases.join(",") : "none") +
-        "/" +
-        (duplicateConfiguredMcomIds.length > 0 ? duplicateConfiguredMcomIds.join(",") : "none")
+        (idMismatches.length > 0 ? idMismatches.join(",") : "none")
     )
   );
   emitStringKeyDebugWorldLog(
     mod.Message(
-      "[OBJECTIVE AUTHORING] sectors {} | HQ triggers/mismatches/collisions {}",
+      "[OBJECTIVE AUTHORING] sectors {} | Cairo restricted trigger {}",
       authoredSectorMismatches.length > 0 ? authoredSectorMismatches.join(",") : "none",
-      (hqProtectionTriggerMismatches.length > 0 ? hqProtectionTriggerMismatches.join(",") : "none") +
-        "/" +
-        (hqProtectionTriggerCollisions.length > 0 ? hqProtectionTriggerCollisions.join(",") : "none")
+      RESTRICTED_AREA_TRIGGER
     )
   );
 }
@@ -10056,14 +8855,11 @@ function registerObjectivesDeterministically(): void {
 }
 
 function applyObjectiveRoundStartOwnership(resetRoundState: boolean = true): void {
-  if (resetRoundState) {
-    captureCreditByCpId = {};
-  }
+  void resetRoundState;
 
   resetCipherNodeStates("applyObjectiveRoundStartOwnership");
   objectiveAreaActiveTriggersByPlayerId = {};
   objectiveAreaLastEnteredTriggerByPlayerId = {};
-  seedObjectiveNativeMcomState("applyObjectiveRoundStartOwnership");
   resetObjectiveRuntimeState();
   resetObjectiveDisableAndAwardFxState();
   disableAllObjectiveCapturePointObjectives("applyObjectiveRoundStartOwnership");
@@ -10076,32 +8872,22 @@ function applyObjectiveRoundStartOwnership(resetRoundState: boolean = true): voi
     const cp = serverCapturePoints[def.cpId];
     if (!cp) continue;
 
-    applyObjectiveLockedCaptureTiming(def.cpId);
     setObjectiveAuthoritativeOwner(def.cpId, getObjectiveDefendingTeamForCurrentHalf(def.cpId));
     clearObjectivePendingAward(def.cpId);
-
-    (cp as any)._capturingTeam = teamNeutral;
-    (cp as any)._captureProgress = 0;
-    (cp as any)._previousCaptureProgress = 0;
-    cp.clearOnPoint();
   }
 }
 
 function applyObjectiveLiveHybridRoundStartState(resetRoundState: boolean = true): void {
-  if (resetRoundState) {
-    captureCreditByCpId = {};
-  }
+  void resetRoundState;
 
   resetCipherNodeStates("applyObjectiveLiveHybridRoundStartState");
   objectiveAreaActiveTriggersByPlayerId = {};
   objectiveAreaLastEnteredTriggerByPlayerId = {};
-  seedObjectiveNativeMcomState("applyObjectiveLiveHybridRoundStartState");
   resetObjectiveRuntimeState();
   resetObjectiveDisableAndAwardFxState();
   disableAllObjectiveCapturePointObjectives("applyObjectiveLiveHybridRoundStartState");
   disableAllNeutralObjectiveCapturePointObjectives("applyObjectiveLiveHybridRoundStartState");
   disableAllObjectiveSurfaceSectors("applyObjectiveLiveHybridRoundStartState", true);
-  setObjectiveNativeMcomObjectivesEnabled(false, "applyObjectiveLiveHybridRoundStartState");
   disableAllObjectiveInteractPoints("applyObjectiveLiveHybridRoundStartState");
 
   for (let i = 0; i < OBJECTIVE_DEFINITIONS.length; i++) {
@@ -10109,58 +8895,23 @@ function applyObjectiveLiveHybridRoundStartState(resetRoundState: boolean = true
     const cp = serverCapturePoints[def.cpId];
     if (!cp) continue;
 
-    applyObjectiveLockedCaptureTiming(def.cpId);
     setObjectiveAuthoritativeOwner(
       def.cpId,
       getObjectiveDefendingTeamForCurrentHalf(def.cpId),
       "applyObjectiveLiveHybridRoundStartState"
     );
     clearObjectivePendingAward(def.cpId);
-
-    (cp as any)._capturingTeam = teamNeutral;
-    (cp as any)._captureProgress = 0;
-    (cp as any)._previousCaptureProgress = 0;
-    cp.clearOnPoint();
   }
 
   syncLiveHybridObjectiveSurfaceState("applyObjectiveLiveHybridRoundStartState");
 }
 
-async function reassertObjectiveOwnershipShortlyAfterLiveStart(): Promise<void> {
-  await mod.Wait(0.2);
-  if (gameStatus !== 3) return;
-  syncLiveHybridObjectiveSurfaceState("reassertObjectiveOwnershipShortlyAfterLiveStart", true);
-  scheduleDelayedObjectiveSurfaceReassert("reassertObjectiveOwnershipShortlyAfterLiveStart");
-  serverPlayers.forEach((p) => UpdateTopFlagColorsForPlayer(p));
-}
-
-function refreshCapturePointsEngineStateForUI(): void {
-  // Lightweight sampling for UI smoothness: script-owned owner + progress + contested state.
-  Object.values(serverCapturePoints).forEach((cp) => {
-    if (isScriptedObjectiveCapturePointId(cp.id)) {
-      ensureObjectiveEngineOwnerMatchesScript(cp.id, "refreshCapturePointsEngineStateForUI");
-    }
-    cp.setCaptureProgress();
-    UpdateCapturePointContestedState(cp);
-  });
-}
-
-function getConfiguredInitialTransitionPlayerSpawnerObjIdForTeam(team: mod.Team): number {
-  // Historical name retained for debug text compatibility. The returned value is now
-  // the authored HQ ID (1-4), not an unauthored PlayerSpawner ID (11-14).
+function getConfiguredInitialTransitionHqObjIdForTeam(team: mod.Team): number {
   return getCipherLiveHqIdForTeam(team);
 }
 
-function getLiveSafeSpawnHqIdsForTeam(team: mod.Team): number[] {
-  return mod.Equals(team, team1) ? LIVE_SAFE_SPAWN_TEAM1_HQ_IDS : LIVE_SAFE_SPAWN_TEAM2_HQ_IDS;
-}
-
-function isValidLiveSafeSpawnHqIdForTeam(team: mod.Team, hqId: number): boolean {
-  const ids = getLiveSafeSpawnHqIdsForTeam(team);
-  for (let i = 0; i < ids.length; i++) {
-    if (hqId === ids[i]) return true;
-  }
-  return false;
+function isCurrentLiveHqIdForTeam(team: mod.Team, hqId: number): boolean {
+  return hqId === getCipherLiveHqIdForTeam(team);
 }
 
 function tryDeployPlayerSafe(player: mod.Player, context: string): boolean {
@@ -10322,17 +9073,13 @@ function processTransitionSpawnQueue(source: string): void {
     }
 
     const lastAttemptTick = transitionSpawnLastAttemptTickByPlayerId[playerId] ?? -999999;
-    if (transitionSpawnInFlightByPlayerId[playerId] === true) {
-      const inFlightTicks = serverTickCount - lastAttemptTick;
-      if (inFlightTicks < TRANSITION_SPAWN_INFLIGHT_TIMEOUT_TICKS) continue;
-      transitionSpawnInFlightByPlayerId[playerId] = false;
-    }
+    if (transitionSpawnInFlightByPlayerId[playerId] === true) continue;
 
     if (serverTickCount - lastAttemptTick < TRANSITION_SPAWN_MIN_RETRY_TICKS) continue;
 
     const team = mod.GetTeam(sp.player);
     const hqObjId = getCipherLiveHqIdForTeam(team);
-    if (!isValidLiveSafeSpawnHqIdForTeam(team, hqObjId)) {
+    if (!isCurrentLiveHqIdForTeam(team, hqObjId)) {
       warnTransitionSpawnOnce(
         "missing_hq/" + source + "/" + String(playerId),
         mod.Message(
@@ -10420,8 +9167,8 @@ function validatePreLivePlayerTeamsFromEngine(): boolean {
 function validatePreLiveTransitionSpawnPrerequisites(): boolean {
   const t1HqObjId = getCipherLiveHqIdForTeam(team1);
   const t2HqObjId = getCipherLiveHqIdForTeam(team2);
-  const t1Ok = isValidLiveSafeSpawnHqIdForTeam(team1, t1HqObjId);
-  const t2Ok = isValidLiveSafeSpawnHqIdForTeam(team2, t2HqObjId);
+  const t1Ok = isCurrentLiveHqIdForTeam(team1, t1HqObjId);
+  const t2Ok = isCurrentLiveHqIdForTeam(team2, t2HqObjId);
   if (t1Ok && t2Ok) return true;
 
   warnTransitionSpawnOnce(
@@ -10498,9 +9245,14 @@ function isSquadSpawnBypassActive(playerId: number): boolean {
   return squadSpawnBypass[playerId] === true;
 }
 
-async function clearSquadSpawnBypassLater(playerId: number): Promise<void> {
-  await mod.Wait(SQUAD_SPAWN_BYPASS_LIFETIME_SECONDS);
-  squadSpawnBypass[playerId] = false;
+function clearSquadSpawnBypassLater(playerId: number): void {
+  const sessionGeneration = playerSessionTokenByPlayerId[playerId];
+  const lifeGeneration = getPlayerLifeGeneration(playerId);
+  scheduleCipherGlobalTask(SQUAD_SPAWN_BYPASS_LIFETIME_SECONDS, "squad_spawn_bypass/" + String(playerId), () => {
+    if (!isCurrentPlayerSession(playerId, sessionGeneration)) return;
+    if (getPlayerLifeGeneration(playerId) !== lifeGeneration) return;
+    squadSpawnBypass[playerId] = false;
+  });
 }
 
 
@@ -10610,16 +9362,11 @@ function isNativeFriendlyOrSquadSpawn(eventPlayer: mod.Player, playerId: number)
   return false;
 }
 
-function finishSafeSpawnAsNativeFriendlyOrSquadSpawn(eventPlayer: mod.Player, playerId: number): void {
-  // This is the critical difference from finishSafeSpawnAsSafe():
-  // DO NOT call finalizeSafeSpawnDeploySuccess(), because that function requests/executes
-  // teleportCipherPlayerToRoutedAnchor().
-  safeSpawnForcedUndeploy[playerId] = false;
-  safeSpawnUnsafePending[playerId] = false;
-  safeSpawnPendingCheck[playerId] = false;
-
+function consumeCipherRouteForNativeFriendlySpawn(eventPlayer: mod.Player, playerId: number): void {
+  delete cipherQueuedAnchorByPlayerId[playerId];
+  clearCipherSpawnJobsForPlayer(playerId);
   squadSpawnBypass[playerId] = true;
-  void clearSquadSpawnBypassLater(playerId);
+  clearSquadSpawnBypassLater(playerId);
 
   if (bombCarrierPlayerId === playerId) {
     syncCipherCarrierVisualsNow(getCurrentSchedulerNowSeconds(), "NativeFriendlyOrSquadSpawn_NoTeleport");
@@ -10627,185 +9374,16 @@ function finishSafeSpawnAsNativeFriendlyOrSquadSpawn(eventPlayer: mod.Player, pl
   queueCipherAdminInteractSpawnForPlayer(playerId, "native_friendly_or_squad_spawn");
 }
 
-function getSafeSpawnGeneration(playerId: number): number {
-  return safeSpawnGenerationByPlayerId[playerId] ?? 0;
-}
-
-function bumpSafeSpawnGeneration(playerId: number): number {
-  const nextGeneration = getSafeSpawnGeneration(playerId) + 1;
-  safeSpawnGenerationByPlayerId[playerId] = nextGeneration;
-  return nextGeneration;
-}
-
-function clearQueuedSafeSpawnStateForPlayer(
-  playerId: number,
-  preserveCipherQueuedAnchor: boolean = false
-): void {
-  delete safeSpawnCheckQueuedGenerationByPlayerId[playerId];
-  delete safeSpawnForcedQueuedGenerationByPlayerId[playerId];
-  if (!preserveCipherQueuedAnchor) delete cipherQueuedAnchorByPlayerId[playerId];
-  safeSpawnCheckQueue = safeSpawnCheckQueue.filter((item) => item.playerId !== playerId);
-  safeSpawnForcedQueue = safeSpawnForcedQueue.filter((item) => item.playerId !== playerId);
-  safeSpawnPendingCheck[playerId] = false;
-}
-
-function isSafeSpawnCheckQueueItemCurrent(item: SafeSpawnCheckQueueItem): boolean {
-  if (safeSpawnCheckQueuedGenerationByPlayerId[item.playerId] !== item.generation) return false;
-  if (getSafeSpawnGeneration(item.playerId) !== item.generation) return false;
-  return isQueuedPlayerWorkCurrent(item.playerId, item.sessionToken, 3, item.expectedMatchStage, -1);
-}
-
-function isForcedSafeSpawnQueueItemCurrent(item: ForcedSafeSpawnQueueItem): boolean {
-  if (safeSpawnForcedQueuedGenerationByPlayerId[item.playerId] !== item.generation) return false;
-  if (getSafeSpawnGeneration(item.playerId) !== item.generation) return false;
-  return isQueuedPlayerWorkCurrent(item.playerId, item.sessionToken, 3, item.expectedMatchStage, -1);
-}
-
-function finalizeSafeSpawnDeploySuccess(eventPlayer: mod.Player, playerId: number): void {
-  if (safeSpawnUnsafePending[playerId] === true) return;
-
-  // Exactly one teleport attempt per deployment. The old path processed an urgent
-  // teleport job and then called teleportCipherPlayerToRoutedAnchor again immediately.
-  clearCipherSpawnJobsForPlayer(playerId);
-  const teleported = teleportCipherPlayerToRoutedAnchor(eventPlayer, playerId);
-  if (!teleported) {
-    // Fail open at the native HQ. Never recycle the player or call an unauthored spawner.
-    delete cipherQueuedAnchorByPlayerId[playerId];
-  }
-
-  if (bombCarrierPlayerId === playerId) {
-    syncCipherCarrierVisualsNow(getCurrentSchedulerNowSeconds(), "SafeSpawnSuccess_LiveTeleport");
-  }
-  queueCipherAdminInteractSpawnForPlayer(playerId, "safe_spawn_success");
-  safeSpawnForcedUndeploy[playerId] = false;
-  safeSpawnUnsafePending[playerId] = false;
-  safeSpawnUnsafeSpawnerObjId[playerId] = 0;
-  safeSpawnUnsafeHqObjIdByPlayerId[playerId] = 0;
-}
-
-function finishSafeSpawnAsSafe(eventPlayer: mod.Player, playerId: number): void {
-  finalizeSafeSpawnDeploySuccess(eventPlayer, playerId);
-}
-
-function runSafeSpawnCheckOrRedeploy(playerId: number, generation: number): void {
-  if (safeSpawnPendingCheck[playerId] === true) return;
-  if (safeSpawnUnsafePending[playerId] === true) return;
-  if (generation !== getSafeSpawnGeneration(playerId)) return;
-
-  const p = serverPlayers.get(playerId);
-  if (!p) return;
-  const eventPlayer = p.player;
-  if (!mod.IsPlayerValid(eventPlayer)) return;
-
-  safeSpawnPendingCheck[playerId] = true;
-  try {
-    if (gameStatus !== 3 || !p.isDeployed || !isPlayerAliveSafe(eventPlayer)) return;
-
-    // Native friendly/squad spawns intentionally bypass custom anchor routing.
-    if (isNativeFriendlyOrSquadSpawn(eventPlayer, playerId) || isSquadSpawnBypassActive(playerId)) {
-      finishSafeSpawnAsNativeFriendlyOrSquadSpawn(eventPlayer, playerId);
-      return;
-    }
-
-    // Do not judge the temporary native HQ position as the final spawn. The routed
-    // anchor performs its own enemy-safety validation before the single teleport.
-    finishSafeSpawnAsSafe(eventPlayer, playerId);
-  } finally {
-    safeSpawnPendingCheck[playerId] = false;
-  }
-}
-
-function SafeSpawnCheckOrRedeploy(playerId: number): void {
-  if (safeSpawnUnsafePending[playerId] === true) return;
-
-  const generation = getSafeSpawnGeneration(playerId);
-  if (safeSpawnCheckQueuedGenerationByPlayerId[playerId] === generation) return;
-
-  safeSpawnCheckQueuedGenerationByPlayerId[playerId] = generation;
-  safeSpawnCheckQueue.push({
-    playerId,
-    generation,
-    dueTick: phaseTickCount + SAFE_SPAWN_CHECK_DELAY_TICKS,
-    sessionToken: ensurePlayerSessionToken(playerId),
-    expectedMatchStage: cipherMatchStage,
-  });
-}
-
-function processSafeSpawnCheckQueue(): void {
-  if (gameStatus !== 3 || safeSpawnCheckQueue.length <= 0) return;
-
-  let processed = 0;
-  const remaining: SafeSpawnCheckQueueItem[] = [];
-
-  for (let i = 0; i < safeSpawnCheckQueue.length; i++) {
-    const item = safeSpawnCheckQueue[i];
-
-    if (!isSafeSpawnCheckQueueItemCurrent(item)) continue;
-
-    if (processed >= SAFE_SPAWN_CHECK_QUEUE_BUDGET_PER_TICK || item.dueTick > phaseTickCount) {
-      remaining.push(item);
-      continue;
-    }
-
-    delete safeSpawnCheckQueuedGenerationByPlayerId[item.playerId];
-    processed += 1;
-    runSafeSpawnCheckOrRedeploy(item.playerId, item.generation);
-  }
-
-  safeSpawnCheckQueue = remaining;
-}
-
-function processForcedSafeSpawnQueue(): void {
-  if (safeSpawnForcedQueue.length <= 0) return;
-
-  // Drain legacy work safely. Never issue another scripted undeploy or PlayerSpawner
-  // spawn for a human; native HQ deployment remains authoritative.
-  const staleItems = safeSpawnForcedQueue;
-  safeSpawnForcedQueue = [];
-  for (let i = 0; i < staleItems.length; i++) {
-    const item = staleItems[i];
-    delete safeSpawnForcedQueuedGenerationByPlayerId[item.playerId];
-    safeSpawnForcedUndeploy[item.playerId] = false;
-    safeSpawnUnsafePending[item.playerId] = false;
-    safeSpawnUnsafeSpawnerObjId[item.playerId] = 0;
-    safeSpawnUnsafeHqObjIdByPlayerId[item.playerId] = 0;
-    const p = serverPlayers.get(item.playerId);
-    if (p && mod.IsPlayerValid(p.player)) {
-      try {
-        mod.SetRedeployTime(p.player, isCipherSuddenDeathActive() ? 9999 : REDEPLOY_TIME);
-      } catch (_err) {}
-    }
-  }
-}
-
-function processLiveSafeSpawnQueues(): void {
-  processForcedSafeSpawnQueue();
-  processSafeSpawnCheckQueue();
-}
 /* =================================================================================================
    5) AUDIO (SFX / VO)
 ================================================================================================= */
 
 let audioInitialized = false;
-let SFX_CaptureBuildup: any = null;
-
-let SFX_TickFriendly: any = null;
-let SFX_TickEnemy: any = null;
-let SFX_CapturedFriendly: any = null;
 let SFX_ReadyUp: any = null;
 let SFX_CountdownHeartbeat: any = null;
-let SFX_ThumpFriendly: any = null;
-let SFX_ThumpEnemy: any = null;
 let SFX_MatchStartStinger: any = null;
 let SFX_ObjectiveDisabledUi: any = null;
-let SFX_ObjectiveArmingLocal: any = null;
-let SFX_ObjectiveArmLocal: any = null;
-let SFX_ObjectiveDefusedLocal: any = null;
-let SFX_ObjectiveDefusingLocal: any = null;
 let SFX_BombSpawnStinger2D: any = null;
-// Capture tick LOOPS (start once, stop once)
-let SFX_TickFriendlyLoop: any = null;
-let SFX_TickEnemyLoop: any = null;
 // End-of-round suspense loops
 let SFX_Endgame_WinningLoop: any = null;
 let SFX_Endgame_LosingLoop: any = null;
@@ -10816,9 +9394,6 @@ let SFX_OutOfBoundsCountdownLoop: any = null;
 // Track per-player state so loops never stack
 let endgameLoopStateByPlayerId: { [playerId: number]: "none" | "win" | "lose" } = {};
 
-
-// Track what loop (if any) each player is currently hearing
-let captureTickLoopStateByPlayerId: { [playerId: number]: "none" | "friendly" | "enemy" } = {};
 
 let voModuleByTeamId: { [teamId: number]: any | undefined } = {};
 let voFallbackModule: any = null;
@@ -10834,70 +9409,13 @@ const ENDGAME_TICKET_THRESHOLD = WIN_SCORE - 1;
 const ENDGAME_TIME_THRESHOLD_SECONDS = 30;
 const ENDGAME_LOOP_INTERVAL_SECONDS = 0.8;
 
-// Per-player endgame loop tokens (token invalidation like capture tick loop)
+// Per-player endgame loop tokens guard the cosmetic suspense task.
 let endgameLoopTokenByPlayerId: { [playerId: number]: number } = {};
 let endgameLoopModeByPlayerId: { [playerId: number]: "none" | "win" | "lose" } = {};
-
-/* Cooldowns */
-const SFX_CONTEST_COOLDOWN = 2.0;
-const SFX_CAPTURE_COOLDOWN = 2.0;
-const SFX_TEAMMATE_JOIN_COOLDOWN = 1.0;
-
-const SFX_CONTEST_CD_TICKS = mod.Ceiling(SFX_CONTEST_COOLDOWN * TICK_RATE);
-const SFX_CAPTURE_CD_TICKS = mod.Ceiling(SFX_CAPTURE_COOLDOWN * TICK_RATE);
-const SFX_JOIN_CD_TICKS = mod.Ceiling(SFX_TEAMMATE_JOIN_COOLDOWN * TICK_RATE);
-
-const CAPTURE_TICK_INTERVAL_SECONDS = 0.45;
-const CAPTURE_TICK_INTERVAL_TICKS = mod.Max(1, mod.Floor(CAPTURE_TICK_INTERVAL_SECONDS * TICK_RATE));
-
-const CAPTURE_BUILDUP_THRESHOLD = 0.88;   // Start buildup when progress crosses this on the way up to 1.0
-const CAPTURE_BUILDUP_BEATS = 3;
-const CAPTURE_BUILDUP_BEAT_INTERVAL_SECONDS = 0.12;
-
-let lastCaptureBuildupTickByCp: { [cpId: number]: number } = {};
-const CAPTURE_BUILDUP_COOLDOWN_TICKS = mod.Ceiling(2.0 * TICK_RATE);
-
-
-let lastContestSfxTickByCp: { [cpId: number]: number } = {};
-let lastCaptureSfxTickByCp: { [cpId: number]: number } = {};
-let lastJoinSfxTickByCp: { [cpId: number]: number } = {};
-
-let lastCaptureTickAt: { [key: string]: number } = {};
-let capturePointContested: { [cpId: number]: boolean } = {};
-let lastCaptureProgressByCpId: { [cpId: number]: number } = {};
-let captureTickLoopTokenByPlayerId: { [playerId: number]: number } = {};
-let captureCreditByCpId: { [cpId: number]: { [playerId: number]: boolean } } = {};
-
-
-let lastEnterPointSfxTickByPlayerId: { [playerId: number]: number } = {};
-const ENTER_POINT_SFX_COOLDOWN_TICKS = mod.Floor(0.75 * TICK_RATE);
 
 function ensureAudioSpawned(): void {
   if (audioInitialized) return;
   audioInitialized = true;
-
-  SFX_CaptureBuildup = mod.SpawnObject(
-    mod.RuntimeSpawn_Common.SFX_UI_Notification_ObjectiveSecured_FadeIn_OneShot2D,
-    mod.CreateVector(0, 0, 0),
-    mod.CreateVector(0, 0, 0),
-    mod.CreateVector(0, 0, 0)
-  );
-
-    // Looping capture tick sounds (SimpleLoop2D)
-  SFX_TickFriendlyLoop = mod.SpawnObject(
-    mod.RuntimeSpawn_Common.SFX_UI_Gauntlet_Standoff_ZoneCaptureTick_OneShot2D,
-    mod.CreateVector(0, 0, 0),
-    mod.CreateVector(0, 0, 0),
-    mod.CreateVector(0, 0, 0)
-  );
-
-  SFX_TickEnemyLoop = mod.SpawnObject(
-    mod.RuntimeSpawn_Common.SFX_UI_Gamemode_Shared_CaptureObjectives_CapturingTick_IsEnemy_SimpleLoop2D,
-    mod.CreateVector(0, 0, 0),
-    mod.CreateVector(0, 0, 0),
-    mod.CreateVector(0, 0, 0)
-  );
-
 
   SFX_ReadyUp = mod.SpawnObject(
     mod.RuntimeSpawn_Common.SFX_UI_SP_Collectibles_Dogtag_OneShot2D,
@@ -10913,41 +9431,6 @@ function ensureAudioSpawned(): void {
     mod.CreateVector(0, 0, 0)
   );
 
-  SFX_TickFriendly = mod.SpawnObject(
-    mod.RuntimeSpawn_Common.SFX_UI_Gauntlet_Standoff_ZoneCaptureTick_OneShot2D,
-    mod.CreateVector(0, 0, 0),
-    mod.CreateVector(0, 0, 0),
-    mod.CreateVector(0, 0, 0)
-  );
-
-  SFX_TickEnemy = mod.SpawnObject(
-    mod.RuntimeSpawn_Common.SFX_UI_Gamemode_Shared_CaptureObjectives_CapturingTickEnemy_OneShot2D,
-    mod.CreateVector(0, 0, 0),
-    mod.CreateVector(0, 0, 0),
-    mod.CreateVector(0, 0, 0)
-  );
-
-  SFX_CapturedFriendly = mod.SpawnObject(
-    mod.RuntimeSpawn_Common.SFX_UI_Gamemode_Shared_CaptureObjectives_OnCapturedByFriendly_OneShot2D,
-    mod.CreateVector(0, 0, 0),
-    mod.CreateVector(0, 0, 0),
-    mod.CreateVector(0, 0, 0)
-  );
-
-  SFX_ThumpFriendly = mod.SpawnObject(
-    mod.RuntimeSpawn_Common.SFX_UI_Gamemode_Shared_CaptureObjectives_CapturingThumpFriendly_OneShot2D,
-    mod.CreateVector(0, 0, 0),
-    mod.CreateVector(0, 0, 0),
-    mod.CreateVector(0, 0, 0)
-  );
-
-  SFX_ThumpEnemy = mod.SpawnObject(
-    mod.RuntimeSpawn_Common.SFX_UI_Gamemode_Shared_CaptureObjectives_CapturingThumpEnemy_OneShot2D,
-    mod.CreateVector(0, 0, 0),
-    mod.CreateVector(0, 0, 0),
-    mod.CreateVector(0, 0, 0)
-  );
-
   SFX_MatchStartStinger = mod.SpawnObject(
     mod.RuntimeSpawn_Common.SFX_UI_Gamemode_Shared_Intro_FinalImpact_OneShot2D,
     mod.CreateVector(0, 0, 0),
@@ -10957,35 +9440,6 @@ function ensureAudioSpawned(): void {
 
   SFX_ObjectiveDisabledUi = mod.SpawnObject(
     OBJECTIVE_DISABLE_UI_SFX_ASSET,
-    mod.CreateVector(0, 0, 0),
-    mod.CreateVector(0, 0, 0),
-    mod.CreateVector(0, 0, 0)
-  );
-
-  // Local objective hold feedback (played directly to the interacting player).
-  SFX_ObjectiveArmingLocal = mod.SpawnObject(
-    mod.RuntimeSpawn_Common.SFX_GameModes_Rush_Arm_SimpleLoop3D,
-    mod.CreateVector(0, 0, 0),
-    mod.CreateVector(0, 0, 0),
-    mod.CreateVector(0, 0, 0)
-  );
-
-  SFX_ObjectiveArmLocal = mod.SpawnObject(
-    mod.RuntimeSpawn_Common.SFX_GameModes_Rush_Armed_OneShot3D,
-    mod.CreateVector(0, 0, 0),
-    mod.CreateVector(0, 0, 0),
-    mod.CreateVector(0, 0, 0)
-  );
-
-  SFX_ObjectiveDefusedLocal = mod.SpawnObject(
-    mod.RuntimeSpawn_Common.SFX_GameModes_Rush_Defused_OneShot3D,
-    mod.CreateVector(0, 0, 0),
-    mod.CreateVector(0, 0, 0),
-    mod.CreateVector(0, 0, 0)
-  );
-
-  SFX_ObjectiveDefusingLocal = mod.SpawnObject(
-    mod.RuntimeSpawn_Common.SFX_GameModes_Rush_Defusing_SimpleLoop3D,
     mod.CreateVector(0, 0, 0),
     mod.CreateVector(0, 0, 0),
     mod.CreateVector(0, 0, 0)
@@ -11042,7 +9496,6 @@ function ensureAudioSpawned(): void {
     mod.CreateVector(0, 0, 0)
   );
 
-  ensureObjectiveMcomSfxSpawned();
 
 }
 
@@ -11052,16 +9505,6 @@ function forEachPlayerOnTeam(team: mod.Team, fn: (p: Player) => void): void {
   });
 }
 
-function stopCaptureTickLoop(playerId: number): void {
-  // Keep the token invalidation (in case other code expects it)
-  const t = captureTickLoopTokenByPlayerId[playerId] ?? 0;
-  captureTickLoopTokenByPlayerId[playerId] = t + 1;
-
-  const p = serverPlayers.get(playerId);
-  if (p && mod.IsPlayerValid(p.player)) {
-    stopCaptureTickLoopsForPlayer(p.player, playerId);
-  }
-}
 function stopEndgameLoop(playerId: number): void {
   const t = endgameLoopTokenByPlayerId[playerId] ?? 0;
   endgameLoopTokenByPlayerId[playerId] = t + 1;
@@ -11095,7 +9538,7 @@ async function startEndgameLoop(playerId: number, mode: "win" | "lose"): Promise
 
     // Use only sounds you already spawn and already know work.
     if (mode === "win") {
-      if (SFX_Endgame_WinningLoop) mod.PlaySound(SFX_CaptureBuildup, 0, sp.player);
+      if (SFX_Endgame_WinningLoop) mod.PlaySound(SFX_Endgame_WinningLoop, 0, sp.player);
     } else {
       if (SFX_CountdownHeartbeat) mod.PlaySound(SFX_CountdownHeartbeat, 0, sp.player);
     }
@@ -11107,78 +9550,6 @@ async function startEndgameLoop(playerId: number, mode: "win" | "lose"): Promise
 function StopAllEndgameLoops(): void {
   serverPlayers.forEach((p) => stopEndgameLoop(p.id));
 }
-
-async function startCaptureTickLoop(playerId: number): Promise<void> {
-  // Kill any previous loop and start a new one.
-  stopCaptureTickLoop(playerId);
-  const myToken = captureTickLoopTokenByPlayerId[playerId];
-
-  while (true) {
-    // Stop if token changed.
-    if (captureTickLoopTokenByPlayerId[playerId] !== myToken) return;
-
-    if (gameStatus !== 3) return;
-
-    const p = serverPlayers.get(playerId);
-    if (!p) return;
-
-    if (!p.isDeployed) return;
-    if (!mod.IsPlayerValid(p.player)) return;
-    if (!isPlayerAlive(p.player)) return;
-
-    const point = p.getCapturePoint();
-    if (!point) return;
-
-    const cp = serverCapturePoints[mod.GetObjId(point)];
-    if (!cp) return;
-
-    const onPointCounts = cp.getOnPoint();
-    const hasT1 = onPointCounts[0] > 0;
-    const hasT2 = onPointCounts[1] > 0;
-
-        const contested = hasT1 && hasT2;
-
-    const progress = cp.getCaptureProgress();
-    const inProgressBand = progress > PROGRESS_EMPTY && progress < PROGRESS_FULL;
-
-    const majorityTeam = getMajorityTeamOnPoint(cp);
-    const ownerTeam = cp.getOwner();
-
-    // "Working" means: your team has majority and you are not already the owner at full progress.
-    // This makes ticking start immediately even when progress is 0 at the beginning of a neutral capture.
-    const working =
-      !contested &&
-      !mod.Equals(majorityTeam, teamNeutral) &&
-      !mod.Equals(ownerTeam, majorityTeam);
-
-    // Only tick if contested, progress is moving, or we're actively working the objective.
-    if (contested || inProgressBand || working) {
-      if (contested) {
-        playTickEnemy(p.player);
-      } else {
-        const playerTeam = mod.GetTeam(p.player);
-
-        if (mod.Equals(majorityTeam, teamNeutral)) {
-          playTickEnemy(p.player);
-        } else if (mod.Equals(playerTeam, majorityTeam)) {
-          playTickFriendly(p.player);
-        } else {
-          playTickEnemy(p.player);
-        }
-      }
-    }
-
-
-    await mod.Wait(CAPTURE_TICK_INTERVAL_SECONDS);
-  }
-}
-function playCaptureBuildupBeat(receiver: mod.Player): void {
-  if (SFX_CaptureBuildup) {
-    // Slightly lower volume so it feels like a buildup, not a capture stinger.
-    mod.PlaySound(SFX_CaptureBuildup, 0.2, receiver);
-  }
-}
-
 
 function UpdateEndgameSuspenseAudio(): void {
   if (gameStatus !== 3) {
@@ -11238,181 +9609,6 @@ function UpdateEndgameSuspenseAudio(): void {
   });
 }
 
-
-async function playCaptureBuildupToCapturingTeamOnPoint(cp: CapturePoint, capturingTeam: mod.Team): Promise<void> {
-  // Rate limit per capture point so it does not spam.
-  const last = lastCaptureBuildupTickByCp[cp.id] ?? -999999;
-  if (serverTickCount - last < CAPTURE_BUILDUP_COOLDOWN_TICKS) return;
-  lastCaptureBuildupTickByCp[cp.id] = serverTickCount;
-
-  // Play a short 3-beat buildup only to the capturing team currently on the point.
-  for (let beat = 0; beat < CAPTURE_BUILDUP_BEATS; beat++) {
-    const ids = cp.getPlayerIdsOnPoint();
-
-    for (let i = 0; i < ids.length; i++) {
-      const pid = ids[i];
-      const p = serverPlayers.get(pid);
-      if (!p) continue;
-
-      if (!p.isDeployed) continue;
-      if (!mod.IsPlayerValid(p.player)) continue;
-      if (!isPlayerAlive(p.player)) continue;
-
-      if (!mod.Equals(mod.GetTeam(p.player), capturingTeam)) continue;
-
-      playCaptureBuildupBeat(p.player);
-    }
-
-    await mod.Wait(CAPTURE_BUILDUP_BEAT_INTERVAL_SECONDS);
-  }
-}
-
-function playTickFriendly(receiver: mod.Player): void {
-  // The CaptureObjectives ticking runtime spawners can be silent or unavailable in some Portal builds.
-  // Use the countdown heartbeat sound as the reliable capture tick.
-  if (SFX_TickFriendly) {
-    mod.PlaySound(SFX_TickFriendly, 0.1, receiver);
-    return;
-  }
-
-  // Fallbacks if heartbeat is not available for some reason.
-  if (SFX_ThumpFriendly) {
-    mod.PlaySound(SFX_ThumpFriendly, 0.2, receiver);
-    return;
-  }
-
-  if (SFX_TickFriendly) mod.PlaySound(SFX_TickFriendly, 0.1, receiver);
-}
-
-function playTickEnemy(receiver: mod.Player): void {
-  // Use the same reliable tick during contest/pressure.
-  if (SFX_TickEnemy) {
-    mod.PlaySound(SFX_TickEnemy, 0.2, receiver);
-    return;
-  }
-
-  // Fallbacks.
-  if (SFX_ThumpEnemy) {
-    mod.PlaySound(SFX_ThumpEnemy, 0.2, receiver);
-    return;
-  }
-
-  if (SFX_TickEnemy) mod.PlaySound(SFX_TickEnemy, 0.2, receiver);
-}
-
-function stopCaptureTickLoopsForPlayer(player: mod.Player, playerId: number): void {
-  // Stop both so we never overlap
-  if (SFX_TickFriendlyLoop) mod.StopSound(SFX_TickFriendlyLoop, player);
-  if (SFX_TickEnemyLoop) mod.StopSound(SFX_TickEnemyLoop, player);
-
-  captureTickLoopStateByPlayerId[playerId] = "none";
-}
-
-function setCaptureTickLoopForPlayer(player: mod.Player, playerId: number, desired: "none" | "friendly" | "enemy"): void {
-  const current = captureTickLoopStateByPlayerId[playerId] ?? "none";
-  if (current === desired) return;
-
-  // Always stop previous loop first
-  if (SFX_TickFriendlyLoop) mod.StopSound(SFX_TickFriendlyLoop, player);
-  if (SFX_TickEnemyLoop) mod.StopSound(SFX_TickEnemyLoop, player);
-
-  if (desired === "friendly") {
-    if (SFX_TickFriendlyLoop) mod.PlaySound(SFX_TickFriendlyLoop, 0.20, player);
-  } else if (desired === "enemy") {
-    if (SFX_TickEnemyLoop) mod.PlaySound(SFX_TickEnemyLoop, 0.20, player);
-  }
-
-  captureTickLoopStateByPlayerId[playerId] = desired;
-}
-
-function StopAllCaptureTickLoops(): void {
-  serverPlayers.forEach((p) => {
-    if (!p) return;
-    if (!mod.IsPlayerValid(p.player)) return;
-    stopCaptureTickLoopsForPlayer(p.player, p.id);
-  });
-}
-
-
-/*
-  Global loop manager:
-  - For each deployed/alive player, decide what they should hear:
-      none: not on a point or no contest/progress activity
-      friendly: player is on point AND their team is the majority capturing/neutralizing (not contested)
-      enemy: contested OR player is not majority OR majority is neutral
-  - Start/stop loops only on state changes (no spam).
-*/
-function UpdateCaptureTickLoopsGlobal(): void {
-  if (gameStatus !== 3) {
-    StopAllCaptureTickLoops();
-    return;
-  }
-
-  serverPlayers.forEach((sp) => {
-    if (!sp) return;
-
-    const player = sp.player;
-    const playerId = sp.id;
-
-    if (!sp.isDeployed || !mod.IsPlayerValid(player) || !isPlayerAlive(player)) {
-      if (mod.IsPlayerValid(player)) stopCaptureTickLoopsForPlayer(player, playerId);
-      return;
-    }
-
-    const point = sp.getCapturePoint();
-    if (!point) {
-      stopCaptureTickLoopsForPlayer(player, playerId);
-      return;
-    }
-
-    const cpWrap = serverCapturePoints[mod.GetObjId(point)];
-    if (!cpWrap) {
-      stopCaptureTickLoopsForPlayer(player, playerId);
-      return;
-    }
-
-    const on = cpWrap.getOnPoint();
-    const hasT1 = on[0] > 0;
-    const hasT2 = on[1] > 0;
-
-    const contested = hasT1 && hasT2;
-
-    const progress = cpWrap.getCaptureProgress();
-    const inProgressBand = progress > PROGRESS_EMPTY && progress < PROGRESS_FULL;
-
-    // If nothing is actually happening, do not play a tick loop
-    if (!contested && !inProgressBand) {
-      stopCaptureTickLoopsForPlayer(player, playerId);
-      return;
-    }
-
-    // Decide friendly vs enemy loop
-    if (contested) {
-      setCaptureTickLoopForPlayer(player, playerId, "enemy");
-      return;
-    }
-
-    const majority = getMajorityTeamOnPoint(cpWrap);
-    const myTeam = mod.GetTeam(player);
-
-    if (mod.Equals(majority, teamNeutral)) {
-      setCaptureTickLoopForPlayer(player, playerId, "enemy");
-      return;
-    }
-
-    if (mod.Equals(myTeam, majority)) setCaptureTickLoopForPlayer(player, playerId, "friendly");
-    else setCaptureTickLoopForPlayer(player, playerId, "enemy");
-  });
-}
-
-
-function playThumpFriendly(receiver: mod.Player): void {
-  if (SFX_ThumpFriendly) mod.PlaySound(SFX_ThumpFriendly, 0.8, receiver);
-}
-
-function playThumpEnemy(receiver: mod.Player): void {
-  if (SFX_ThumpEnemy) mod.PlaySound(SFX_ThumpEnemy, 0.8, receiver);
-}
 
 function playCountdownHeartbeatToAll(volume: number): void {
   if (!SFX_CountdownHeartbeat) return;
@@ -11663,35 +9859,6 @@ function getOpposingTeam(team: mod.Team): mod.Team {
   return teamNeutral;
 }
 
-function playObjectiveOutcomeVoForTeams(
-  kind: "arm" | "defuse" | "destroyed",
-  actingTeam: mod.Team,
-  symbol: ObjectiveLetter
-): void {
-  if (!mod.Equals(actingTeam, team1) && !mod.Equals(actingTeam, team2)) return;
-
-  const enemyTeam = getOpposingTeam(actingTeam);
-  if (!mod.Equals(enemyTeam, team1) && !mod.Equals(enemyTeam, team2)) return;
-
-  const flag = getVoiceOverFlagForSymbol(symbol);
-
-  if (kind === "arm") {
-    playVOToTeam(actingTeam, mod.VoiceOverEvents2D.MComArmFriendly, flag);
-    playVOToTeam(enemyTeam, mod.VoiceOverEvents2D.MComArmEnemy, flag);
-    return;
-  }
-
-  if (kind === "defuse") {
-    playVOToTeam(actingTeam, mod.VoiceOverEvents2D.MComDefuseFriendly, flag);
-    playVOToTeam(enemyTeam, mod.VoiceOverEvents2D.MComDefuseEnemy, flag);
-    return;
-  }
-
-  playVOToTeam(actingTeam, mod.VoiceOverEvents2D.MComDestroyedFriendly, flag);
-  playVOToTeam(enemyTeam, mod.VoiceOverEvents2D.MComDestroyedEnemy, flag);
-}
-
-
 function playPostMatchResultSfxOnce(): void {
   if (postmatchResultSfxPlayed) return;
   postmatchResultSfxPlayed = true;
@@ -11711,15 +9878,6 @@ function playPostMatchResultSfxOnce(): void {
   });
 }
 
-
-function canPlayCpSfx(cdTicks: number, lastMap: { [cpId: number]: number }, cpId: number): boolean {
-  const last = lastMap[cpId] ?? -9999999;
-  return serverTickCount - last >= cdTicks;
-}
-
-function markCpSfx(lastMap: { [cpId: number]: number }, cpId: number): void {
-  lastMap[cpId] = serverTickCount;
-}
 
 /* =================================================================================================
    6) UI (PARSE UI + PER-PLAYER HUD)
@@ -11868,8 +10026,8 @@ function applyPrematchPanelLayout(layout: PrematchPanelLayout, force: boolean = 
 
 let postMatchWidgetsToDelete: string[] = [];
 
-const POSTMATCH_SHOWCASE_PARENT_ID = 4747;
-const POSTMATCH_CAMERA_ID = 4646;
+const POSTMATCH_SHOWCASE_PARENT_ID = WORLD_IDS.postmatch.anchor;
+const POSTMATCH_CAMERA_ID = WORLD_IDS.postmatch.camera;
 const POSTMATCH_SHOWCASE_HEAD_TEXT_Y_OFFSET_METERS = 2.4;
 const POSTMATCH_SHOWCASE_FEET_TEXT_Y_OFFSET_METERS = -0.25;
 const POSTMATCH_RESULT_TEXT_Y = -360;
@@ -11970,7 +10128,7 @@ const POSTMATCH_SHOWCASE_RUNTIME_OBJECT_CONFIGS: PostmatchShowcaseRuntimeObjectC
     localRotation: mod.CreateVector(3.14159265, -1.56201727, 3.14159265),
   },
   {
-    key: "most_mcoms_destroyed_pedestal",
+    key: "most_nodes_ciphered_pedestal",
     asset: mod.RuntimeSpawn_Common.BarrierStoneBlock_01_A,
     localOffset: mod.CreateVector(-0.59240722, -0.59436035, 1.53784186),
     localRotation: mod.CreateVector(3.14159265, -1.56201727, 3.14159265),
@@ -11995,7 +10153,7 @@ const POSTMATCH_SHOWCASE_RUNTIME_OBJECT_CONFIGS: PostmatchShowcaseRuntimeObjectC
     localRotation: mod.CreateVector(0, -1.43722636, 0),
   },
   {
-    key: "most_mcoms_destroyed_anchor",
+    key: "most_nodes_ciphered_anchor",
     anchorId: 4546,
     asset: mod.RuntimeSpawn_Common.FiringRange_MatDecal_01,
     localOffset: mod.CreateVector(-0.58270266, 0.6274719, 1.59271247),
@@ -12217,12 +10375,12 @@ const UIWidget = modlib.ParseUI({
           name: "Container_A",
           type: "Container",
           position: safeContentPosFromTopLeft(
-            LIVE_SCORE_FLAG_ROW_LEFT,
-            LIVE_SCORE_FLAG_ROW_TOP,
-            LIVE_SCORE_FLAG_SIZE,
-            LIVE_SCORE_FLAG_SIZE
+            LIVE_SCORE_NODE_ROW_LEFT,
+            LIVE_SCORE_NODE_ROW_TOP,
+            LIVE_SCORE_NODE_SIZE,
+            LIVE_SCORE_NODE_SIZE
           ),
-          size: [LIVE_SCORE_FLAG_SIZE, LIVE_SCORE_FLAG_SIZE],
+          size: [LIVE_SCORE_NODE_SIZE, LIVE_SCORE_NODE_SIZE],
           anchor: mod.UIAnchor.Center,
           visible: false,
           padding: 0,
@@ -12234,12 +10392,12 @@ const UIWidget = modlib.ParseUI({
           name: "Container_B",
           type: "Container",
           position: safeContentPosFromTopLeft(
-            LIVE_SCORE_FLAG_ROW_LEFT + (LIVE_SCORE_FLAG_SIZE + LIVE_SCORE_FLAG_GAP),
-            LIVE_SCORE_FLAG_ROW_TOP,
-            LIVE_SCORE_FLAG_SIZE,
-            LIVE_SCORE_FLAG_SIZE
+            LIVE_SCORE_NODE_ROW_LEFT + (LIVE_SCORE_NODE_SIZE + LIVE_SCORE_NODE_GAP),
+            LIVE_SCORE_NODE_ROW_TOP,
+            LIVE_SCORE_NODE_SIZE,
+            LIVE_SCORE_NODE_SIZE
           ),
-          size: [LIVE_SCORE_FLAG_SIZE, LIVE_SCORE_FLAG_SIZE],
+          size: [LIVE_SCORE_NODE_SIZE, LIVE_SCORE_NODE_SIZE],
           anchor: mod.UIAnchor.Center,
           visible: false,
           padding: 0,
@@ -12251,12 +10409,12 @@ const UIWidget = modlib.ParseUI({
           name: "Container_C",
           type: "Container",
           position: safeContentPosFromTopLeft(
-            LIVE_SCORE_FLAG_ROW_LEFT + ((LIVE_SCORE_FLAG_SIZE + LIVE_SCORE_FLAG_GAP) * 2),
-            LIVE_SCORE_FLAG_ROW_TOP,
-            LIVE_SCORE_FLAG_SIZE,
-            LIVE_SCORE_FLAG_SIZE
+            LIVE_SCORE_NODE_ROW_LEFT + ((LIVE_SCORE_NODE_SIZE + LIVE_SCORE_NODE_GAP) * 2),
+            LIVE_SCORE_NODE_ROW_TOP,
+            LIVE_SCORE_NODE_SIZE,
+            LIVE_SCORE_NODE_SIZE
           ),
-          size: [LIVE_SCORE_FLAG_SIZE, LIVE_SCORE_FLAG_SIZE],
+          size: [LIVE_SCORE_NODE_SIZE, LIVE_SCORE_NODE_SIZE],
           anchor: mod.UIAnchor.Center,
           visible: false,
           padding: 0,
@@ -12268,12 +10426,12 @@ const UIWidget = modlib.ParseUI({
           name: "Container_D",
           type: "Container",
           position: safeContentPosFromTopLeft(
-            LIVE_SCORE_FLAG_ROW_LEFT + ((LIVE_SCORE_FLAG_SIZE + LIVE_SCORE_FLAG_GAP) * 3),
-            LIVE_SCORE_FLAG_ROW_TOP,
-            LIVE_SCORE_FLAG_SIZE,
-            LIVE_SCORE_FLAG_SIZE
+            LIVE_SCORE_NODE_ROW_LEFT + ((LIVE_SCORE_NODE_SIZE + LIVE_SCORE_NODE_GAP) * 3),
+            LIVE_SCORE_NODE_ROW_TOP,
+            LIVE_SCORE_NODE_SIZE,
+            LIVE_SCORE_NODE_SIZE
           ),
-          size: [LIVE_SCORE_FLAG_SIZE, LIVE_SCORE_FLAG_SIZE],
+          size: [LIVE_SCORE_NODE_SIZE, LIVE_SCORE_NODE_SIZE],
           anchor: mod.UIAnchor.Center,
           visible: false,
           padding: 0,
@@ -12396,7 +10554,7 @@ const UIWidget = modlib.ParseUI({
       textAnchor: mod.UIAnchor.Center
     },
     {
-      name: "Text_Mode_Domination",
+      name: "Text_Mode_Cipher",
       type: "Text",
       position: [72, 22],
       size: [130, 42],
@@ -12406,7 +10564,7 @@ const UIWidget = modlib.ParseUI({
       bgColor: [0.2, 0.2, 0.2],
       bgAlpha: 1,
       bgFill: mod.UIBgFill.None,
-      textLabel: mod.stringkeys.Text_Mode_Domination,
+      textLabel: mod.stringkeys.Text_Mode_Cipher,
       textColor: [1, 1, 1],
       textAlpha: 1,
       textSize: 22,
@@ -12597,7 +10755,6 @@ function HandlePrematchSwitchTeams(player: mod.Player): void {
   markPrematchTeamSwitchTick(playerId);
   p?.setTeam();
   setReadyPhaseProtectionForPlayer(player, true);
-  if (p) UpdateTopFlagColorsForPlayer(p);
   refreshPrematchReadyStateUi();
 }
 // Force key UI widgets to render AboveGameUI (above deploy screen / game UI layer)
@@ -12619,12 +10776,8 @@ function SetCountdownOverlayVisible(visible: boolean): void {
   SafeSetWidgetVisibleByName("CountDownText", visible);
 }
 
-function getTopHudFlagContainerWidgetName(lane: TopHudLane): string {
-  return "Container_" + lane;
-}
-
 function setLiveScorePanelVisible(visible: boolean): void {
-  // Always hide the old/shared Squad Obliteration HUD.
+  // Always hide the old shared objective HUD.
   // Cipher uses per-player widgets now.
   const rootHudWidgets = [
     "BG_Score_Container",
@@ -12769,14 +10922,16 @@ function hideCipherLiveHudForAllPlayers(): void {
 }
 
 /* -----------------------------------------------------------------------------------------------
-   Match start banner (DOMINATION splash)
+   Match start Cipher splash
 ------------------------------------------------------------------------------------------------ */
 
 const MATCH_START_BANNER_SHOW_SECONDS = 2.0;
 let matchStartBannerRunning = false;
 let hasShownMatchStartBanner = false;
+let matchStartBannerToken = 0;
 
 function resetMatchStartBannerState(resetShown: boolean = false): void {
+  matchStartBannerToken += 1;
   if (resetShown) hasShownMatchStartBanner = false;
   matchStartBannerRunning = false;
   SafeSetWidgetVisibleByName("Container_0NX1G", false);
@@ -12812,7 +10967,7 @@ const container0nx1gWidget = modlib.ParseUI({
       textAnchor: mod.UIAnchor.TopCenter,
     },
     {
-      name: "Intro_DOMINATION_Text",
+      name: "Intro_CIPHER_Text",
       type: "Text",
       position: safeRootPosFromTopCenter(0, 196, 720, 76),
       size: [720, 76],
@@ -12822,14 +10977,14 @@ const container0nx1gWidget = modlib.ParseUI({
       bgColor: [0.13, 0.15, 0.18],
       bgAlpha: 0.86,
       bgFill: mod.UIBgFill.Blur,
-      textLabel: mod.stringkeys.Text_Domination,
+      textLabel: mod.stringkeys.Text_CipherObliteration,
       textColor: [1, 1, 1],
       textAlpha: 1,
       textSize: 72,
       textAnchor: mod.UIAnchor.Center,
     },
     {
-      name: "Intro_DOMINATION_Line_Left",
+      name: "Intro_CIPHER_Line_Left",
       type: "Container",
       position: safeRootPosFromTopCenter(-410, 196, 96, 76),
       size: [96, 76],
@@ -12841,7 +10996,7 @@ const container0nx1gWidget = modlib.ParseUI({
       bgFill: mod.UIBgFill.GradientRight,
     },
     {
-      name: "Intro_DOMINATION_Line_Right",
+      name: "Intro_CIPHER_Line_Right",
       type: "Container",
       position: safeRootPosFromTopCenter(410, 196, 96, 76),
       size: [96, 76],
@@ -12862,16 +11017,19 @@ function Lerp(start: number, end: number, t: number): number {
 async function showMatchStartBannerOnce(): Promise<void> {
   if (hasShownMatchStartBanner || matchStartBannerRunning) return;
   matchStartBannerRunning = true;
+  matchStartBannerToken += 1;
+  const token = matchStartBannerToken;
   let root: mod.UIWidget | undefined = undefined;
 
   try {
     await mod.Wait(0.8); // Wait for the match start stinger to finish playing
+    if (token !== matchStartBannerToken || gameStatus !== 3) return;
 
     root = mod.FindUIWidgetWithName("Container_0NX1G");
-    const textW = mod.FindUIWidgetWithName("Intro_DOMINATION_Text");
+    const textW = mod.FindUIWidgetWithName("Intro_CIPHER_Text");
     const subtitleW = mod.FindUIWidgetWithName("Text_Cipher_Presents");
-    const leftW = mod.FindUIWidgetWithName("Intro_DOMINATION_Line_Left");
-    const rightW = mod.FindUIWidgetWithName("Intro_DOMINATION_Line_Right");
+    const leftW = mod.FindUIWidgetWithName("Intro_CIPHER_Line_Left");
+    const rightW = mod.FindUIWidgetWithName("Intro_CIPHER_Line_Right");
 
     if (!root || !textW || !subtitleW || !leftW || !rightW) {
       return;
@@ -12894,9 +11052,11 @@ async function showMatchStartBannerOnce(): Promise<void> {
       const titleSize = mod.Floor(Lerp(72, 46, progress));
       SafeSetTextSizeHandle(textW, titleSize);
       await mod.Wait(0.1);
+      if (token !== matchStartBannerToken || gameStatus !== 3) return;
     }
 
     await mod.Wait(MATCH_START_BANNER_SHOW_SECONDS);
+    if (token !== matchStartBannerToken || gameStatus !== 3) return;
 
     let currentLerpValue = 0;
     let lerpIncrement = 0;
@@ -12914,6 +11074,7 @@ async function showMatchStartBannerOnce(): Promise<void> {
       mod.SetUIWidgetBgAlpha(rightW, a);
 
       await mod.Wait(0.1);
+      if (token !== matchStartBannerToken || gameStatus !== 3) return;
     }
 
     mod.SetUIWidgetVisible(root, false);
@@ -12925,7 +11086,7 @@ async function showMatchStartBannerOnce(): Promise<void> {
       } catch (_hideErr) {}
     }
   } finally {
-    matchStartBannerRunning = false;
+    if (token === matchStartBannerToken) matchStartBannerRunning = false;
   }
 }
 
@@ -13014,7 +11175,7 @@ function resetPrematchRosterBuildState(): void {
 function setStaticPrematchPanelWidgetsVisible(visible: boolean): void {
   const staticNames = [
     "Text_Cipher_Esports",
-    "Text_Mode_Domination",
+    "Text_Mode_Cipher",
     "Text_Current_Map",
     "Container_NRDAA",
     "Text_Team_1",
@@ -13398,7 +11559,6 @@ function resolvePrematchReadyTextWidgetForPlayer(playerId: number): mod.UIWidget
 
 function deletePlayerLiveHudWidgets(playerId: number, privateSessionToken?: number): void {
   markCipherKeyHudDirtyForPlayer(playerId);
-  deleteLegacyPlayerLiveHudWidgets(playerId);
   safeDeleteWidgetByName("TeamFriendlyScore" + playerId);
   safeDeleteWidgetByName("TeamOpponentScore" + playerId);
   safeDeleteWidgetByName("TeamFriendlyScorePad0" + playerId);
@@ -13424,29 +11584,6 @@ function deletePlayerLiveHudWidgets(playerId: number, privateSessionToken?: numb
   safeDeleteWidgetByName(CIPHER_ENEMY_PROGRESS_BG_WIDGET_NAME_PREFIX + playerId);
   safeDeleteWidgetByName(CIPHER_ENEMY_PROGRESS_FILL_WIDGET_NAME_PREFIX + playerId);
 
-  const syms = TOP_HUD_LANES;
-  for (let i = 0; i < syms.length; i++) {
-    const s = syms[i];
-
-    safeDeleteWidgetByName("FLAG" + s + "_FILL" + playerId);
-    safeDeleteWidgetByName("FLAG" + s + playerId);
-    safeDeleteWidgetByName("FLAG" + s + "_OUTLINE" + playerId);
-    safeDeleteWidgetByName("FLAG" + s + "_INNER" + playerId);
-
-    // Thin outline frame pieces
-    safeDeleteWidgetByName("FLAG" + s + "_OL_T" + playerId);
-    safeDeleteWidgetByName("FLAG" + s + "_OL_B" + playerId);
-    safeDeleteWidgetByName("FLAG" + s + "_OL_L" + playerId);
-    safeDeleteWidgetByName("FLAG" + s + "_OL_R" + playerId);
-    safeDeleteWidgetByName("FLAG" + s + "_HOLD_BG" + playerId);
-    safeDeleteWidgetByName("FLAG" + s + "_HOLD_FILL" + playerId);
-  }
-
-  safeDeleteWidgetByName("ActiveFlag" + playerId);
-  safeDeleteWidgetByName("FriendlyCap" + playerId);
-  safeDeleteWidgetByName("EnemyCap" + playerId);
-  safeDeleteWidgetByName("CapProgress" + playerId);
-  safeDeleteWidgetByName("ActiveFlagContainer" + playerId);
   safeDeleteWidgetByName("FriendlyScorePulse" + playerId);
   safeDeleteWidgetByName("EnemyScorePulse" + playerId);
   safeDeleteWidgetByName("Text_BombCarrier" + playerId);
@@ -13472,8 +11609,6 @@ function deletePlayerLiveHudWidgets(playerId: number, privateSessionToken?: numb
   safeDeleteWidgetByName("ObjectiveHoldTextDisarming" + playerId);
   safeDeleteWidgetByName("ObjectiveHoldContainer" + playerId);
   safeDeleteWidgetByName("ObjectiveHoldRoot" + playerId);
-  safeDeleteWidgetByName("ObjectiveHoldBg" + playerId);
-  safeDeleteWidgetByName("ObjectiveHoldFill" + playerId);
   safeDeleteAllWidgetsByName(getDeployObjectiveTimerLaneFillWidgetName(playerId, privateSessionToken));
   safeDeleteAllWidgetsByName(getDeployObjectiveTimerLaneTextWidgetName(playerId, privateSessionToken));
   safeDeleteAllWidgetsByName(getDeployObjectiveTimerLaneOutlineTopWidgetName(playerId, privateSessionToken));
@@ -13659,41 +11794,6 @@ function getPlayerLiveHudRootWidgetName(playerId: number): string {
   return PLAYER_LIVE_HUD_ROOT_WIDGET_NAME_PREFIX + playerId;
 }
 
-function deleteLegacyPlayerLiveHudWidgets(playerId: number): void {
-  const legacyNames = [
-    "PlayerLiveHudRoot",
-    "Container_SCOREPANEL",
-    "Container_FRIENDLY_SCORE_BOX",
-    "Container_ENEMY_SCORE_BOX",
-    "Text_FRIENDLY_SCORE",
-    "Text_ENEMY_SCORE",
-    "Container_SCORE_TIME",
-    "Text_SCORE_TIME",
-    "Container_MATCH_TIME_BOX",
-    "Text_MATCH_TIME",
-    "Text_SCORE_LEAD",
-    "Text_CARRIER_NAME",
-    "Container_FRIENDLY_TICKER_BG",
-    "Container_FRIENDLY_TICKER_FILL",
-    "Container_ENEMY_TICKER_BG",
-    "Container_ENEMY_TICKER_FILL",
-    "Container_KEY_EVENT_BANNER",
-    "Container_OUTLINE",
-    "Container_DROPPED_KEY",
-    "Container_DROPPED_KEY_OUTLINE",
-    "Text_KEY_EVENT_TEXT",
-    "Text_DROPPED_KEY",
-    "Container_PLAYER_NAME",
-    "Text_PLAYER_NAME",
-    "Container_NextKeyUnlock",
-    "Text_NextKeyUnlock",
-  ];
-
-  for (let i = 0; i < legacyNames.length; i++) {
-    safeDeleteWidgetByName(legacyNames[i] + playerId);
-  }
-}
-
 function bindPlayerTopScoreWidgetRefs(p: Player): void {
   p.friendlyScoreWidget = SafeFindWidget(CIPHER_FRIENDLY_SCORE_TEXT_WIDGET_NAME_PREFIX + p.id) as any;
   p.opponentScoreWidget = SafeFindWidget(CIPHER_ENEMY_SCORE_TEXT_WIDGET_NAME_PREFIX + p.id) as any;
@@ -13849,7 +11949,6 @@ function rebuildPlayerTopScoreWidgets(p: Player): boolean {
   const playerId = p.id;
   const targetPlayer = p.player;
 
-  deleteLegacyPlayerLiveHudWidgets(playerId);
   safeDeleteWidgetByName("TeamFriendlyScore" + playerId);
   safeDeleteWidgetByName("TeamOpponentScore" + playerId);
   safeDeleteWidgetByName("TeamFriendlyScorePad0" + playerId);
@@ -13897,7 +11996,7 @@ function rebuildPlayerTopScoreWidgets(p: Player): boolean {
 
   try {
     // Dummy root only exists so the rest of the runtime can find the player's live HUD root.
-    // The visible HUD pieces below are intentionally ROOT-positioned like the working Squad Obliteration HUD.
+    // The visible HUD pieces below are intentionally root-positioned for stable Portal rendering.
     addHudNode({
       name: getPlayerLiveHudRootWidgetName(playerId),
       type: "Container",
@@ -14667,37 +12766,6 @@ function executeCipherAdminAction(player: mod.Player, playerId: number, action: 
 }
 
 
-function cleanupLegacySharedTopHudWidgets(): void {
-  const legacyNames = [
-    "FlagContainerA",
-    "FlagContainerB",
-    "FlagContainerC",
-    "FlagContainerD",
-    "FlagContainerE",
-    "FlagContainerF",
-    "friendlyprogressbar",
-    "friendlyprogressbarfill",
-    "friendlyprogress_pulse",
-    "enemyprogressbar",
-    "enemyprogressbarfill",
-    "enemyprogress_pulse",
-    "friendlyscore_pulse",
-    "enemyscore_pulse",
-  ];
-
-  for (let i = 0; i < legacyNames.length; i++) {
-    safeDeleteWidgetByName(legacyNames[i]);
-  }
-}
-
-function hasLiveHudFlagParentsReady(): boolean {
-  for (let i = 0; i < TOP_HUD_LANES.length; i++) {
-    const lane = TOP_HUD_LANES[i];
-    if (!mod.FindUIWidgetWithName(getTopHudFlagContainerWidgetName(lane))) return false;
-  }
-  return true;
-}
-
 function getStringMessageWithFallback(key: any, fallbackText: string): any {
   if (key !== undefined && key !== null) {
     try {
@@ -14742,14 +12810,6 @@ function rebuildPlayerLiveHudTopStage(p: Player): boolean {
   } else {
     setTopScoreWidgetDepthForPlayer(p.id);
   }
-    p.flagWidget = {} as any;
-    p.activeFlagContainerWidget = null as any;
-    p.activeFlagFriendlyWidget = null as any;
-    p.activeFlagEnemyWidget = null as any;
-    p.friendlyCapWidget = null as any;
-    p.enemyCapWidget = null as any;
-    p.activeFlagWidget = null as any;
-    p.progressBarWidget = null as any;
     UpdateTopTicketBarsForPlayer(p);
     return true;
 }
@@ -14809,8 +12869,6 @@ function rebuildObjectiveHoldProgressUiWidgetsForPlayer(p: Player): void {
   safeDeleteWidgetByName(getObjectiveHoldDisarmingTextWidgetName(playerId));
   safeDeleteWidgetByName(getObjectiveHoldContainerWidgetName(playerId));
   safeDeleteWidgetByName(getObjectiveHoldRootWidgetName(playerId));
-  safeDeleteWidgetByName("ObjectiveHoldBg" + playerId);
-  safeDeleteWidgetByName("ObjectiveHoldFill" + playerId);
 
   mod.AddUIContainer(
     getObjectiveHoldRootWidgetName(playerId),
@@ -14957,8 +13015,6 @@ function hideObjectiveHoldProgressForPlayer(playerId: number): void {
   const textArming = widgets.textArming ?? mod.FindUIWidgetWithName(getObjectiveHoldArmingTextWidgetName(playerId));
   const textDisarming =
     widgets.textDisarming ?? mod.FindUIWidgetWithName(getObjectiveHoldDisarmingTextWidgetName(playerId));
-  const legacyBg = mod.FindUIWidgetWithName("ObjectiveHoldBg" + playerId);
-  const legacyFill = mod.FindUIWidgetWithName("ObjectiveHoldFill" + playerId);
 
   SafeSetWidgetPositionHandle(fillArming, mod.CreateVector(0, 0, 0));
   SafeSetWidgetSizeHandle(fillArming, mod.CreateVector(OBJECTIVE_HOLD_FILL_MIN_WIDTH, OBJECTIVE_HOLD_FILL_HEIGHT, 0));
@@ -14973,8 +13029,6 @@ function hideObjectiveHoldProgressForPlayer(playerId: number): void {
   SafeSetWidgetVisibleHandle(textDisarming, false);
   SafeSetWidgetPositionHandle(container, mod.CreateVector(0, OBJECTIVE_HOLD_PROGRESS_BAR_OFFSET_Y, 0));
   SafeSetWidgetVisibleHandle(container, false);
-  SafeDeleteWidgetHandle(legacyBg);
-  SafeDeleteWidgetHandle(legacyFill);
 }
 
 function getDeployObjectiveTimerRootWidgetName(playerId: number, sessionToken?: number): string {
@@ -15082,7 +13136,7 @@ function rebuildDeployObjectiveTimerUiWidgetsForPlayer(p: Player): void {
     false,
     0,
     COLOR_NEUTRAL,
-    TOP_HUD_FLAG_FILL_BASE_ALPHA,
+    TOP_HUD_NODE_FILL_BASE_ALPHA,
     mod.UIBgFill.Blur,
     p.player
   );
@@ -15100,7 +13154,7 @@ function rebuildDeployObjectiveTimerUiWidgetsForPlayer(p: Player): void {
     false,
     0,
     COLOR_NEUTRAL,
-    TOP_HUD_FLAG_OUTLINE_BASE_ALPHA,
+    TOP_HUD_NODE_OUTLINE_BASE_ALPHA,
     mod.UIBgFill.Solid,
     p.player
   );
@@ -15118,7 +13172,7 @@ function rebuildDeployObjectiveTimerUiWidgetsForPlayer(p: Player): void {
     false,
     0,
     COLOR_NEUTRAL,
-    TOP_HUD_FLAG_OUTLINE_BASE_ALPHA,
+    TOP_HUD_NODE_OUTLINE_BASE_ALPHA,
     mod.UIBgFill.Solid,
     p.player
   );
@@ -15136,7 +13190,7 @@ function rebuildDeployObjectiveTimerUiWidgetsForPlayer(p: Player): void {
     false,
     0,
     COLOR_NEUTRAL,
-    TOP_HUD_FLAG_OUTLINE_BASE_ALPHA,
+    TOP_HUD_NODE_OUTLINE_BASE_ALPHA,
     mod.UIBgFill.Solid,
     p.player
   );
@@ -15154,7 +13208,7 @@ function rebuildDeployObjectiveTimerUiWidgetsForPlayer(p: Player): void {
     false,
     0,
     COLOR_NEUTRAL,
-    TOP_HUD_FLAG_OUTLINE_BASE_ALPHA,
+    TOP_HUD_NODE_OUTLINE_BASE_ALPHA,
     mod.UIBgFill.Solid,
     p.player
   );
@@ -15177,7 +13231,7 @@ function rebuildDeployObjectiveTimerUiWidgetsForPlayer(p: Player): void {
     mod.Message(mod.stringkeys.FLAGA),
     DEPLOY_OBJECTIVE_TIMER_LANE_TEXT_SIZE,
     COLOR_NEUTRAL,
-    TOP_HUD_FLAG_TEXT_BASE_ALPHA,
+    TOP_HUD_NODE_TEXT_BASE_ALPHA,
     mod.UIAnchor.Center,
     p.player
   );
@@ -15420,15 +13474,15 @@ function UpdateDeployObjectiveTimerUiForPlayer(p: Player, nowSec?: number): void
   SafeSetWidgetBgColorHandle(outlineLeft, displayColor);
   SafeSetWidgetBgColorHandle(outlineRight, displayColor);
   SafeSetTextColorHandle(laneText, displayColor);
-  SafeSetWidgetBgAlphaHandle(laneFill, TOP_HUD_FLAG_FILL_BASE_ALPHA);
-  SafeSetWidgetBgAlphaHandle(outlineTop, TOP_HUD_FLAG_OUTLINE_BASE_ALPHA);
-  SafeSetWidgetBgAlphaHandle(outlineBottom, TOP_HUD_FLAG_OUTLINE_BASE_ALPHA);
-  SafeSetWidgetBgAlphaHandle(outlineLeft, TOP_HUD_FLAG_OUTLINE_BASE_ALPHA);
-  SafeSetWidgetBgAlphaHandle(outlineRight, TOP_HUD_FLAG_OUTLINE_BASE_ALPHA);
-  SafeSetTextAlphaHandle(laneText, TOP_HUD_FLAG_TEXT_BASE_ALPHA);
+  SafeSetWidgetBgAlphaHandle(laneFill, TOP_HUD_NODE_FILL_BASE_ALPHA);
+  SafeSetWidgetBgAlphaHandle(outlineTop, TOP_HUD_NODE_OUTLINE_BASE_ALPHA);
+  SafeSetWidgetBgAlphaHandle(outlineBottom, TOP_HUD_NODE_OUTLINE_BASE_ALPHA);
+  SafeSetWidgetBgAlphaHandle(outlineLeft, TOP_HUD_NODE_OUTLINE_BASE_ALPHA);
+  SafeSetWidgetBgAlphaHandle(outlineRight, TOP_HUD_NODE_OUTLINE_BASE_ALPHA);
+  SafeSetTextAlphaHandle(laneText, TOP_HUD_NODE_TEXT_BASE_ALPHA);
 
   if (p.deployObjectiveTimerLastShownCpId !== armedCpId) {
-    SafeSetTextLabelHandle(laneText, mod.Message(getFlagStringKey(lane)));
+    SafeSetTextLabelHandle(laneText, mod.Message(getLaneStringKey(lane)));
     p.deployObjectiveTimerLastShownCpId = armedCpId;
     p.deployObjectiveTimerLastShownRemainingSeconds = -1;
   }
@@ -16090,23 +14144,23 @@ function clearBombNoticeState(): void {
   queueCipherKeyUiRefresh("clearBombNoticeState", { force: true, refreshBombNotice: true }, 1);
 }
 
-async function hideBombNoticeForPlayerAfterDelay(
+function scheduleBombNoticeHide(
   playerId: number,
   token: number,
   durationSeconds: number
-): Promise<void> {
-  await mod.Wait(durationSeconds);
-  if ((bombNoticeTokenByPlayerId[playerId] ?? 0) !== token) return;
-
-  bombNoticeVisibleUntilSecByPlayerId[playerId] = 0;
-  delete bombNoticeDetailMessageByPlayerId[playerId];
-  delete bombNoticeToneByPlayerId[playerId];
-  delete bombNoticeKindByPlayerId[playerId];
-  queueCipherKeyUiRefresh(
-    "hideBombNoticeForPlayerAfterDelay/" + String(playerId),
-    { force: true, refreshBombNotice: true },
-    1
-  );
+): void {
+  scheduleCipherGlobalTask(durationSeconds, "bomb_notice_hide/" + String(playerId), () => {
+    if ((bombNoticeTokenByPlayerId[playerId] ?? 0) !== token) return;
+    bombNoticeVisibleUntilSecByPlayerId[playerId] = 0;
+    delete bombNoticeDetailMessageByPlayerId[playerId];
+    delete bombNoticeToneByPlayerId[playerId];
+    delete bombNoticeKindByPlayerId[playerId];
+    queueCipherKeyUiRefresh(
+      "scheduleBombNoticeHide/" + String(playerId),
+      { force: true, refreshBombNotice: true },
+      1
+    );
+  });
 }
 
 function showBombNoticeForAllPlayers(
@@ -16155,7 +14209,7 @@ function showBombNoticeForPlayerDetailed(
     { force: true, refreshBombNotice: true },
     0
   );
-  void hideBombNoticeForPlayerAfterDelay(playerId, token, durationSeconds);
+  scheduleBombNoticeHide(playerId, token, durationSeconds);
 }
 
 function showBombNoticeForPlayer(
@@ -16319,34 +14373,6 @@ function ClampTicketsAndMaybeEndMatch(): void {
   if (serverScores[0] >= WIN_SCORE || serverScores[1] >= WIN_SCORE) {
     finalizePendingObjectiveAwardsForImmediateTransition("ClampTicketsAndMaybeEndMatch");
     enterPostmatchFromLive();
-  }
-}
-
-function ClearAllTicketBleedPulses(): void {
-  return;
-}
-
-
-function ChangeTickets(): void {
-  // First-to-2 mode: score changes only on enemy-owned flag captures.
-  // Keep pulse cleanup and centralized win evaluation in this periodic path.
-  ClearAllTicketBleedPulses();
-  ClampTicketsAndMaybeEndMatch();
-}
-
-
-// Ticket bar fills are per-player; keep shared fills hidden.
-function HideSharedTicketBarFills(): void {
-  // Progress bars were removed from the top score panel.
-}
-function UpdateTopFlagColorsForPlayer(p: Player): void {
-  void p;
-}
-
-function UpdateTopFlagColorsForAllPlayers(): void {
-  const players = getValidHumanPlayersSnapshot();
-  for (let i = 0; i < players.length; i++) {
-    UpdateTopFlagColorsForPlayer(players[i]);
   }
 }
 
@@ -16759,7 +14785,6 @@ function resetCipherObjectivesForCurrentStage(context: string): void {
   resetCipherObjectiveCounters();
   applyObjectiveLiveHybridRoundStartState(true);
   syncLiveHybridObjectiveSurfaceState(context, true);
-  scheduleDelayedObjectiveSurfaceReassert(context);
   updateCipherCounterWorldIcons(true);
 }
 
@@ -17987,23 +16012,24 @@ function clearCipherLivePhaseTransitionRuntimeState(
   }
 }
 
-async function reassertCipherLiveInputUnlocksForStage(
+function scheduleCipherLiveInputUnlockReasserts(
   expectedStage: CipherMatchStage,
   source: string
-): Promise<void> {
-  const waits = [0, 0.25, 0.75, 1.0];
-  for (let i = 0; i < waits.length; i++) {
-    if (waits[i] > 0) await mod.Wait(waits[i]);
-    if (gameStatus !== 3) return;
-    if (cipherMatchStage !== expectedStage) return;
-    if (cipherSecondHalfTransitionStage !== "none") return;
-    hardUnlockCipherLiveInputsForAllPlayers(source);
+): void {
+  const delays = [0.25, 0.75, 1.0];
+  for (let i = 0; i < delays.length; i++) {
+    scheduleCipherGlobalTask(delays[i], "live_input_unlock/" + source, () => {
+      if (gameStatus !== 3) return;
+      if (cipherMatchStage !== expectedStage) return;
+      if (cipherSecondHalfTransitionStage !== "none") return;
+      hardUnlockCipherLiveInputsForAllPlayers(source);
+    });
   }
 }
 
 function startCipherPostTransitionLiveInputUnlock(expectedStage: CipherMatchStage, source: string): void {
   hardUnlockCipherLiveInputsForAllPlayers(source);
-  void reassertCipherLiveInputUnlocksForStage(expectedStage, source);
+  scheduleCipherLiveInputUnlockReasserts(expectedStage, source);
 }
 
 function markCipherSecondHalfDeployRequiredPlayers(): void {
@@ -18530,8 +16556,6 @@ function prepareCipherHalfForLive(
   ConfigureLiveSpawns();
   serverPlayers.forEach((p) => {
     mod.SetRedeployTime(p.player, redeploySeconds);
-    p.setCapturePoint(null);
-    UpdateTopFlagColorsForPlayer(p);
   });
 }
 
@@ -18669,10 +16693,11 @@ function scheduleCipherLiveStartKeySpawn(
   const token = cipherDeferredLiveStartKeyToken + 1;
   cipherDeferredLiveStartKeyToken = token;
   armCipherLiveKeyWatchdog(expectedHalf, expectedStage, getCurrentSchedulerNowSeconds(), context);
-  Timers.clearTimeout(cipherDeferredLiveStartKeyTimerHandle);
-  cipherDeferredLiveStartKeyTimerHandle = Timers.setTimeout(
-    () => runDeferredCipherLiveStartKeySpawn(token, expectedHalf, expectedStage, context),
-    CIPHER_DEFERRED_LIVE_START_KEY_DELAY_SECONDS * 1000
+  cancelCipherGlobalTask(cipherDeferredLiveStartKeyTimerHandle);
+  cipherDeferredLiveStartKeyTimerHandle = scheduleCipherGlobalTask(
+    CIPHER_DEFERRED_LIVE_START_KEY_DELAY_SECONDS,
+    "live_start_key/" + context,
+    () => runDeferredCipherLiveStartKeySpawn(token, expectedHalf, expectedStage, context)
   );
 }
 
@@ -19040,7 +17065,6 @@ function safeUndeployOneHumanForTransition(playerId: number, source: string): vo
   }
 
   p.isDeployed = false;
-  p.setCapturePoint(null);
   clearCipherSecondHalfDeployReadyForPlayer(p.id, true);
 }
 
@@ -19061,7 +17085,7 @@ function beginCipherTransitionPreDeployReset(nowSec: number, source: string): vo
     detachNativeBombBeforeTransitionCleanup(source);
     buildCipherTransitionBotRemovalQueue();
     buildCipherTransitionHumanUndeployQueue();
-    applyCipherSecondHalfHqDisableOnly(source + "_hq_disable");
+    applyCipherIncomingSecondHalfHqProfile(source + "_hq_profile");
     startCipherTransitionSupervisorStage("predeployReset", CIPHER_TRANSITION_PREDEPLOY_STAGE_SECONDS, nowSec);
   }
 
@@ -19165,7 +17189,7 @@ function tickCipherTransitionPreDeployReset(nowSec: number): void {
 
   // Move the heavy deploy-stage entry out of the same tick that finished undeploy/unspawn cleanup.
   // This avoids Portal crashing exactly when the 0-second switching-sides cleanup completes.
-  Timers.setTimeout(() => {
+  scheduleCipherGlobalTask(0.15, "transition_predeploy/" + source, () => {
     const enterNowSec = getCurrentSchedulerNowSeconds();
     if (gameStatus !== 3) return;
     if (!isCipherLiveTransitionActive()) return;
@@ -19179,7 +17203,7 @@ function tickCipherTransitionPreDeployReset(nowSec: number): void {
       LogRuntimeError("TransitionPreDeployReset/enterDeploy/" + source, err);
       recoverCipherTransitionSupervisorTickFailure(enterNowSec, "predeployReset", err);
     }
-  }, 150);
+  });
 }
 
 function prepareCipherTransitionDeployStageLight(kind: CipherLiveTransitionSupervisorKind, context: string): void {
@@ -19251,7 +17275,6 @@ function enterCipherSecondHalfDeploySupervisorStage(nowSec: number): void {
 
     try {
       mod.SetRedeployTime(p.player, 0);
-      p.setCapturePoint(null);
       clearCipherSecondHalfDeployReadyForPlayer(p.id, true);
       delete cipherTransitionDeploySeenByPlayerId[p.id];
       if (isRequiredSecondHalfDeployPlayer(p)) {
@@ -19295,7 +17318,6 @@ function restoreCipherTransitionPlayersForLive(redeploySeconds: number, context:
       if (!p || !mod.IsPlayerValid(p.player)) return;
       mod.SetRedeployTime(p.player, redeploySeconds);
       setReadyPhaseProtectionForPlayer(p.player, false);
-      p.setCapturePoint(null);
     } catch (err) {
       LogRuntimeError("TransitionComplete/playerRestore/" + context + "/" + String(p?.id ?? -1), err);
     }
@@ -19407,7 +17429,6 @@ function prepareCipherTransitionScriptStateForLiveStage(
   resetCipherSuddenDeathState();
   clearAllCipherNodeRebootState(context, false);
   resetCipherSpawnRoutingState();
-  captureCreditByCpId = {};
   objectiveAreaActiveTriggersByPlayerId = {};
   objectiveAreaLastEnteredTriggerByPlayerId = {};
   clearBotObjectiveAssignments();
@@ -19419,13 +17440,7 @@ function resetCipherTransitionObjectiveRuntimeOnly(context: string): void {
   disableAllObjectiveInteractPoints(context + "_interacts");
   for (let i = 0; i < OBJECTIVE_DEFINITIONS.length; i++) {
     const cpId = OBJECTIVE_DEFINITIONS[i].cpId;
-    const cp = serverCapturePoints[cpId];
-    if (cp) {
-      (cp as any)._capturingTeam = teamNeutral;
-      (cp as any)._captureProgress = 0;
-      (cp as any)._previousCaptureProgress = 0;
-      cp.clearOnPoint();
-    }
+    void cpId;
   }
 }
 
@@ -19486,11 +17501,10 @@ function applyCipherMinimalHalfObjectiveSurface(half: CipherHalfIndex, context: 
   disableCipherObjectiveHalfSurface(inactiveHalf, context + "_inactive_cps");
   enableCipherObjectiveHalfSector(half, context + "_active_sector");
   enableCipherObjectiveHalfCapturePoints(half, context + "_active_cps");
-  disableHardObjectiveMcoms(context + "_hard_mcoms");
 }
 
-function applyCipherSecondHalfHqDisableOnly(_context: string): void {
-  setCipherHqPhaseProfile("transition_disabled", []);
+function applyCipherIncomingSecondHalfHqProfile(_context: string): void {
+  setCipherHqPhaseProfile("half2", [TEAM1_LIVE_HQ, TEAM2_LIVE_HQ]);
 }
 
 function applyCipherSecondHalfHqEnableOnly(context: string): void {
@@ -19642,7 +17656,6 @@ function forceFinishCipherTransitionFinalizer(nowSec: number, reason: string): v
 
   try {
     updateCipherCounterWorldIcons(true);
-    UpdateTopFlagColorsForAllPlayers();
   } catch (err) {
     LogRuntimeError("TransitionWatchdog/objectiveIcons/" + context, err);
   }
@@ -19724,9 +17737,6 @@ function beginCipherTransitionFinalizer(
     enqueueCipherTransitionWork(token, context + "/enableHalf2Cps", "heavy", () =>
       enableCipherObjectiveHalfCapturePoints(2, context + "_enable_half2_cps")
     );
-    enqueueCipherTransitionWork(token, context + "/hardDisableMcoms", "heavy", () =>
-      disableHardObjectiveMcoms(context + "_hard_mcoms")
-    );
     enqueueCipherTransitionWork(token, context + "/restorePlayers", "heavy", () =>
       restoreCipherTransitionPlayersForLive(REDEPLOY_TIME, context)
     );
@@ -19738,7 +17748,6 @@ function beginCipherTransitionFinalizer(
     });
     enqueueCipherTransitionWork(token, context + "/objectiveIcons", "heavy", () => {
       updateCipherCounterWorldIcons(true);
-      UpdateTopFlagColorsForAllPlayers();
     });
     enqueueCipherTransitionWork(token, context + "/uiSync", "normal", () => {
       UpdateScoreboard();
@@ -19775,7 +17784,6 @@ function beginCipherTransitionFinalizer(
     });
     enqueueCipherTransitionWork(token, context + "/objectiveIcons", "heavy", () => {
       updateCipherCounterWorldIcons(true);
-      UpdateTopFlagColorsForAllPlayers();
     });
     enqueueCipherTransitionWork(token, context + "/uiSync", "normal", () => {
       UpdateScoreboard();
@@ -19902,13 +17910,13 @@ function tickCipherLiveTransitionSupervisorUnsafe(nowSec: number): boolean {
     if (remaining <= 0 && !cipherTransitionIntermissionHandoffScheduled) {
       cipherTransitionIntermissionHandoffScheduled = true;
       const handoffKind = cipherLiveTransitionSupervisorKind;
-      Timers.setTimeout(() => {
+      scheduleCipherGlobalTask(0.75, "transition_intermission_handoff", () => {
         const handoffNowSec = getCurrentSchedulerNowSeconds();
         if (gameStatus !== 3) return;
         if (cipherLiveTransitionSupervisorKind !== handoffKind) return;
         if (cipherSecondHalfTransitionStage !== "intermission") return;
         beginCipherTransitionPreDeployReset(handoffNowSec, handoffKind + "_intermission_complete_delayed");
-      }, 750);
+      });
     }
 
     return true;
@@ -19984,7 +17992,7 @@ function beginCipherSecondHalfSupervisor(
   // The 5-second switching-sides screen should play first.
   // Bot unspawn + human undeploy happens after intermission, right before the 30-second deploy phase.
   clearCipherLivePhaseTransitionRuntimeState("second_half_supervisor_enter", true, true);
-  applyCipherSecondHalfHqDisableOnly("second_half_supervisor_enter_hq_disable");
+  applyCipherIncomingSecondHalfHqProfile("second_half_supervisor_enter_hq_profile");
 
   cipherSecondHalfTransitionStage = "intermission";
   cipherTransitionUndeployCursor = 0;
@@ -20048,7 +18056,7 @@ function beginCipherSuddenDeathSupervisor(nowSec: number): void {
   // Do NOT clear bots or undeploy players here.
   // Let the 5-second transition notice finish first.
   clearCipherLivePhaseTransitionRuntimeState("sudden_death_supervisor_enter", true, true);
-  applyCipherSecondHalfHqDisableOnly("sudden_death_supervisor_enter_hq_disable");
+  applyCipherIncomingSecondHalfHqProfile("sudden_death_supervisor_enter_hq_profile");
 
   cipherSecondHalfTransitionStage = "intermission";
   cipherTransitionUndeployCursor = 0;
@@ -20133,7 +18141,7 @@ function normalizeCipherPostmatchWinnerTeam(candidate: mod.Team | undefined): mo
 
 function clearDeferredCipherTimeoutTransitionTimer(): void {
   if (cipherTimeoutTransitionTimer !== undefined) {
-    Timers.clearTimeout(cipherTimeoutTransitionTimer);
+    cancelCipherGlobalTask(cipherTimeoutTransitionTimer);
   }
 
   cipherTimeoutTransitionTimer = undefined;
@@ -20167,7 +18175,7 @@ function scheduleCipherTimeoutPhaseTransition(
 
   // Match the safer VIP Escort pattern: the timeout only requests a phase transition.
   // Heavy phase changes happen later from a clean timer/supervisor stack, not inside the live tick.
-  cipherTimeoutTransitionTimer = Timers.setTimeout(() => {
+  cipherTimeoutTransitionTimer = scheduleCipherGlobalTask(0.25, "timeout_transition/" + source, () => {
     if (token !== cipherTimeoutTransitionToken) return;
 
     cipherTimeoutTransitionTimer = undefined;
@@ -20209,13 +18217,13 @@ function scheduleCipherTimeoutPhaseTransition(
         LogRuntimeError("DeferredCipherTimeoutTransitionFallback/" + source + "/" + outcome, fallbackErr);
       }
     }
-  }, 250);
+  });
 }
 
 
 function clearPostmatchEndTimer(): void {
   if (postmatchEndTimer !== undefined) {
-    Timers.clearTimeout(postmatchEndTimer);
+    cancelCipherGlobalTask(postmatchEndTimer);
   }
 
   postmatchEndTimer = undefined;
@@ -20264,7 +18272,7 @@ function schedulePostmatchEndGameModeFallback(source: string): void {
   // If the engine ignores EndGameMode at 20s, retry every second after the first full-duration call.
   const delayMs = source.indexOf("_retry") >= 0 ? POSTMATCH_END_RETRY_MS : POSTMATCH_TIME * 1000;
 
-  postmatchEndTimer = Timers.setTimeout(() => {
+  postmatchEndTimer = scheduleCipherGlobalTask(delayMs / 1000, "postmatch_end/" + source, () => {
     if (token !== postmatchEndToken) return;
     postmatchEndTimer = undefined;
     if (gameStatus !== 4) return;
@@ -20275,7 +18283,7 @@ function schedulePostmatchEndGameModeFallback(source: string): void {
     if (gameStatus === 4) {
       schedulePostmatchEndGameModeFallback(source + "_retry");
     }
-  }, delayMs);
+  });
 }
 
 function enterPostmatchFromLive(forcedWinner?: mod.Team): void {
@@ -20365,7 +18373,7 @@ function scheduleCipherSuddenDeathEliminatedPlayerCleanup(playerId: number, sour
     LogRuntimeError("SuddenDeathCleanupSetRedeploy/" + source + "/" + String(playerId), err);
   }
 
-  Timers.setTimeout(() => {
+  scheduleCipherGlobalTask(0.1, "sudden_death_undeploy/" + source, () => {
     if (cipherSuddenDeathForcedUndeployTokenByPlayerId[playerId] !== token) return;
     if (!isCurrentPlayerSession(playerId, sessionToken)) return;
     if (gameStatus !== 3 || cipherMatchStage !== expectedMatchStage) return;
@@ -20386,7 +18394,7 @@ function scheduleCipherSuddenDeathEliminatedPlayerCleanup(playerId: number, sour
       LogRuntimeError("SuddenDeathCleanupUndeploy/" + source + "/" + String(playerId), err);
       delete cipherSuddenDeathForcedUndeployTokenByPlayerId[playerId];
     }
-  }, 100);
+  });
 }
 
 function scheduleCipherSuddenDeathPostmatch(winner: mod.Team, source: string): void {
@@ -20407,7 +18415,7 @@ function scheduleCipherSuddenDeathPostmatch(winner: mod.Team, source: string): v
 
   // Do not enter postmatch directly inside mandown/death/score event stacks.
   // Portal can crash if we clear objectives/UI/key state while the engine is still processing combat events.
-  Timers.setTimeout(() => {
+  scheduleCipherGlobalTask(0.25, "sudden_death_postmatch/" + source, () => {
     if (token !== cipherSuddenDeathPostmatchToken) return;
     if (gameStatus !== 3 || cipherMatchStage !== "suddenDeath") {
       cipherSuddenDeathPostmatchPending = false;
@@ -20419,7 +18427,7 @@ function scheduleCipherSuddenDeathPostmatch(winner: mod.Team, source: string): v
     } catch (err) {
       LogRuntimeError("SuddenDeathPostmatch/" + source, err);
     }
-  }, 250);
+  });
 }
 
 function consumeCipherSuddenDeathLife(playerId: number, source: string): void {
@@ -20698,6 +18706,7 @@ type PlayerDeployHydrationJob = {
   expectedGameStatus: number;
   expectedMatchStage: CipherMatchStage;
   expectedTransitionToken: number;
+  lifeGeneration: number;
 };
 type PlayerLeaveCleanupJob = {
   playerId: number;
@@ -20727,6 +18736,7 @@ const PLAYER_JOIN_REQUIRED_STABLE_SAMPLES = 2;
 const PLAYER_JOIN_WATCHDOG_MS = 10000;
 let playerSessionTokenCounter = 0;
 let playerSessionTokenByPlayerId: { [playerId: number]: number | undefined } = {};
+let playerLifeGenerationByPlayerId: { [playerId: number]: number | undefined } = {};
 let playerDisconnectedAtTickByPlayerId: { [playerId: number]: number | undefined } = {};
 let cipherSuddenDeathJoinAliveExemptByPlayerId: { [playerId: number]: boolean | undefined } = {};
 let cipherSuddenDeathJoinCleanupQueuedByPlayerId: { [playerId: number]: boolean | undefined } = {};
@@ -20742,6 +18752,7 @@ function beginPlayerSessionForJoin(playerId: number): number {
   playerSessionTokenCounter += 1;
   playerSessionTokenByPlayerId[playerId] = playerSessionTokenCounter;
   delete playerDisconnectedAtTickByPlayerId[playerId];
+  playerLifeGenerationByPlayerId[playerId] = 0;
   return playerSessionTokenCounter;
 }
 
@@ -20749,6 +18760,17 @@ function invalidatePlayerSessionForDisconnect(playerId: number): void {
   playerSessionTokenCounter += 1;
   playerSessionTokenByPlayerId[playerId] = playerSessionTokenCounter;
   playerDisconnectedAtTickByPlayerId[playerId] = serverTickCount;
+  delete playerLifeGenerationByPlayerId[playerId];
+}
+
+function getPlayerLifeGeneration(playerId: number): number {
+  return playerLifeGenerationByPlayerId[playerId] ?? 0;
+}
+
+function beginNextPlayerLife(playerId: number): number {
+  const next = getPlayerLifeGeneration(playerId) + 1;
+  playerLifeGenerationByPlayerId[playerId] = next;
+  return next;
 }
 
 function isCurrentPlayerSession(playerId: number, token: number | undefined): boolean {
@@ -20835,12 +18857,8 @@ function isQueuedPlayerWorkCurrent(
 function resetPlayerSessionRefsForJoin(p: Player, preserveActiveLiveState: boolean): void {
   if (!preserveActiveLiveState) {
     p.isDeployed = false;
-    p.setCapturePoint(null);
   }
 
-  p.friendlyCapWidget = null as any;
-  p.enemyCapWidget = null as any;
-  p.progressBarWidget = null as any;
   p.friendlyScoreWidget = null as any;
   p.opponentScoreWidget = null as any;
   p.friendlyScorePadWidget = null as any;
@@ -20889,11 +18907,6 @@ function resetPlayerSessionRefsForJoin(p: Player, preserveActiveLiveState: boole
   p.cipherSuddenDeathEnemyAliveWidget = null as any;
   p.cipherSuddenDeathFriendlyAliveSlotWidgets = [];
   p.cipherSuddenDeathEnemyAliveSlotWidgets = [];
-  p.flagWidget = {} as any;
-  p.activeFlagContainerWidget = null as any;
-  p.activeFlagFriendlyWidget = null as any;
-  p.activeFlagEnemyWidget = null as any;
-  p.activeFlagWidget = null as any;
 
   clearLiveHudQueueForPlayer(p.id);
   clearPhasePlayerOperationsForPlayer(p.id);
@@ -20978,8 +18991,6 @@ function clearVolatilePlayerSessionState(playerId: number, source: string): void
   cipherUrgentSpawnJobs = cipherUrgentSpawnJobs.filter((item) => item.playerId !== playerId);
   delete cipherQueuedAnchorByPlayerId[playerId];
   invalidateCipherRespawnRouteJobForPlayer(playerId);
-  bumpSafeSpawnGeneration(playerId);
-  clearQueuedSafeSpawnStateForPlayer(playerId);
   clearObjectiveCaptureAttemptStateForPlayerDataOnly(playerId);
   clearAllObjectiveAreaTriggerStateForPlayer(playerId);
   clearCipherPresenceForPlayer(playerId);
@@ -21138,6 +19149,7 @@ function queuePlayerDeployHydration(playerId: number): void {
     expectedGameStatus: gameStatus,
     expectedMatchStage: cipherMatchStage,
     expectedTransitionToken: getQueuedPlayerWorkTransitionToken(),
+    lifeGeneration: getPlayerLifeGeneration(playerId),
   });
 }
 
@@ -21293,7 +19305,7 @@ function hydrateDeployedHumanPlayer(job: PlayerDeployHydrationJob): void {
     job.expectedGameStatus,
     job.expectedMatchStage,
     job.expectedTransitionToken
-  )) return;
+  ) || job.lifeGeneration !== getPlayerLifeGeneration(job.playerId)) return;
   const p = serverPlayers.get(job.playerId);
   if (!p || !mod.IsPlayerValid(p.player)) return;
   const player = p.player;
@@ -21357,23 +19369,22 @@ function hydrateDeployedHumanPlayer(job: PlayerDeployHydrationJob): void {
   applyPrematch889HealthForPlayer(playerId);
   applyPhaseInputRestrictionsForPlayer(player);
   const liveRedeploySeconds = isCipherSuddenDeathActive() ? 9999 : REDEPLOY_TIME;
-  const enteringForcedSafeSpawnFlow = safeSpawnForcedUndeploy[playerId] === true;
-  if (!enteringForcedSafeSpawnFlow) {
-    bumpSafeSpawnGeneration(playerId);
-    clearQueuedSafeSpawnStateForPlayer(playerId, true);
-  }
-  if (!enteringForcedSafeSpawnFlow && isNativeFriendlyOrSquadSpawn(player, playerId)) {
+  mod.SetRedeployTime(player, liveRedeploySeconds);
+  const firstDeploy = p.isFirstDeploy();
+  if (isNativeFriendlyOrSquadSpawn(player, playerId)) {
     invalidateCipherRespawnRouteJobForPlayer(playerId);
-    mod.SetRedeployTime(player, liveRedeploySeconds);
-    p.isFirstDeploy();
-    finishSafeSpawnAsNativeFriendlyOrSquadSpawn(player, playerId);
+    consumeCipherRouteForNativeFriendlySpawn(player, playerId);
     return;
   }
-  mod.SetRedeployTime(player, liveRedeploySeconds);
-  finalizeCipherRespawnRouteJobForPlayer(playerId, "DeployHydration_Live");
-  requestCipherSpawnAnchorForPlayer(playerId, true);
-  p.isFirstDeploy();
-  SafeSpawnCheckOrRedeploy(playerId);
+
+  // A normal redeploy consumes only the route selected during the native countdown.
+  // First deploys are selected here by the scheduler-owned hydration lane.
+  if (firstDeploy && getCipherQueuedSpawnAnchorForPlayer(playerId) === undefined) {
+    requestCipherSpawnAnchorForPlayer(playerId, true);
+  }
+  if (getCipherQueuedSpawnAnchorForPlayer(playerId) !== undefined || firstDeploy) {
+    requestCipherSpawnTeleportForPlayer(playerId, true);
+  }
 }
 
 function processPlayerDeployHydrationQueue(): boolean {
@@ -21417,8 +19428,6 @@ function processPlayerLeaveCleanupQueue(): boolean {
     }
     clearBombCarrierDeployRestoreCacheForPlayer(playerId);
     delete lastKnownLivePositionByPlayerId[playerId];
-    clearQueuedSafeSpawnStateForPlayer(playerId);
-    delete safeSpawnGenerationByPlayerId[playerId];
     delete cipherSuddenDeathEliminatedByPlayerId[playerId];
     clearPrematch889StateForPlayer(playerId);
     clearAllObjectiveAreaTriggerStateForPlayer(playerId);
@@ -21451,7 +19460,7 @@ function processPlayerUndeployCleanupQueue(): boolean {
   if (!p || !mod.IsPlayerValid(p.player)) return true;
   const player = p.player;
   const id = p.id;
-  const isForcedSafeSpawnFlow = safeSpawnUnsafePending[id] === true || safeSpawnForcedUndeploy[id] === true;
+  beginNextPlayerLife(id);
   const keepTransitionReady =
     cipherSecondHalfTransitionStage === "deploy" &&
     cipherSecondHalfDeployReadyByPlayerId[id] === true &&
@@ -21465,16 +19474,12 @@ function processPlayerUndeployCleanupQueue(): boolean {
   if (!keepTransitionReady) clearCipherSecondHalfDeployReadyForPlayer(id);
   invalidateBombDeployLoadoutApplyForPlayer(id);
   invalidateBombCarrierRestoreInsertForPlayer(id);
-  playerInDamageZone[id] = false;
   resetRestrictedAreaStateForPlayer(id);
   clearAllObjectiveAreaTriggerStateForPlayer(id);
   clearCipherPresenceForPlayer(id);
   // A teleport/anchor job from the dead life must never execute on the next soldier.
   clearCipherSpawnJobsForPlayer(id);
-  if (!isForcedSafeSpawnFlow) {
-    bumpSafeSpawnGeneration(id);
-    clearQueuedSafeSpawnStateForPlayer(id);
-  }
+  delete cipherQueuedAnchorByPlayerId[id];
   cancelObjectiveCaptureAttemptsForPlayer(id);
 
   if (isCipherLiveTransitionActive()) {
@@ -21505,7 +19510,6 @@ function processPlayerUndeployCleanupQueue(): boolean {
     !isCipherLiveStartSettling() &&
     job.wasDeployed &&
     !isPlayerAliveSafe(player) &&
-    safeSpawnForcedUndeploy[id] !== true &&
     getCurrentSchedulerNowSeconds() >= cipherSuddenDeathUndeployIgnoreUntilSec
   ) {
     consumeCipherSuddenDeathLife(id, "undeploy_supervisor");
@@ -21518,9 +19522,7 @@ function processPlayerUndeployCleanupQueue(): boolean {
     return true;
   }
   if (gameStatus === 3) {
-    ForceRemovePlayerFromAllCapturePoints(id);
-    stopCaptureTickLoop(id);
-    if (!isForcedSafeSpawnFlow && getCurrentSchedulerNowSeconds() >= cipherPhaseTransitionUndeployIgnoreUntilSec) {
+    if (getCurrentSchedulerNowSeconds() >= cipherPhaseTransitionUndeployIgnoreUntilSec) {
       startCipherRespawnRouteJobForPlayer(id, job.wasDeployed, "UndeployCleanup_Live");
       recordScoreboardDeathForPlayer(p);
     }
@@ -22033,7 +20035,6 @@ function flushPreliveTransitionSpawnRequestsAfterUndeploy(): void {
   requestTransitionSpawnForAllTransitionPlayers("prelive_start");
 }
 
-let playerInDamageZone: { [playerId: number]: boolean } = {};
 let prematchHealthInside889ByPlayerId: { [playerId: number]: boolean } = {};
 let prematchHealthAppliedMaxByPlayerId: { [playerId: number]: number } = {};
 
@@ -22076,19 +20077,8 @@ function isObjectiveAreaTriggerId(triggerId: number): boolean {
 }
 
 function isRestrictedTriggerForPlayer(triggerId: number, playerTeam: mod.Team): boolean {
-  if (triggerId === RESTRICTED_AREA_TRIGGER) {
-    return mod.Equals(playerTeam, team1) || mod.Equals(playerTeam, team2);
-  }
-
-  if (triggerId === TEAM1_HQ_PROTECTION_TRIGGER_ID) {
-    return mod.Equals(playerTeam, team2);
-  }
-
-  if (triggerId === TEAM2_HQ_PROTECTION_TRIGGER_ID) {
-    return mod.Equals(playerTeam, team1);
-  }
-
-  return false;
+  return triggerId === RESTRICTED_AREA_TRIGGER &&
+    (mod.Equals(playerTeam, team1) || mod.Equals(playerTeam, team2));
 }
 
 function markRestrictedTriggerActive(playerId: number, triggerId: number): void {
@@ -22184,7 +20174,7 @@ function hasRestrictedAreaFeedbackOrSourcesActive(playerId: number): boolean {
 function cancelPendingRestrictedLethalConfirmForPlayer(playerId: number): void {
   restrictedAreaPendingLethalConfirmTokenByPlayerId[playerId] =
     (restrictedAreaPendingLethalConfirmTokenByPlayerId[playerId] ?? 0) + 1;
-  Timers.clearTimeout(restrictedAreaPendingLethalConfirmTimerByPlayerId[playerId]);
+  cancelCipherGlobalTask(restrictedAreaPendingLethalConfirmTimerByPlayerId[playerId]);
   delete restrictedAreaPendingLethalConfirmTimerByPlayerId[playerId];
 }
 
@@ -22260,7 +20250,10 @@ function scheduleRestrictedAreaLethalConfirmForPlayer(playerId: number, player: 
   const expectedMatchStage = cipherMatchStage;
   const expectedTransitionToken = getQueuedPlayerWorkTransitionToken();
   restrictedAreaPendingLethalConfirmTokenByPlayerId[playerId] = token;
-  restrictedAreaPendingLethalConfirmTimerByPlayerId[playerId] = Timers.setTimeout(() => {
+  restrictedAreaPendingLethalConfirmTimerByPlayerId[playerId] = scheduleCipherGlobalTask(
+    RESTRICTED_AREA_LETHAL_CONFIRM_DELAY_MS / 1000,
+    "restricted_lethal_confirm/" + String(playerId),
+    () => {
     if (restrictedAreaPendingLethalConfirmTokenByPlayerId[playerId] !== token) return;
     delete restrictedAreaPendingLethalConfirmTimerByPlayerId[playerId];
 
@@ -22279,7 +20272,8 @@ function scheduleRestrictedAreaLethalConfirmForPlayer(playerId: number, player: 
     if (!isRestrictedAreaLethalStateForPlayer(playerId, latest.player)) return;
 
     deactivateRestrictedAreaFeedbackForPlayer(playerId, true);
-  }, RESTRICTED_AREA_LETHAL_CONFIRM_DELAY_MS);
+    }
+  );
   void player;
 }
 
@@ -22446,75 +20440,54 @@ function hideRestrictedAreaUi(playerId: number): void {
   mod.SetUIWidgetVisible(root, false);
 }
 
-async function startRestrictedAreaCountdown(p: Player): Promise<void> {
-  const playerId = p.id;
+function tickRestrictedAreaCountdown(
+  playerId: number,
+  token: number,
+  sessionGeneration: number | undefined,
+  secondsLeft: number
+): void {
+  if (restrictedAreaCountdownToken[playerId] !== token) return;
+  if (!isCurrentPlayerSession(playerId, sessionGeneration)) return;
+  const latest = serverPlayers.get(playerId);
+  if (!latest || !mod.IsPlayerValid(latest.player)) return;
+  if (syncRestrictedAreaStateFromSources(playerId) !== true) {
+    deactivateRestrictedAreaFeedbackForPlayer(playerId, false);
+    return;
+  }
 
-  // New token cancels any existing countdown loop for this player
+  if (secondsLeft <= 0) {
+    if (latest.isDeployed && isPlayerAlive(latest.player)) {
+      deactivateRestrictedAreaFeedbackForPlayer(playerId, true);
+      mod.DealDamage(latest.player, 9999);
+    }
+    return;
+  }
+
+  const counterWidget = restrictedAreaCounterWidgetByPlayerId[playerId];
+  if (counterWidget) mod.SetUITextLabel(counterWidget, mod.Message(secondsLeft));
+  scheduleCipherGlobalTask(1, "restricted_countdown/" + String(playerId), () => {
+    tickRestrictedAreaCountdown(playerId, token, sessionGeneration, secondsLeft - 1);
+  });
+}
+
+function startRestrictedAreaCountdown(p: Player): void {
+  const playerId = p.id;
   const myToken = (restrictedAreaCountdownToken[playerId] ?? 0) + 1;
   restrictedAreaCountdownToken[playerId] = myToken;
-
-  // Re-check eligibility here so a queued countdown cannot flash after death/mandown.
-  if (restrictedAreaCountdownToken[playerId] !== myToken) {
-    return;
-  }
   if (syncRestrictedAreaStateFromSources(playerId) !== true) {
     deactivateRestrictedAreaFeedbackForPlayer(playerId, false);
     return;
   }
-
-  await mod.Wait(RESTRICTED_AREA_UI_ACTIVATION_DELAY_SECONDS);
-
-  if (restrictedAreaCountdownToken[playerId] !== myToken) {
-    return;
-  }
-  if (syncRestrictedAreaStateFromSources(playerId) !== true) {
-    deactivateRestrictedAreaFeedbackForPlayer(playerId, false);
-    return;
-  }
-
-  const initialCounterWidget = restrictedAreaCounterWidgetByPlayerId[playerId];
-  if (initialCounterWidget) mod.SetUITextLabel(initialCounterWidget, mod.Message(3));
-
-  showRestrictedAreaUi(playerId);
-  startRestrictedAreaLoopSfxForPlayer(p.player);
-
-  let secondsLeft = 3;
-
-  while (secondsLeft > 0) {
-    // Cancel if player left area or a newer countdown started
-    if (playerInRestrictedArea[playerId] !== true) break;
-    if (restrictedAreaCountdownToken[playerId] !== myToken) break;
-
-    const counterWidget = restrictedAreaCounterWidgetByPlayerId[playerId];
-    if (counterWidget) mod.SetUITextLabel(counterWidget, mod.Message(secondsLeft));
-
-    await mod.Wait(1);
-    secondsLeft--;
-  }
-
-  if (restrictedAreaCountdownToken[playerId] !== myToken) return;
-
-  // If still in area after countdown, kill
-  if (
-    playerInRestrictedArea[playerId] === true &&
-    p.isDeployed &&
-    isPlayerAlive(p.player)
-  ) {
-    deactivateRestrictedAreaFeedbackForPlayer(playerId, true);
-    // Big damage = guaranteed kill
-    mod.DealDamage(p.player, 9999);
-    return;
-  }
-
-  // Hide UI if they left (or after kill attempt)
-  if (playerInRestrictedArea[playerId] !== true) {
-    deactivateRestrictedAreaFeedbackForPlayer(playerId, false);
-  } else {
-    // Still in restricted area after countdown (even after kill attempt), keep UI up,
-    // but stop the ticking loop so it doesn't run forever.
-    stopRestrictedAreaLoopSfxForPlayer(p.player);
-  }
-
+  const sessionGeneration = playerSessionTokenByPlayerId[playerId];
+  scheduleCipherGlobalTask(RESTRICTED_AREA_UI_ACTIVATION_DELAY_SECONDS, "restricted_activate/" + String(playerId), () => {
+    if (restrictedAreaCountdownToken[playerId] !== myToken) return;
+    if (!isCurrentPlayerSession(playerId, sessionGeneration)) return;
+    const latest = serverPlayers.get(playerId);
+    if (!latest || syncRestrictedAreaStateFromSources(playerId) !== true) return;
+    showRestrictedAreaUi(playerId);
+    startRestrictedAreaLoopSfxForPlayer(latest.player);
+    tickRestrictedAreaCountdown(playerId, myToken, sessionGeneration, 3);
+  });
 }
 
 function cleanupRestrictedAreaUiForPlayer(playerId: number): void {
@@ -22528,7 +20501,7 @@ function cleanupRestrictedAreaUiForPlayer(playerId: number): void {
 }
 
 /* ----------------------------------------
-   Player state (UI + scoreboard + capture)
+   Player session UI and scoreboard state
 ---------------------------------------- */
 
 class Player {
@@ -22537,10 +20510,6 @@ class Player {
   public team: mod.Team;
 
   public isDeployed: boolean;
-
-  public friendlyCapWidget: mod.UIWidget;
-  public enemyCapWidget: mod.UIWidget;
-  public progressBarWidget: mod.UIWidget;
 
   public friendlyScoreWidget: mod.UIWidget;
   public opponentScoreWidget: mod.UIWidget;
@@ -22591,15 +20560,7 @@ class Player {
   public cipherSuddenDeathFriendlyAliveSlotWidgets: mod.UIWidget[];
   public cipherSuddenDeathEnemyAliveSlotWidgets: mod.UIWidget[];
 
-  public flagWidget: { [key: string]: mod.UIWidget };
-
-  public activeFlagContainerWidget: mod.UIWidget;
-  public activeFlagFriendlyWidget: mod.UIWidget;
-  public activeFlagEnemyWidget: mod.UIWidget;
-  public activeFlagWidget: mod.UIWidget;
-
   private _scoreboard: number[]; // [score, kills, deaths, keyTimeSeconds, nodeCiphers]
-  private _onCapturePoint: mod.CapturePoint | null;
   private _firstDeploy: boolean;
   private _ready: boolean;
 
@@ -22609,17 +20570,12 @@ class Player {
     this.team = mod.GetTeam(this.player);
 
     this._scoreboard = [0, 0, 0, 0, 0];
-    this._onCapturePoint = null;
     this._firstDeploy = true;
     this._ready = false;
 
     this.isDeployed = false;
 
     // Live HUD widget refs start empty. They will be built when live starts or when joining during live.
-    this.friendlyCapWidget = null as any;
-    this.enemyCapWidget = null as any;
-    this.progressBarWidget = null as any;
-
     this.friendlyScoreWidget = null as any;
     this.opponentScoreWidget = null as any;
     this.friendlyScorePadWidget = null as any;
@@ -22669,12 +20625,6 @@ class Player {
     this.cipherSuddenDeathFriendlyAliveSlotWidgets = [];
     this.cipherSuddenDeathEnemyAliveSlotWidgets = [];
 
-    this.flagWidget = {} as any;
-
-    this.activeFlagContainerWidget = null as any;
-    this.activeFlagFriendlyWidget = null as any;
-    this.activeFlagEnemyWidget = null as any;
-    this.activeFlagWidget = null as any;
 
     // Do not build any Live HUD widgets here.
     // Building them here is what causes some players to keep the placeholder tickets and then get a second set in live.
@@ -22683,14 +20633,6 @@ class Player {
     liveHudBuiltByPlayerId[this.id] = false;
   }
 
-
-  setCapturePoint(capturePoint: mod.CapturePoint | null): void {
-    this._onCapturePoint = capturePoint;
-  }
-
-  getCapturePoint(): mod.CapturePoint | null {
-    return this._onCapturePoint;
-  }
 
   isFirstDeploy(): boolean {
     if (this._firstDeploy) {
@@ -22731,14 +20673,6 @@ class Player {
 
   addDeath(): void {
     this._scoreboard[2] += 1;
-  }
-
-  addKillAssist(): void {
-    // Legacy method kept for compatibility. Assist stat is repurposed.
-  }
-
-  addArmed(): void {
-    // Legacy method kept for compatibility. Slot 3 is Key Time now.
   }
 
   addKeyTimeSeconds(seconds: number): void {
@@ -22790,8 +20724,6 @@ class Player {
 
     // Pull from authoritative server state
     this.updateTickets();
-    this.updateUIPlayersOnPoint();
-    this.updateUIProgress();
     UpdateObjectiveHoldProgressUiForPlayer(this);
     UpdateDeployObjectiveTimerUiForPlayer(this);
     updateCipherSuddenDeathAliveHudForPlayer(this);
@@ -22809,7 +20741,6 @@ class Player {
 
   resetForNewRound(): void {
     this._scoreboard = [0, 0, 0, 0, 0];
-    this._onCapturePoint = null;
     this._firstDeploy = true;
     this._ready = false;
     this.isDeployed = false;
@@ -22839,8 +20770,6 @@ class Player {
 
       UpdateTopTicketBarsForPlayer(this);
 
-      // NEW: keep top flag colors correct when the player's team changes mid-match
-      UpdateTopFlagColorsForPlayer(this);
     } catch (_err) {
       this.friendlyScoreWidget = null as any;
       this.opponentScoreWidget = null as any;
@@ -22848,75 +20777,6 @@ class Player {
     }
   }
 
-
-  updateUIPlayersOnPoint(): void {
-    if (!this.friendlyCapWidget || !this.enemyCapWidget) return;
-
-    try {
-      const point = this.getCapturePoint();
-      if (!point) return;
-
-      const cp = serverCapturePoints[mod.GetObjId(point)];
-      const team = mod.GetTeam(this.player);
-
-      if (modlib.Equals(team, team1)) {
-        SafeSetTextLabelHandle(this.friendlyCapWidget, mod.Message(cp.getOnPoint()[0]));
-        SafeSetTextLabelHandle(this.enemyCapWidget, mod.Message(cp.getOnPoint()[1]));
-      } else {
-        SafeSetTextLabelHandle(this.friendlyCapWidget, mod.Message(cp.getOnPoint()[1]));
-        SafeSetTextLabelHandle(this.enemyCapWidget, mod.Message(cp.getOnPoint()[0]));
-      }
-    } catch (_err) {
-      this.friendlyCapWidget = null as any;
-      this.enemyCapWidget = null as any;
-      markCipherKeyHudDirtyForPlayer(this.id);
-    }
-  }
-
-  updateUIProgress(): void {
-    if (!this.progressBarWidget) return;
-
-    try {
-      const point = this.getCapturePoint();
-      if (!point) return;
-
-      const cp = serverCapturePoints[mod.GetObjId(point)];
-      const team = mod.GetTeam(this.player);
-      const capturingTeam = cp.getCapturingTeam();
-
-      let prog = cp.getCaptureProgress();
-
-      if (mod.Equals(cp.getOwner(), team) && prog >= PROGRESS_FULL) {
-        prog = 1;
-      }
-
-      const size = mod.CreateVector(mod.Ceiling(60 * prog), 60, 0);
-
-      if (this.progressBarWidget) {
-        SafeSetWidgetSizeHandle(this.progressBarWidget, size);
-
-        if (!mod.Equals(capturingTeam, teamNeutral) && prog > PROGRESS_EMPTY && prog < PROGRESS_FULL) {
-          if (mod.Equals(capturingTeam, team)) SafeSetWidgetBgColorHandle(this.progressBarWidget, COLOR_FRIENDLY);
-          else SafeSetWidgetBgColorHandle(this.progressBarWidget, COLOR_ENEMY);
-        } else if (modlib.Equals(cp.getOwner(), team)) {
-          SafeSetWidgetBgColorHandle(this.progressBarWidget, COLOR_FRIENDLY);
-        } else if (modlib.Equals(cp.getOwner(), teamNeutral)) {
-          if (modlib.Equals(cp.getCapturingTeam(), team)) SafeSetWidgetBgColorHandle(this.progressBarWidget, COLOR_FRIENDLY);
-          else SafeSetWidgetBgColorHandle(this.progressBarWidget, COLOR_ENEMY);
-        } else {
-          SafeSetWidgetBgColorHandle(this.progressBarWidget, COLOR_ENEMY);
-        }
-      }
-    } catch (_err) {
-      this.progressBarWidget = null as any;
-      markCipherKeyHudDirtyForPlayer(this.id);
-    }
-  }
-}
-
-function initializePerformanceStatsLoggingOnce(): void {
-  // Disabled to keep Portal bundle.ts under the hard file-size limit.
-  // Cipher Obliteration does not require bf6-portal-utils/performance-stats at runtime.
 }
 
 /* ----------------------------------------
@@ -22925,187 +20785,46 @@ function initializePerformanceStatsLoggingOnce(): void {
 
 class CapturePoint {
   public capturePoint: mod.CapturePoint | undefined;
-  public symbol: ObjectiveLetter;
-  public id: number;
-
-  private _owner: mod.Team;
-  private _onPoint: number[];
-  private _captureProgress: number;
-  private _previousCaptureProgress: number;
-  private _capturingTeam: mod.Team;
-  private _resolveMissingWarned: boolean;
-  private _configureFailedWarned: boolean;
+  public readonly symbol: ObjectiveLetter;
+  public readonly id: number;
+  private owner: mod.Team = teamNeutral;
+  private resolveMissingWarned = false;
 
   constructor(id: number, symbol: ObjectiveLetter) {
     this.id = id;
     this.symbol = symbol;
-
-    this.capturePoint = undefined;
-
-    this._owner = teamNeutral;
-    this._onPoint = [];
-    this._captureProgress = 0;
-    this._previousCaptureProgress = 0;
-    this._capturingTeam = teamNeutral;
-    this._resolveMissingWarned = false;
-    this._configureFailedWarned = false;
-
-    const capturePoint = this.resolveHandle("constructor");
-    if (!capturePoint) return;
-
-    try {
-      mod.SetCapturePointCapturingTime(capturePoint, CAPTURE_TIME);
-      mod.SetCapturePointNeutralizationTime(capturePoint, NEUTRALIZE_TIME);
-      mod.EnableGameModeObjective(capturePoint, false);
-    } catch (err) {
-      this.warnConfigureFailureOnce("constructor", err);
-    }
   }
 
-  resolveHandle(context: string = "resolveHandle"): mod.CapturePoint | undefined {
+  resolveHandle(context: string): mod.CapturePoint | undefined {
+    if (this.capturePoint) return this.capturePoint;
     try {
       this.capturePoint = mod.GetCapturePoint(this.id);
       return this.capturePoint;
     } catch (err) {
-      if (!this._resolveMissingWarned) {
-        this._resolveMissingWarned = true;
+      if (!this.resolveMissingWarned) {
+        this.resolveMissingWarned = true;
         LogRuntimeError("CapturePoint/GetCapturePoint/" + context + "/" + String(this.id), err);
       }
       return undefined;
     }
   }
 
-  private warnConfigureFailureOnce(context: string, err: unknown): void {
-    if (this._configureFailedWarned) return;
-    this._configureFailedWarned = true;
-    LogRuntimeError("CapturePoint/configure/" + context + "/" + String(this.id), err);
-  }
-
-  getPlayerIdsOnPoint(): number[] {
-    return this._onPoint;
-  }
-  clearOnPoint(): void {
-    this._onPoint.length = 0; // reuses same array backing store
-  }
-
-  addOnPoint(playerId: number): void {
-    this._onPoint.push(playerId);
-  }
-
-  removeOnPoint(playerId: number): void {
-    const index = this._onPoint.indexOf(playerId);
-    if (index >= 0) this._onPoint.splice(index, 1);
-  }
-
-  getOnPoint(): number[] {
-    let onPoint = [0, 0];
-    for (let i = 0; i < this._onPoint.length; i++) {
-      const p = serverPlayers.get(this._onPoint[i]);
-      if (!p) continue;
-
-      const team = mod.GetTeam(p.player);
-      if (mod.Equals(team, team1)) onPoint[0] += 1;
-      else onPoint[1] += 1;
-    }
-    return onPoint;
-  }
-
   setOwner(owner: mod.Team): void {
-    this._owner = owner;
+    this.owner = owner;
   }
 
   getOwner(): mod.Team {
-    return this._owner;
+    return this.owner;
   }
 
-  setCaptureProgress(): void {
-    const capturePoint = this.resolveHandle("setCaptureProgress");
-    if (!capturePoint) return;
-
-    this._previousCaptureProgress = this._captureProgress;
-    try {
-      this._captureProgress = mod.GetCaptureProgress(capturePoint);
-    } catch (err) {
-      this.warnConfigureFailureOnce("GetCaptureProgress", err);
-      return;
-    }
-    if (this._captureProgress < 0) this._captureProgress = 0;
-    if (this._captureProgress > 1) this._captureProgress = 1;
-
-    const onPoint = this.getOnPoint();
-    const majorityTeam =
-      onPoint[0] > onPoint[1] ? team1 :
-      onPoint[1] > onPoint[0] ? team2 :
-      teamNeutral;
-    const progressMoved = mod.AbsoluteValue(this._captureProgress - this._previousCaptureProgress) > 0.0001;
-    if (progressMoved && !mod.Equals(majorityTeam, teamNeutral)) {
-      this._capturingTeam = majorityTeam;
-    } else if (!(this._captureProgress > PROGRESS_EMPTY && this._captureProgress < PROGRESS_FULL)) {
-      this._capturingTeam = teamNeutral;
-    }
-
-    if (gameStatus === 3) {
-      const prev = this._previousCaptureProgress;
-      const cur = this._captureProgress;
-      const progressMovedLocal = mod.AbsoluteValue(cur - prev) > 0.0001;
-
-      if (progressMovedLocal) {
-        const creditTeam = majorityTeam;
-
-        if (!mod.Equals(creditTeam, teamNeutral)) {
-          const ids = this.getPlayerIdsOnPoint();
-          for (let i = 0; i < ids.length; i++) {
-            const pid = ids[i];
-            const sp = serverPlayers.get(pid);
-            if (!sp) continue;
-            if (!mod.Equals(mod.GetTeam(sp.player), creditTeam)) continue;
-            markCaptureCredit(this.id, pid);
-          }
-        }
-      }
-
-      const progressRising = cur > prev;
-      const crossedThreshold = prev < CAPTURE_BUILDUP_THRESHOLD && cur >= CAPTURE_BUILDUP_THRESHOLD;
-      if (progressRising && crossedThreshold && !mod.Equals(this._capturingTeam, teamNeutral)) {
-        void playCaptureBuildupToCapturingTeamOnPoint(this, this._capturingTeam);
-      }
-    }
-
-    if (mod.AbsoluteValue(this._captureProgress - this._previousCaptureProgress) > 0.0001) {
-      this.setUIProgressForPlayersOnPoint();
-    }
-  }
-
-  getCaptureProgress(): number {
-    return this._captureProgress;
-  }
-
-  getCapturingTeam(): mod.Team {
-    return this._capturingTeam;
-  }
-
-  getColor(team: mod.Team): mod.Vector {
-    if (mod.Equals(team, this._owner)) return COLOR_FRIENDLY;
-    if (mod.Equals(this._owner, teamNeutral)) return COLOR_NEUTRAL;
+  getColor(viewerTeam: mod.Team): mod.Vector {
+    if (mod.Equals(viewerTeam, this.owner)) return COLOR_FRIENDLY;
+    if (mod.Equals(this.owner, teamNeutral)) return COLOR_NEUTRAL;
     return COLOR_ENEMY;
-  }
-
-  updateUIforPlayersOnPoint(): void {
-    this._onPoint.forEach((id) => {
-      const p = serverPlayers.get(id);
-      if (p) p.updateUIPlayersOnPoint();
-    });
-  }
-
-  setUIProgressForPlayersOnPoint(): void {
-    this._onPoint.forEach((id) => {
-      const p = serverPlayers.get(id);
-      if (p) p.updateUIProgress();
-    });
   }
 }
 
-/* Capture points registry */
+/* Display-only CapturePoint registry; handles resolve lazily after mode start. */
 let serverCapturePoints: { [key: number]: CapturePoint } = {
   [CP_A_ID]: new CapturePoint(CP_A_ID, "A"),
   [CP_B_ID]: new CapturePoint(CP_B_ID, "B"),
@@ -23117,12 +20836,6 @@ let serverCapturePoints: { [key: number]: CapturePoint } = {
   [CP_D_SECOND_HALF_ID]: new CapturePoint(CP_D_SECOND_HALF_ID, "D"),
 };
 
-/* Threatened-flag overrides for late spawns */
-// HQ routing updates can be expensive; we drive them off capture-point events and a small safety cadence.
-
-
-// Track whether each team has captured at least one flag this round.
-// Used to keep initial HQ spawns until a team captures a flag for the first time.
 /* =================================================================================================
    8) INPUT / DAMAGE RESTRICTIONS (PHASE-BASED)
 ================================================================================================= */
@@ -23329,8 +21042,8 @@ function warnPrematchPreliveGateOnce(
 ): void {
   if (!shouldEmitStringKeyDebugWorldLogs()) return;
   const teamId = getPrematchEventTeamId(eventPlayer);
-  const t1SpawnerObjId = getConfiguredInitialTransitionPlayerSpawnerObjIdForTeam(team1);
-  const t2SpawnerObjId = getConfiguredInitialTransitionPlayerSpawnerObjIdForTeam(team2);
+  const t1SpawnerObjId = getConfiguredInitialTransitionHqObjIdForTeam(team1);
+  const t2SpawnerObjId = getConfiguredInitialTransitionHqObjIdForTeam(team2);
   const key =
     source +
     "/" +
@@ -23579,8 +21292,7 @@ function setCipherHqPhaseProfile(profileKey: string, desiredIds: number[]): void
     if (epoch !== hqPhaseProfileEpoch) return;
     applyCipherHqProfileNow(hqPhaseProfileDesiredIds, true);
   };
-  Timers.setTimeout(reassert, 250);
-  Timers.setTimeout(reassert, 1000);
+  scheduleCipherGlobalTask(0, "hq_profile_reconcile/" + profileKey, reassert);
 }
 
 function EnableAllBaseHQs(): void {
@@ -23619,12 +21331,6 @@ function ConfigurePreMatchSpawns(): void {
 }
 
 
-/*
-  Updates which HQ is enabled for each team in live phase.
-  Priority:
-    - If a team still owns a "threatened" point (being neutralized), route them to that flag HQ.
-    - Else route by ownership count: 0 -> NO, 1 -> that flag HQ, 2 -> combo HQ, 3 -> ABC HQ
-*/
 /* =================================================================================================
    10) TICKETS / BLEED / SCOREBOARD
 ================================================================================================= */
@@ -23638,65 +21344,12 @@ function UpdateScoreboard(): void {
 }
 
 
-function PlayCaptureContestedAudio(cp: CapturePoint): void {
-  const owner = getObjectiveAuthoritativeOwner(cp.id);
-  const playerIds = cp.getPlayerIdsOnPoint();
-  const symbol = getObjectiveLaneSymbol(cp.id, cp.symbol);
-
-  for (let i = 0; i < playerIds.length; i++) {
-    const playerId = playerIds[i];
-    const p = serverPlayers.get(playerId);
-    if (!p) continue;
-
-    const playerTeam = mod.GetTeam(p.player);
-
-    if (!mod.Equals(owner, teamNeutral) && mod.Equals(playerTeam, owner)) {
-      playVOToPlayer(p.player, mod.VoiceOverEvents2D.ObjectiveContested, getVoiceOverFlagForSymbol(symbol));
-    }
-  }
-}
-
-function UpdateCapturePointContestedState(cp: CapturePoint): void {
-  const onPoint = cp.getOnPoint();
-  const contestedNow = onPoint[0] > 0 && onPoint[1] > 0;
-
-  const cpId = cp.id;
-  const wasContested = capturePointContested[cpId] === true;
-
-  if (contestedNow && !wasContested) {
-    PlayCaptureContestedAudio(cp);
-  }
-
-  capturePointContested[cpId] = contestedNow;
-}
-
-function getMajorityTeamOnPoint(cp: CapturePoint): mod.Team {
-  const onPoint = cp.getOnPoint();
-  if (onPoint[0] > onPoint[1]) return team1;
-  if (onPoint[1] > onPoint[0]) return team2;
-  return teamNeutral;
-}
-
 /* =================================================================================================
    12) PHASE INITIALIZATION
 ================================================================================================= */
-function ResetRoutingAndSafeSpawnStateForNewRound(): void {
-
-  safeSpawnUnsafePending = {};
-  safeSpawnUnsafeSpawnerObjId = {};
-  safeSpawnUnsafeHqObjIdByPlayerId = {};
-  safeSpawnPendingCheck = {};
-  safeSpawnForcedUndeploy = {};
-  safeSpawnGenerationByPlayerId = {};
-  safeSpawnCheckQueuedGenerationByPlayerId = {};
-  safeSpawnForcedQueuedGenerationByPlayerId = {};
-  safeSpawnCheckQueue = [];
-  safeSpawnForcedQueue = [];
-
+function ResetRoutingStateForNewRound(): void {
   squadSpawnBypass = {};
-
   resetCipherSpawnRoutingState();
-
 }
 
 function ResetRoundGameplayState(): void {
@@ -23721,40 +21374,17 @@ function ResetRoundGameplayState(): void {
   cipherSuddenDeathJoinAliveExemptByPlayerId = {};
   cipherSuddenDeathJoinCleanupQueuedByPlayerId = {};
 
-  // Clear per-round caches related to capture tick audio and capture credit (if you added it)
-  lastCaptureTickAt = {};
-  capturePointContested = {};
-  lastContestSfxTickByCp = {};
-  lastCaptureSfxTickByCp = {};
-  lastJoinSfxTickByCp = {};
-  lastEnterPointSfxTickByPlayerId = {};
-
-  // Clear threatened routing
-  ResetRoutingAndSafeSpawnStateForNewRound();
+  ResetRoutingStateForNewRound();
 
   // Restore all objectives to defending-owner defaults for the next round.
   registerObjectivesDeterministically();
   applyObjectiveRoundStartOwnership(true);
-
-  // Clear all players capturepoint refs and hide the capture widget container
-  const resetPlayers = getValidHumanPlayersSnapshot();
-  for (let i = 0; i < resetPlayers.length; i++) {
-    const p = resetPlayers[i];
-    p.setCapturePoint(null);
-    if (p.activeFlagContainerWidget) {
-      try {
-        mod.SetUIWidgetVisible(p.activeFlagContainerWidget, false);
-      } catch (_err) {}
-    }
-  }
 
   // Reset the match timer baseline (your custom timer uses phaseTickCount + ROUND_TIME)
   phaseTickCount = 0;
   clearPhaseCountdownDeadline();
   resetEngineSchedulerCadenceState();
   resetLiveClockState();
-  stopDamageZonePulseTimer();
-  playerInDamageZone = {};
   prematchReadyPlayersByTeam = [0, 0];
   prematchTotalPlayersByTeam = [0, 0];
   prematchAllPlayersReady = false;
@@ -23765,6 +21395,7 @@ function ResetRoundGameplayState(): void {
 
 
 function resetLifecycleStateForFreshMatchStart(): void {
+  resetCipherScheduledTasks();
   resetUniversalPlayerLifecycleQueues(true);
   // OnPlayerJoinGame can run before OnGameModeStarted for the hosting player.
   // A fresh mode start must invalidate old sessions, then explicitly bootstrap
@@ -23772,6 +21403,7 @@ function resetLifecycleStateForFreshMatchStart(): void {
   // makes the active-session filter hide them from prematch UI and lifecycle work.
   serverPlayers.clear();
   playerSessionTokenByPlayerId = {};
+  playerLifeGenerationByPlayerId = {};
   playerDisconnectedAtTickByPlayerId = {};
   clearRuntimeBotState(true);
   initialization[0] = false;
@@ -23787,8 +21419,6 @@ function resetLifecycleStateForFreshMatchStart(): void {
   clearPhaseCountdownDeadline();
   resetEngineSchedulerCadenceState();
   resetLiveClockState();
-  stopDamageZonePulseTimer();
-  playerInDamageZone = {};
   prematchReadyPlayersByTeam = [0, 0];
   prematchTotalPlayersByTeam = [0, 0];
   prematchAllPlayersReady = false;
@@ -23882,10 +21512,9 @@ function ReturnToPreMatchState(): void {
   resetLiveClockState();
   postmatchResultSfxPlayed = false;
   stopAllObjectiveAwardBursts();
-  StopAllObjectiveMcomSfx();
   hideAllObjectiveArmedWorldIcons();
   HideAllDeployObjectiveTimerUi();
-  ResetRoutingAndSafeSpawnStateForNewRound();
+  ResetRoutingStateForNewRound();
   liveTransitionCheckpointSeenByKey = {};
   prematchSwitchLastHandledTickByPlayerId = {};
   prematchSwitchDebounceWarnedByPlayerId = {};
@@ -23900,11 +21529,9 @@ function ReturnToPreMatchState(): void {
   prematchHealthAppliedMaxByPlayerId = {};
   resetMatchStartBannerState(true);
   clearPostmatchShowcaseState();
-  stopDamageZonePulseTimer();
   clearLiveHudQueues();
   clearCipherKeyUiRefreshQueue();
   clearPhasePlayerOperationQueues();
-  playerInDamageZone = {};
 
   // IMPORTANT: make sure prematch init re-runs (so prematch enables icons/interacts/etc)
   initialization[0] = false;
@@ -23933,14 +21560,6 @@ function ReturnToPreMatchState(): void {
 
     // Reset internal deploy bookkeeping so prematch behaves clean
     p.isDeployed = false;
-
-    // Clear any capture UI state
-    p.setCapturePoint(null);
-    if (p.activeFlagContainerWidget) {
-      try {
-        mod.SetUIWidgetVisible(p.activeFlagContainerWidget, false);
-      } catch (_err) {}
-    }
 
     // Clear redeploy time so players can be placed into prematch world state.
     try {
@@ -23975,7 +21594,6 @@ function ReturnToPreMatchState(): void {
 
   // --- Put everyone back into the world in prematch through the bounded operation queue. ---
   queuePhasePlayerOperationForAll("deploy", "ReturnToPreMatchState");
-  setObjectiveNativeMcomObjectivesEnabled(false, "restorePrematch");
   disableAllObjectiveCapturePointObjectives("restorePrematch");
   disableAllObjectiveSurfaceSectors("restorePrematch", true);
   disableAllObjectiveInteractPoints("restorePrematch");
@@ -23987,15 +21605,12 @@ function InitializePreMatch(): void {
   phaseTickCount = 0;
   clearPhaseCountdownDeadline();
   resetEngineSchedulerCadenceState();
-  stopDamageZonePulseTimer();
   clearPostmatchShowcaseState();
   setLiveScorePanelVisible(false);
-  setObjectiveNativeMcomObjectivesEnabled(false, "InitializePreMatch");
   disableAllObjectiveCapturePointObjectives("InitializePreMatch");
   disableAllObjectiveSurfaceSectors("InitializePreMatch", true);
   disableAllObjectiveInteractPoints("InitializePreMatch");
   syncDisabledBombAnchorObjectives();
-  StopAllObjectiveMcomSfx();
   hideAllObjectiveArmedWorldIcons();
   HideAllDeployObjectiveTimerUi();
   invalidateCipherLiveTransitionOwnership();
@@ -24004,7 +21619,6 @@ function InitializePreMatch(): void {
   cipherSecondHalfTransitionStage = "none";
   clearCipherLivePhaseTransitionRuntimeState("InitializePreMatch", true, true);
   resetLiveClockState();
-  validateRequiredQuadBikeAnchorConfigurationOnce();
 
   // If we are looping back into prematch, ensure the world state is clean.
   ResetRoundGameplayState();
@@ -24069,7 +21683,6 @@ function InitializeCountDown(): void {
   try {
     liveTransitionCheckpointSeenByKey = {};
     emitLiveTransitionCheckpoint("countdown_init_enter");
-    stopDamageZonePulseTimer();
     clearPostmatchShowcaseState();
     phaseTickCount = 0;
     countDown = COUNT_DOWN_TIME;
@@ -24077,9 +21690,7 @@ function InitializeCountDown(): void {
     resetEngineSchedulerCadenceState();
     setLiveScorePanelVisible(false);
     hideCipherLiveHudForAllPlayers();
-    setObjectiveNativeMcomObjectivesEnabled(false, "InitializeCountDown");
     syncDisabledBombAnchorObjectives();
-    StopAllObjectiveMcomSfx();
     hideAllObjectiveArmedWorldIcons();
     HideAllDeployObjectiveTimerUi();
     resetBombCarrierRuntimeState(true);
@@ -24093,7 +21704,7 @@ function InitializeCountDown(): void {
     preliveZeroTransitionHandled = false;
 
 
-    // Restore the legacy countdown UI behavior for the ready-up delay.
+    // Show the countdown UI for the ready-up delay.
     // Players stay deployed while this 5-second Redeploying countdown is visible,
     // then they are undeployed only after it completes.
     mod.SetSpawnMode(mod.SpawnModes.Deploy);
@@ -24144,16 +21755,13 @@ function InitializePreLive(): void {
   try {
     liveTransitionCheckpointSeenByKey = {};
     emitLiveTransitionCheckpoint("prelive_init_enter");
-    stopDamageZonePulseTimer();
     clearPostmatchShowcaseState();
     phaseTickCount = 0;
     countDown = PRELIVE_TIME;
     setPhaseCountdownDeadlineFromNow(PRELIVE_TIME);
     resetEngineSchedulerCadenceState();
     setLiveScorePanelVisible(false);
-    setObjectiveNativeMcomObjectivesEnabled(false, "InitializePreLive");
     syncDisabledBombAnchorObjectives();
-    StopAllObjectiveMcomSfx();
     hideAllObjectiveArmedWorldIcons();
     HideAllDeployObjectiveTimerUi();
     resetMatchStartBannerState(true);
@@ -24214,8 +21822,7 @@ function InitializePreLive(): void {
 
     registerObjectivesDeterministically();
 
-    // Re-apply defending owners and expose the active CP objective layer during pre-live.
-    // Native MCOM objectives stay disabled so the deploy map keeps A/B labels.
+    // Re-apply defending owners while keeping native CapturePoint gameplay disabled.
     applyObjectiveLiveHybridRoundStartState(true);
 
     cipherPhaseTransitionUndeployIgnoreUntilSec = getCurrentSchedulerNowSeconds() + PRELIVE_TIME + 2;
@@ -24247,7 +21854,6 @@ function InitializeLive(): void {
   let initOk = false;
   try {
     emitLiveTransitionCheckpoint("live_init_enter");
-    stopDamageZonePulseTimer();
     clearPostmatchShowcaseState();
     clearLiveHudQueues();
     clearCipherKeyUiRefreshQueue();
@@ -24257,11 +21863,9 @@ function InitializeLive(): void {
     liveGameModeLimitAtSec = mod.GetMatchTimeElapsed() + LIVE_ENGINE_TIME_LIMIT_SAFETY_SECONDS;
     mod.SetGameModeTimeLimit(liveGameModeLimitAtSec);
     emitLiveTransitionCheckpoint("live_init_time_limit");
-    cleanupLegacySharedTopHudWidgets();
     setLiveScorePanelVisible(true);
     emitLiveTransitionCheckpoint("live_init_score_panel");
     syncDisabledBombAnchorObjectives();
-    StopAllObjectiveMcomSfx();
     hideAllObjectiveArmedWorldIcons();
     HideAllDeployObjectiveTimerUi();
     emitLiveTransitionCheckpoint("live_init_objective_fx_clear");
@@ -24288,10 +21892,7 @@ function InitializeLive(): void {
     emitLiveTransitionCheckpoint("live_init_spawns");
     applyObjectiveLiveHybridRoundStartState(false);
     updateCipherCounterWorldIcons(true);
-    void reassertObjectiveOwnershipShortlyAfterLiveStart();
     emitLiveTransitionCheckpoint("live_init_objectives");
-    trySpawnLiveQuadBikeFromConfiguredCapturePoint();
-    emitLiveTransitionCheckpoint("live_init_quadbike");
     phaseTickCount = 0;
     clearPhaseCountdownDeadline();
     resetEngineSchedulerCadenceState();
@@ -24309,7 +21910,7 @@ function InitializeLive(): void {
     SetDepthAboveGameUI("friendlyscore");
     SetDepthAboveGameUI("enemyscore");
 
-    // Objective/score panel + flag containers
+    // Objective and score presentation
     SetDepthAboveGameUI("BG_Score_Container");
     SetDepthAboveGameUI("Container_A");
     SetDepthAboveGameUI("Container_B");
@@ -24324,7 +21925,6 @@ function InitializeLive(): void {
     SetCountdownOverlayVisible(false);
     hideCipherTransitionHudForAllPlayers();
     SafeSetWidgetVisibleByName("LiveContainer", true);
-    HideSharedTicketBarFills();
     emitLiveTransitionCheckpoint("live_init_countdown_hidden");
 
     const livePlayers = getValidHumanPlayersSnapshot();
@@ -24369,7 +21969,6 @@ function InitializeLive(): void {
 
     SetUITime();
     SetUIScores();
-    startDamageZonePulseTimer();
     emitLiveTransitionCheckpoint("live_init_complete");
     initOk = true;
   } catch (err) {
@@ -24833,7 +22432,7 @@ function schedulePostmatchCameraForPlayerAfterSettle(player: mod.Player, context
   const playerId = modlib.getPlayerId(player);
   const sessionToken = ensurePlayerSessionToken(playerId);
   const expectedMatchStage = cipherMatchStage;
-  Timers.setTimeout(() => {
+  scheduleCipherGlobalTask(POSTMATCH_SHOWCASE_SPAWN_SETTLE_MS / 1000, "postmatch_camera/" + context, () => {
     if (!isQueuedPlayerWorkCurrent(playerId, sessionToken, 4, expectedMatchStage)) return;
     const latest = getValidHumanPlayerById(playerId);
     if (!latest) return;
@@ -24843,7 +22442,7 @@ function schedulePostmatchCameraForPlayerAfterSettle(player: mod.Player, context
     } catch (err) {
       LogRuntimeError("PostmatchCameraSettle/" + context + "/" + String(playerId), err);
     }
-  }, POSTMATCH_SHOWCASE_SPAWN_SETTLE_MS);
+  });
 }
 
 function applyPostmatchShowcaseCameraAndInputForAllPlayers(): void {
@@ -24895,11 +22494,11 @@ function prepareAllPostmatchPlayers(context: string): void {
 }
 
 function schedulePostmatchPlayerStateReassert(context: string, delayMs: number): void {
-  Timers.setTimeout(() => {
+  scheduleCipherGlobalTask(delayMs / 1000, "postmatch_reassert/" + context, () => {
     if (gameStatus !== 4) return;
     prepareAllPostmatchPlayers(context + "_" + String(delayMs));
     applyPostmatchShowcaseCameraAndInputForAllPlayers();
-  }, delayMs);
+  });
 }
 
 function clearPostmatchShowcaseCameraAndInputForAllPlayers(): void {
@@ -25130,7 +22729,7 @@ function teleportPostmatchShowcaseSlotPlayer(slot: PostmatchShowcaseSlot, contex
 function reassertPostmatchShowcaseSlotTeleport(playerId: number, context: string, delayMs: number): void {
   const sessionToken = ensurePlayerSessionToken(playerId);
   const expectedMatchStage = cipherMatchStage;
-  Timers.setTimeout(() => {
+  scheduleCipherGlobalTask(delayMs / 1000, "postmatch_slot_reassert/" + context, () => {
     if (!isQueuedPlayerWorkCurrent(playerId, sessionToken, 4, expectedMatchStage)) return;
     const latest = getValidHumanPlayerById(playerId);
     if (!latest) return;
@@ -25141,7 +22740,7 @@ function reassertPostmatchShowcaseSlotTeleport(playerId: number, context: string
     teleportPostmatchShowcaseSlotPlayer(slot, context);
     applyPostmatchInputStateForPlayer(slot.player.player);
     setPostmatchShowcaseCameraForPlayer(slot.player.player, true);
-  }, delayMs);
+  });
 }
 function applyPostmatchShowcaseSlot(slot: PostmatchShowcaseSlot): void {
   if (!slot || !slot.player) return;
@@ -25158,7 +22757,7 @@ function applyPostmatchShowcaseSlot(slot: PostmatchShowcaseSlot): void {
   const sessionToken = ensurePlayerSessionToken(playerId);
   const expectedMatchStage = cipherMatchStage;
 
-  Timers.setTimeout(() => {
+  scheduleCipherGlobalTask(POSTMATCH_SHOWCASE_SPAWN_SETTLE_MS / 1000, "postmatch_slot_apply", () => {
     if (!isQueuedPlayerWorkCurrent(playerId, sessionToken, 4, expectedMatchStage)) return;
     const latest = getValidHumanPlayerById(playerId);
     if (!latest) return;
@@ -25174,7 +22773,7 @@ function applyPostmatchShowcaseSlot(slot: PostmatchShowcaseSlot): void {
       reassertPostmatchShowcaseSlotTeleport(playerId, "apply_reassert_750", 750);
       reassertPostmatchShowcaseSlotTeleport(playerId, "apply_reassert_1250", 1250);
     }
-  }, POSTMATCH_SHOWCASE_SPAWN_SETTLE_MS);
+  });
 }
 
 function applyPostmatchShowcaseSlots(): void {
@@ -25184,16 +22783,14 @@ function applyPostmatchShowcaseSlots(): void {
   updatePostmatchShowcaseWorldIconPositions();
 }
 
-async function reassertPostmatchShowcaseAfterDelay(): Promise<void> {
-  const waits = [0.1, 0.35, 0.75, 1.25];
-  let previousWait = 0;
-  for (let i = 0; i < waits.length; i++) {
-    const waitSeconds = waits[i] - previousWait;
-    previousWait = waits[i];
-    await mod.Wait(waitSeconds);
-    if (gameStatus !== 4 || initialization[4] !== true) return;
-    applyPostmatchShowcaseCameraAndInputForAllPlayers();
-    applyPostmatchShowcaseSlots();
+function schedulePostmatchShowcaseReasserts(): void {
+  const delays = [0.1, 0.35, 0.75, 1.25];
+  for (let i = 0; i < delays.length; i++) {
+    scheduleCipherGlobalTask(delays[i], "postmatch_showcase_reassert", () => {
+      if (gameStatus !== 4 || initialization[4] !== true) return;
+      applyPostmatchShowcaseCameraAndInputForAllPlayers();
+      applyPostmatchShowcaseSlots();
+    });
   }
 }
 
@@ -25211,7 +22808,7 @@ function beginPostmatchShowcase(): void {
 
   applyPostmatchInputStateForAllPlayers();
   applyPostmatchShowcaseSlots();
-  void reassertPostmatchShowcaseAfterDelay();
+  schedulePostmatchShowcaseReasserts();
 }
 
 function clearPostmatchShowcaseState(): void {
@@ -25413,7 +23010,6 @@ function updatePostmatchEndTimerUi(secondsRemaining: number): void {
 function InitializePostmatch(): void {
   let initOk = false;
   try {
-    stopDamageZonePulseTimer();
     phaseTickCount = 0;
     countDown = POSTMATCH_TIME;
     postmatchEndStep = 0;
@@ -25429,12 +23025,10 @@ function InitializePostmatch(): void {
     resetEngineSchedulerCadenceState();
     setLiveScorePanelVisible(false);
     hideCipherLiveHudForAllPlayersHard();
-    setObjectiveNativeMcomObjectivesEnabled(false, "InitializePostmatch");
     disableAllObjectiveCapturePointObjectives("InitializePostmatch");
     disableAllObjectiveSurfaceSectors("InitializePostmatch", true);
     disableAllObjectiveInteractPoints("InitializePostmatch");
     syncDisabledBombAnchorObjectives();
-    StopAllObjectiveMcomSfx();
     hideAllObjectiveArmedWorldIcons();
     resetCipherNodeStates("InitializePostmatch");
     resetBombCarrierRuntimeState(true);
@@ -25445,7 +23039,6 @@ function InitializePostmatch(): void {
     hideCipherTransitionHudForAllPlayers();
     hideCipherSuddenDeathAliveHudForAllPlayers();
     HidePrematchUiForTransition();
-    StopAllCaptureTickLoops();
     StopAllEndgameLoops();
     applyPostmatchInputStateForAllPlayers();
 
@@ -25815,50 +23408,6 @@ function forceReturnToPrematchFromTransitionFailure(source: string, err?: any): 
 }
 
 
-const MAIN_LOOP_INTERVAL_MS = 33;
-let mainLoopIntervalHandle: number | undefined = undefined;
-let damageZonePulseIntervalHandle: number | undefined = undefined;
-
-function pulseDamageZonePlayers(): void {
-  if (gameStatus !== 3) return;
-
-  serverPlayers.forEach((p) => {
-    if (playerInDamageZone[p.id] === true && p.isDeployed && isPlayerAlive(p.player)) {
-      mod.DealDamage(p.player, DAMAGE_PER_PULSE);
-    }
-  });
-}
-
-function stopDamageZonePulseTimer(): void {
-  Timers.clearInterval(damageZonePulseIntervalHandle);
-  damageZonePulseIntervalHandle = undefined;
-}
-
-function startDamageZonePulseTimer(): void {
-  stopDamageZonePulseTimer();
-  damageZonePulseIntervalHandle = Timers.setInterval(() => {
-    pulseDamageZonePlayers();
-  }, DAMAGE_ZONE_PULSE_INTERVAL_MS);
-}
-
-function stopMainLoopTimer(): void {
-  Timers.clearInterval(mainLoopIntervalHandle);
-  mainLoopIntervalHandle = undefined;
-}
-
-function startMainLoopTimer(): void {
-  stopMainLoopTimer();
-  mainLoopIntervalHandle = Timers.setInterval(() => {
-    try {
-      OngoingGlobal_Inner();
-    } catch (err) {
-      try {
-        LogRuntimeError("MainLoop", err);
-      } catch (_errLog) {}
-    }
-  }, MAIN_LOOP_INTERVAL_MS);
-}
-
 function forceEnablePrematchDeploymentForKnownPlayers(
   source: string,
   extraHandles: mod.Player[] = []
@@ -25993,38 +23542,26 @@ function bootstrapConnectedHumanPlayersForGameModeStart(startupHandles: mod.Play
 
 function Mode_OnGameModeStarted(): void {
   const startupPlayerHandles = collectConnectedHumanPlayerHandlesForGameModeStart();
-  initializePerformanceStatsLoggingOnce();
-  // Do not let the interval supervisor race the fresh-start reset and player
-  // bootstrap. It is started only after prematch deployment and roster state are
-  // fully restored.
-  stopMainLoopTimer();
   resetLifecycleStateForFreshMatchStart();
   SetDepthAboveGameUI("PreMatchContainer");
   SetDepthAboveGameUI(PREMATCH_PANEL_WIDGET_NAME);
   SetCountdownOverlayVisible(false);
 
-  refreshObjectiveResolvedMcomAliases("Mode_OnGameModeStarted");
   ValidateObjectiveConfiguration();
-  moveHardObjectiveMcomsBelowMapOnce("Mode_OnGameModeStarted");
-  validateRequiredQuadBikeAnchorConfigurationOnce();
   resetObjectiveRuntimeState();
   resetObjectiveDisableAndAwardFxState();
   ensureAudioSpawned();
   spawnTeamVoModulesForMatchStart();
   postmatchResultSfxPlayed = false;
-  setObjectiveNativeMcomObjectivesEnabled(false, "OnGameModeStarted");
   disableAllObjectiveCapturePointObjectives("OnGameModeStarted");
   disableAllObjectiveSurfaceSectors("OnGameModeStarted", true);
   disableAllObjectiveInteractPoints("OnGameModeStarted");
   syncDisabledBombAnchorObjectives();
-  StopAllObjectiveMcomSfx();
   hideAllObjectiveArmedWorldIcons();
   resetBombCarrierRuntimeState(true);
 
   gameStatus = 0;
   serverTickCount = 0;
-  mainLoopLastPulseAtMs = 0;
-  ongoingGlobalFallbackLastPulseAtMs = 0;
   gameModeStarted = true;
 
   ConfigurePreMatchSpawns();
@@ -26033,15 +23570,9 @@ function Mode_OnGameModeStarted(): void {
   bootstrapConnectedHumanPlayersForGameModeStart(startupPlayerHandles);
   forceEnablePrematchDeploymentForKnownPlayers("OnGameModeStarted_after_bootstrap", startupPlayerHandles);
 
-  for (let i = 0; i < fireVfx.length; i++) {
-    mod.EnableVFX(fireVfx[i], true);
-  }
   refreshPrematchReadyStateUi();
-  startMainLoopTimer();
 }
 function Mode_OnGameModeEnding(): void {
-  stopMainLoopTimer();
-  stopDamageZonePulseTimer();
   clearCipherAdminRuntimeState("Mode_OnGameModeEnding");
   cancelAllCipherRespawnRouteJobs();
   clearLiveHudQueues();
@@ -26050,7 +23581,6 @@ function Mode_OnGameModeEnding(): void {
   resetUniversalPlayerLifecycleQueues(true);
   clearRuntimeBotState(true);
   stopAllObjectiveAwardBursts();
-  StopAllObjectiveMcomSfx();
   hideAllObjectiveArmedWorldIcons();
   disableAllObjectiveSurfaceSectors("Mode_OnGameModeEnding", true);
   resetCipherNodeStates("Mode_OnGameModeEnding");
@@ -26060,20 +23590,11 @@ function Mode_OnGameModeEnding(): void {
 
 function Mode_OngoingGlobal(): void {
   if (!gameModeStarted) return;
-
-  // The normal runtime loop uses Timers, but Portal can pause/delay wait-based timers
-  // while players are on the deploy screen. VIP Escort keeps a supervisor on
-  // OngoingGlobal, so this mode keeps OngoingGlobal as a watchdog fallback.
-  const nowMs = Date.now();
-  if (mainLoopLastPulseAtMs > 0 && nowMs - mainLoopLastPulseAtMs < CIPHER_TRANSITION_CLOCK_FALLBACK_STALE_MS) return;
-  if (ongoingGlobalFallbackLastPulseAtMs > 0 && nowMs - ongoingGlobalFallbackLastPulseAtMs < MAIN_LOOP_INTERVAL_MS) return;
-
-  ongoingGlobalFallbackLastPulseAtMs = nowMs;
   try {
     OngoingGlobal_Inner();
   } catch (err) {
     try {
-      LogRuntimeError("OngoingGlobalFallback", err);
+      LogRuntimeError("OngoingGlobal", err);
     } catch (_errLog) {}
   }
 }
@@ -26081,7 +23602,6 @@ function Mode_OngoingGlobal(): void {
 function OngoingGlobal_Inner(): void {
   if (!gameModeStarted) return;
 
-  mainLoopLastPulseAtMs = Date.now();
   serverTickCount += 1;
   phaseTickCount += 1;
 
@@ -26090,6 +23610,7 @@ function OngoingGlobal_Inner(): void {
   currentFrameHasEngineNowSec = useEngineSchedulerFrame;
   currentFrameNowSec = useEngineSchedulerFrame ? (engineNowSec as number) : serverTickCount / TICK_RATE;
   const nowSec = currentFrameNowSec;
+  processCipherScheduledTasks(nowSec);
   updatePerfTelemetryFrame(nowSec);
   processPlayerLifecycleSupervisor();
   tickCipherAdminInteractFallback(nowSec);
@@ -26176,7 +23697,8 @@ function OngoingGlobal_Inner(): void {
       return;
     }
 
-    processLiveSafeSpawnQueues();
+    processCipherRespawnRouteJobs(nowSec);
+    processCipherSpawnJobs("live_scheduler");
 
     const visualNowSec = ENABLE_CARRIER_SUBTICK ? getVisualSubtickNowSec() : nowSec;
 
@@ -26193,12 +23715,12 @@ function OngoingGlobal_Inner(): void {
     SetUITime(nowSec);
     UpdateObjectiveCaptureInteractionState();
     EvaluateObjectiveCaptureHoldAttempts();
+    evaluateCipherNodeRebootDeadlines(nowSec);
     EvaluatePostCaptureAwardTimers();
     if (gameStatus !== 3) {
       HideAllObjectiveHoldProgressUi();
       return;
     }
-    UpdateObjectiveArmAlarmSfxState();
     UpdateObjectiveHoldProgressUiForAllPlayers(visualNowSec);
     UpdateDeployObjectiveTimerUiForAllPlayers();
 
@@ -26245,9 +23767,6 @@ function OngoingGlobal_Inner(): void {
       fastLaneDue = mod.Modulo(phaseTickCount, LIVE_FAST_UPDATE_INTERVAL_TICKS) === 0;
     }
     if (fastLaneDue) {
-      SyncPlayersOnPointsFromEngine();
-      refreshCapturePointsEngineStateForUI();
-      UpdateTopFlagColorsForAllPlayers();
       EvaluateBombPickupAndCarrierState();
       ensureDroppedBombRuntimeWorldIconVisibleIfNeeded();
       ensureBaseBombRuntimeWorldIconVisibleIfNeeded();
@@ -26278,10 +23797,8 @@ function OngoingGlobal_Inner(): void {
     }
     if (slowLaneDue) {
       // UI/tickets/scoreboard do not need per-tick updates
-      ChangeTickets();
       SetUIScores();
       UpdateScoreboard();
-      UpdateCaptureTickLoopsGlobal();
       updateCipherCounterWorldIcons(false);
       updateCipherSuddenDeathAliveHudForAllPlayers();
       if (DEBUG_PERF_TELEMETRY) perfTelemetrySlowLaneRuns += 1;
@@ -26459,9 +23976,10 @@ function recordPlayerDeployedMinimal(eventPlayer: mod.Player): void {
   if (!identity || identity.playerId !== playerId || identity.isBot) return;
   p.player = eventPlayer;
   p.team = identity.team;
-  // Remove work left by the previous life before sealing the countdown route.
-  clearCipherSpawnJobsForPlayer(playerId);
+  // Consume the countdown route before clearing stale queue work. The route belongs
+  // to this life generation and must survive the deploy acknowledgement.
   sealCipherRespawnRouteJobForDeploy(playerId, "OnPlayerDeployed_Minimal");
+  clearCipherSpawnJobsForPlayer(playerId);
   p.isDeployed = true;
   if (cipherSecondHalfTransitionStage === "deploy" && isCipherLiveTransitionActive()) {
     const transitionToken = getCipherSecondHalfForceDeployToken();
@@ -26482,240 +24000,6 @@ async function Mode_OnPlayerDeployed(eventPlayer: mod.Player): Promise<void> {
   }
 }
 
-/* Legacy synchronous deploy implementation retained temporarily as migration history.
-async function Legacy_Mode_OnPlayerDeployed_Unused(eventPlayer: mod.Player): Promise<void> {
-  let handledMinimalTransitionDeploy = false;
-  try {
-    {
-      const playerId = tryGetSafeEventPlayerIdOnly(eventPlayer);
-      if (playerId === undefined) return;
-      const pending = pendingPlayerSessionById[playerId];
-      if (pending && isCurrentPlayerSession(playerId, pending.sessionToken)) {
-        pending.player = eventPlayer;
-        pending.deployAckSeen = true;
-        return;
-      }
-      const p = serverPlayers.get(playerId);
-      const sessionToken = playerSessionTokenByPlayerId[playerId];
-      if (!p || sessionToken === undefined) return;
-      if (playerActivatedSessionTokenByPlayerId[playerId] !== sessionToken) return;
-      const identity = tryGetSafeEventPlayerIdentity(eventPlayer);
-      if (!identity || identity.playerId !== playerId || identity.isBot) return;
-      p.player = eventPlayer;
-      p.team = identity.team;
-      p.isDeployed = true;
-      if (cipherSecondHalfTransitionStage === "deploy" && isCipherLiveTransitionActive()) {
-        const transitionToken = getCipherSecondHalfForceDeployToken();
-        cipherSecondHalfDeployRequiredByPlayerId[playerId] = true;
-        cipherTransitionDeploySeenByPlayerId[playerId] = true;
-        cipherSecondHalfDeployReadyByPlayerId[playerId] = true;
-        cipherTransitionDeployAckTokenByPlayerId[playerId] = transitionToken;
-      }
-      queuePlayerDeployHydration(playerId);
-      requestCipherTransitionReconcile("OnPlayerDeployed_Minimal");
-      if (useQueuedPlayerLifecycleCallbacks()) return;
-    }
-    const identity = tryGetSafeEventPlayerIdentity(eventPlayer);
-    if (!identity) return;
-    const playerId = identity.playerId;
-    const team = identity.team;
-    const deployedRuntimeBotSlot = getRuntimeBotSlotForPlayerId(playerId);
-    const deployedIsBot = deployedRuntimeBotSlot !== undefined;
-    const deployedSkipsHumanFlow = deployedIsBot || identity.isBot;
-
-    if (!deployedSkipsHumanFlow && handleTransitionDeployAckMinimal(
-      eventPlayer,
-      identity,
-      "OnPlayerDeployed_TransitionMinimal"
-    )) {
-      handledMinimalTransitionDeploy = true;
-      return;
-    }
-
-    if (!deployedSkipsHumanFlow) {
-      adoptLatestHumanPlayerHandleFromEvent(identity, eventPlayer, true);
-    }
-
-    const deployingIsSuddenDeathEliminated =
-      isCipherSuddenDeathActive() && cipherSuddenDeathEliminatedByPlayerId[playerId] === true;
-    if (!deployingIsSuddenDeathEliminated) {
-      clearScoreboardDeathCountForPlayerLife(playerId);
-      delete playerInMandownByPlayerId[playerId];
-    }
-    delete botLiveSpawnRequestedByPlayerId[playerId];
-    delete botLiveSpawnNextAttemptAtSecByPlayerId[playerId];
-    cancelPendingRestrictedLethalConfirmForPlayer(playerId);
-    clearRestrictedAreaFeedbackSuppressionForPlayer(playerId);
-    hideDeployObjectiveTimerUiForPlayer(playerId);
-    clearTransitionSpawnStateForPlayer(playerId);
-    clearAllObjectiveAreaTriggerStateForPlayer(playerId);
-    clearCipherPresenceForPlayer(playerId);
-    cancelObjectiveCaptureAttemptsForPlayer(playerId);
-
-    if (!deployedSkipsHumanFlow) {
-      applyPhaseInputRestrictionsForPlayer(eventPlayer);
-    }
-
-    // Reset damage spacing state on deploy
-    dmgSpreadClearForPlayer(eventPlayer);
-
-    if (deployedIsBot && deployedRuntimeBotSlot) {
-      handleRuntimeBotDeployedForCurrentPhase(
-        eventPlayer,
-        playerId,
-        deployedRuntimeBotSlot,
-        "OnPlayerDeployed_RuntimeBot"
-      );
-      return;
-    }
-
-    if (deployedSkipsHumanFlow) {
-      const pAi = serverPlayers.get(playerId);
-      if (pAi) {
-        pAi.player = eventPlayer;
-        pAi.team = team;
-        pAi.isDeployed = true;
-      }
-      clearCipherKeyHudCacheForPlayer(playerId);
-      clearBotObjectiveStateForPlayer(playerId);
-      clearQueuedSafeSpawnStateForPlayer(playerId);
-      invalidateCipherRespawnRouteJobForPlayer(playerId);
-      clearTransitionSpawnStateForPlayer(playerId);
-      return;
-    }
-  
-    if (gameStatus === 0) {
-      const pPrematch = serverPlayers.get(playerId);
-      if (pPrematch) {
-        pPrematch.team = team;
-        pPrematch.isDeployed = true;
-      }
-      applyPrematch889HealthForPlayer(playerId);
-      refreshPrematchReadyStateUi();
-      queueCipherAdminInteractSpawnForPlayer(playerId, "OnPlayerDeployed_Prematch");
-      return;
-    }
-
-    if (gameStatus === 1) {
-      const pCountdown = serverPlayers.get(playerId);
-      if (pCountdown) {
-        pCountdown.team = team;
-        pCountdown.isDeployed = true;
-      }
-      applyPrematch889HealthForPlayer(playerId);
-      stripLoadoutToMeleeOnly(eventPlayer);
-      queueCipherAdminInteractSpawnForPlayer(playerId, "OnPlayerDeployed_Countdown");
-      return;
-    }
-
-    if (gameStatus === 2) {
-      const pPre = serverPlayers.get(playerId);
-      if (pPre) {
-        pPre.team = team;
-        pPre.isDeployed = true;
-      }
-      applyPrematch889HealthForPlayer(playerId);
-      requestCipherSpawnAnchorForPlayer(playerId, true);
-      requestCipherSpawnTeleportForPlayer(playerId, true);
-      return;
-    }
-
-    if (gameStatus === 4) {
-      const pPost = serverPlayers.get(playerId);
-      if (pPost) {
-        pPost.team = team;
-        pPost.isDeployed = true;
-      }
-      applyPostmatchInputStateForPlayer(eventPlayer);
-      schedulePostmatchCameraForPlayerAfterSettle(eventPlayer, "OnPlayerDeployed_Postmatch");
-      const slot = findPostmatchShowcaseSlotForPlayerId(playerId);
-      if (slot) applyPostmatchShowcaseSlot(slot);
-      queueCipherAdminInteractSpawnForPlayer(playerId, "OnPlayerDeployed_Postmatch");
-      return;
-    }
-
-    if (gameStatus !== 3) return;
-
-    const p = serverPlayers.get(playerId);
-    if (!p) return;
-
-    const liveRedeploySeconds = isCipherSuddenDeathActive() ? 9999 : REDEPLOY_TIME;
-
-    p.team = team;
-    if (isCipherLiveTransitionActive()) {
-      if (cipherSecondHalfTransitionStage === "deploy") {
-        handledMinimalTransitionDeploy = handleTransitionDeployAckMinimal(
-          eventPlayer,
-          identity,
-          "OnPlayerDeployed_TransitionMinimalFallback"
-        );
-        return;
-      }
-
-      if (handleCipherTransitionDeployedPlayer(playerId, eventPlayer, "OnPlayerDeployed_Transition")) {
-        queueCipherAdminInteractSpawnForPlayer(playerId, "OnPlayerDeployed_Transition");
-        requestCipherTransitionReconcile("OnPlayerDeployed_Transition");
-      }
-      return;
-    }
-
-    p.isDeployed = true;
-
-    if (isCipherSuddenDeathActive() && cipherSuddenDeathEliminatedByPlayerId[playerId] === true) {
-      playerInMandownByPlayerId[playerId] = true;
-      try {
-        mod.SetRedeployTime(eventPlayer, 9999);
-      } catch (_errRedeploy) {}
-
-      try {
-        mod.UndeployPlayer(eventPlayer);
-      } catch (_errUndeploy) {}
-
-      return;
-    }
-
-    queueCipherAdminInteractSpawnForPlayer(playerId, "OnPlayerDeployed_Live");
-    repairCipherKeyHudCacheForPlayer(p, true);
-    updateCipherSuddenDeathAliveHudForPlayer(p);
-
-    applyPrematch889HealthForPlayer(playerId);
-    recordLastLiveHqSpawnSourceFromDeploy(eventPlayer, playerId);
-    applyPhaseInputRestrictionsForPlayer(eventPlayer);
-
-    const enteringForcedSafeSpawnFlow = safeSpawnForcedUndeploy[playerId] === true;
-
-    if (!enteringForcedSafeSpawnFlow) {
-      bumpSafeSpawnGeneration(playerId);
-      clearQueuedSafeSpawnStateForPlayer(playerId);
-    }
-
-    // CRITICAL FIX:
-    // If the player spawned near a teammate/squadmate, this is a native squad/friendly spawn.
-    // Do NOT request a Cipher anchor and do NOT call SafeSpawnCheckOrRedeploy(),
-    // because those paths can teleport the player to an anchor.
-    if (!enteringForcedSafeSpawnFlow && isNativeFriendlyOrSquadSpawn(eventPlayer, playerId)) {
-      invalidateCipherRespawnRouteJobForPlayer(playerId);
-      mod.SetRedeployTime(eventPlayer, liveRedeploySeconds);
-      p.isFirstDeploy();
-      finishSafeSpawnAsNativeFriendlyOrSquadSpawn(eventPlayer, playerId);
-      return;
-    }
-
-    // Normal custom Cipher spawn route.
-    mod.SetRedeployTime(eventPlayer, liveRedeploySeconds);
-    finalizeCipherRespawnRouteJobForPlayer(playerId, "OnPlayerDeployed_Live");
-    requestCipherSpawnAnchorForPlayer(playerId, true);
-
-    p.isFirstDeploy();
-
-    SafeSpawnCheckOrRedeploy(playerId);
-  } catch (err) {
-    LogRuntimeError("OnPlayerDeployed", err);
-  } finally {
-    if (!handledMinimalTransitionDeploy) requestCipherTransitionReconcile("OnPlayerDeployed");
-  }
-}
-*/
 
 function recordPlayerUndeployedMinimal(eventPlayer: mod.Player): void {
   const playerId = tryGetSafeEventPlayerIdOnly(eventPlayer);
@@ -26759,228 +24043,6 @@ async function Mode_OnPlayerUndeploy(eventPlayer: mod.Player): Promise<void> {
   }
 }
 
-/* Legacy synchronous undeploy implementation retained temporarily as migration history.
-async function Legacy_Mode_OnPlayerUndeploy_Unused(eventPlayer: mod.Player): Promise<void> {
-  let handledMinimalTransitionUndeploy = false;
-  try {
-    {
-      const playerId = tryGetSafeEventPlayerIdOnly(eventPlayer);
-      if (playerId === undefined) return;
-      const pending = pendingPlayerSessionById[playerId];
-      if (pending && isCurrentPlayerSession(playerId, pending.sessionToken)) {
-        pending.player = eventPlayer;
-        pending.deployAckSeen = false;
-        return;
-      }
-      const p = serverPlayers.get(playerId);
-      const sessionToken = playerSessionTokenByPlayerId[playerId];
-      if (!p || sessionToken === undefined) return;
-      if (playerActivatedSessionTokenByPlayerId[playerId] !== sessionToken) return;
-      p.player = eventPlayer;
-      const wasDeployed = p.isDeployed === true;
-      const keepTransitionReady =
-        cipherSecondHalfTransitionStage === "deploy" &&
-        cipherSecondHalfDeployReadyByPlayerId[playerId] === true &&
-        cipherTransitionDeployAckTokenByPlayerId[playerId] === getCipherSecondHalfForceDeployToken();
-      p.isDeployed = keepTransitionReady;
-      if (!keepTransitionReady) clearCipherSecondHalfDeployReadyForPlayer(playerId);
-      if (playerUndeployCleanupQueuedByPlayerId[playerId] === true) return;
-      playerUndeployCleanupQueuedByPlayerId[playerId] = true;
-      playerUndeployCleanupQueue.push({
-        playerId,
-        sessionToken,
-        wasDeployed,
-        expectedGameStatus: gameStatus,
-        expectedMatchStage: cipherMatchStage,
-        expectedTransitionToken: getQueuedPlayerWorkTransitionToken(),
-      });
-      requestCipherTransitionReconcile("OnPlayerUndeploy_Minimal");
-      if (useQueuedPlayerLifecycleCallbacks()) return;
-    }
-    const identity = tryGetSafeEventPlayerIdentity(eventPlayer);
-    if (!identity) return;
-    const id = identity.playerId;
-    const undeployedRuntimeSlot = getRuntimeBotSlotForPlayerId(id);
-    const undeployedIsBot = undeployedRuntimeSlot !== undefined || identity.isBot;
-
-    if (!undeployedIsBot && handleTransitionUndeployAckMinimal(
-      eventPlayer,
-      identity,
-      "OnPlayerUndeploy_TransitionMinimal"
-    )) {
-      handledMinimalTransitionUndeploy = true;
-      return;
-    }
-
-    const p = undeployedIsBot
-      ? serverPlayers.get(id)
-      : adoptLatestHumanPlayerHandleFromEvent(identity, eventPlayer, true);
-    if (!p) return;
-    const wasDeployed = p.isDeployed === true;
-    const isForcedSafeSpawnFlowAtUndeploy =
-      safeSpawnUnsafePending[id] === true || safeSpawnForcedUndeploy[id] === true;
-    const wasAliveAtUndeploy = isPlayerAliveSafe(eventPlayer);
-    const isSuddenDeathScriptForcedUndeploy =
-      cipherSuddenDeathForcedUndeployTokenByPlayerId[id] !== undefined;
-    const keepTransitionDeployReadyAfterUndeploy =
-      gameStatus === 3 &&
-      (cipherSecondHalfTransitionActive || cipherSuddenDeathTransitionActive) &&
-      cipherSecondHalfTransitionStage === "deploy" &&
-      cipherSecondHalfDeployReadyByPlayerId[id] === true &&
-      cipherTransitionDeployAckTokenByPlayerId[id] === getCipherSecondHalfForceDeployToken();
-    closeCipherAdminPanelForPlayerId(id);
-    delete cipherAdminInteractSpawnTokenByPlayerId[id];
-    if (cipherAdminPlayerId === id) clearCipherAdminInteractPoint("admin_undeploy");
-
-    // Reset damage spacing state on undeploy
-    dmgSpreadClearForPlayer(eventPlayer);
-    prematchHealthInside889ByPlayerId[id] = false;
-    delete prematchHealthAppliedMaxByPlayerId[id];
-
-    if (keepTransitionDeployReadyAfterUndeploy) {
-      p.isDeployed = true;
-      cipherTransitionDeploySeenByPlayerId[id] = true;
-    } else {
-      p.isDeployed = false;
-      clearCipherSecondHalfDeployReadyForPlayer(id);
-    }
-    invalidateBombDeployLoadoutApplyForPlayer(id);
-    invalidateBombCarrierRestoreInsertForPlayer(id);
-    playerInDamageZone[id] = false;
-    resetRestrictedAreaStateForPlayer(id);
-    clearAllObjectiveAreaTriggerStateForPlayer(id);
-    clearCipherPresenceForPlayer(id);
-    if (!isForcedSafeSpawnFlowAtUndeploy) {
-      bumpSafeSpawnGeneration(id);
-      clearQueuedSafeSpawnStateForPlayer(id);
-    }
-    cancelObjectiveCaptureAttemptsForPlayer(id);
-    UpdateDeployObjectiveTimerUiForPlayer(p);
-    updateCipherSuddenDeathAliveHudForAllPlayers();
-
-    if (undeployedIsBot && (gameStatus === 2 || (gameStatus === 3 && (cipherSecondHalfTransitionActive || cipherSuddenDeathTransitionActive)))) {
-      const slot = getRuntimeBotSlotForPlayerId(id);
-      if (slot && !slot.retired) {
-        clearRuntimeBotPlayerBinding(slot, true);
-        slot.nextSpawnAtSec = getCurrentSchedulerNowSeconds() + CIPHER_RUNTIME_BOT_RESPAWN_DELAY_SECONDS;
-        runtimeBotStagedSpawnNextTick = 0;
-      }
-      clearCipherKeyHudCacheForPlayer(id);
-      clearQueuedSafeSpawnStateForPlayer(id);
-      invalidateCipherRespawnRouteJobForPlayer(id);
-      requestCipherTransitionReconcile("OnPlayerUndeploy_RuntimeBotTransition");
-      return;
-    }
-
-    if (gameStatus === 3 && (cipherSecondHalfTransitionActive || cipherSuddenDeathTransitionActive)) {
-      if (cipherSecondHalfTransitionStage === "deploy") {
-        setCipherSecondHalfDeployFreezeForPlayer(
-          eventPlayer,
-          keepTransitionDeployReadyAfterUndeploy,
-          "transition_deploy_undeploy"
-        );
-      } else {
-        applyPhaseInputRestrictionsForPlayer(eventPlayer);
-      }
-      mod.SetRedeployTime(eventPlayer, 0);
-      clearTransitionSpawnStateForPlayer(id);
-      return;
-    }
-
-    if (gameStatus === 3 && initialization[3] === true) {
-      syncLiveHybridObjectiveSurfaceState("Mode_OnPlayerUndeploy");
-    }
-
-    if (isSuddenDeathScriptForcedUndeploy && isCipherSuddenDeathActive()) {
-      delete cipherSuddenDeathForcedUndeployTokenByPlayerId[id];
-      try {
-        mod.SetRedeployTime(eventPlayer, 9999);
-      } catch (_errRedeploy) {}
-      return;
-    }
-
-    if (gameStatus === 3 && bombCarrierPlayerId === id) {
-      const undeployPos = tryGetPlayerPositionSafe(eventPlayer);
-      if (undeployPos) lastKnownLivePositionByPlayerId[id] = undeployPos;
-      scheduleBombCarrierDropAfterCombatEvent(id, "undeploy", undeployPos);
-    }
-
-    if (
-      isCipherSuddenDeathActive() &&
-      !isCipherLiveStartSettling() &&
-      wasDeployed &&
-      !wasAliveAtUndeploy &&
-      !isSuddenDeathScriptForcedUndeploy &&
-      safeSpawnForcedUndeploy[id] !== true &&
-      getCurrentSchedulerNowSeconds() >= cipherSuddenDeathUndeployIgnoreUntilSec
-    ) {
-      consumeCipherSuddenDeathLife(id, "undeploy");
-      return;
-    }
-
-
-    if (
-      gameStatus === 1 ||
-      gameStatus === 2
-    ) {
-      applyPhaseInputRestrictionsForPlayer(eventPlayer);
-      mod.SetRedeployTime(eventPlayer, 0);
-      clearTransitionSpawnStateForPlayer(id);
-      requestTransitionSpawn(id, "OnPlayerUndeploy_Transition");
-      return;
-    }
-
-    if (gameStatus === 3) {
-      ForceRemovePlayerFromAllCapturePoints(id);
-      stopCaptureTickLoop(id);
-    }
-
-    if (gameStatus === 3 && undeployedIsBot) {
-      const nowSec = getCurrentSchedulerNowSeconds();
-      const trackedReviveWindowUntilSec = runtimeBotRespawnAfterSecByPlayerId[id];
-      const reviveWindowUntilSec = trackedReviveWindowUntilSec ?? 0;
-      const fallbackRespawnDelaySeconds = isForcedSafeSpawnFlowAtUndeploy
-        ? CIPHER_RUNTIME_BOT_RESPAWN_DELAY_SECONDS
-        : trackedReviveWindowUntilSec !== undefined
-          ? CIPHER_RUNTIME_BOT_RESPAWN_DELAY_SECONDS
-          : CIPHER_RUNTIME_BOT_MANDOWN_REVIVE_WINDOW_SECONDS;
-      const respawnDelaySeconds =
-        reviveWindowUntilSec > nowSec
-          ? reviveWindowUntilSec - nowSec
-          : fallbackRespawnDelaySeconds;
-      safeSpawnForcedUndeploy[id] = false;
-      safeSpawnUnsafePending[id] = false;
-      safeSpawnPendingCheck[id] = false;
-      requestLiveBotSpawnForPlayerId(id, "OnPlayerUndeploy_Live", respawnDelaySeconds);
-      recordScoreboardDeathForPlayer(p);
-      return;
-    }
-
-    if (safeSpawnUnsafePending[id] === true) {
-      if (safeSpawnForcedQueuedGenerationByPlayerId[id] !== undefined) return;
-
-      safeSpawnUnsafePending[id] = false;
-      safeSpawnUnsafeHqObjIdByPlayerId[id] = 0;
-      safeSpawnUnsafeSpawnerObjId[id] = 0;
-      safeSpawnForcedUndeploy[id] = false;
-      return;
-    }
-
-    if (safeSpawnForcedUndeploy[id] === true) return;
-    if (gameStatus === 2) return;
-    if (gameStatus === 3 && getCurrentSchedulerNowSeconds() < cipherPhaseTransitionUndeployIgnoreUntilSec) return;
-
-    if (gameStatus === 3) {
-      startCipherRespawnRouteJobForPlayer(id, wasDeployed, "OnPlayerUndeploy_Live");
-      recordScoreboardDeathForPlayer(p);
-    }
-  } catch (err) {
-    LogRuntimeError("OnPlayerUndeploy", err);
-  } finally {
-    if (!handledMinimalTransitionUndeploy) requestCipherTransitionReconcile("OnPlayerUndeploy");
-  }
-}
-*/
 
 function Mode_OnPlayerInteract(eventPlayer: mod.Player, eventInteractPoint: mod.InteractPoint): void {
   try {
@@ -27084,246 +24146,6 @@ function Mode_OnPlayerUIButtonEvent(
   } catch (err) {
     LogRuntimeError("OnPlayerUIButtonEvent", err);
   }
-}
-
-/* =================================================================================================
-   15) CAPTURE EVENTS (ENTER/EXIT / CAPTURED / LOST / CAPTURING)
-================================================================================================= */
-function SyncPlayersOnPointsFromEngine(): void {
-  if (gameStatus !== 3) return;
-
-  // --- Reused caches (declare these once at module scope if you haven't yet) ---
-  // let _syncStamp = 0;
-  // const _seenThisSync: { [playerId: number]: number } = {};
-  // const _tmpPlayerToCpId: { [playerId: number]: number } = {};
-  // const _tmpPlayerToCpIdKeys: number[] = [];
-  // function _tmpPlayerToCpIdSet(playerId: number, cpId: number): void { ... }
-  // function _tmpPlayerToCpIdClear(): void { ... }
-
-  _syncStamp += 1;
-
-  // Overwrite each CP's _onPoint list with engine truth (no per-call arrays).
-  // Also build a temp player->cpId mapping without allocating a new object.
-  for (const k in serverCapturePoints) {
-    const cp = serverCapturePoints[k];
-    if (!cp) continue;
-
-    cp.clearOnPoint();
-
-    const capturePoint = cp.resolveHandle("syncCapturePointPlayersOnPointFromEngine");
-    if (!capturePoint) continue;
-
-    const arr = mod.GetPlayersOnPoint(capturePoint);
-
-    for (let i = 0; i < mod.CountOf(arr); i++) {
-      const pl = mod.ValueInArray(arr, i) as mod.Player;
-      if (!mod.IsPlayerValid(pl)) continue;
-      if (!isPlayerAlive(pl)) continue;
-
-      const pid = modlib.getPlayerId(pl);
-      const sp = serverPlayers.get(pid);
-      if (!sp) continue;
-      if (!sp.isDeployed) continue;
-
-      // De-dupe without allocating freshIds or doing indexOf scans
-      if (_seenThisSync[pid] === _syncStamp) continue;
-      _seenThisSync[pid] = _syncStamp;
-
-      // Add to this CP's on-point list (reuses same array backing store)
-      (cp as any)._onPoint.push(pid);
-
-      // Record mapping (reused cache, cleared cheaply later)
-      _tmpPlayerToCpIdSet(pid, cp.id);
-    }
-  }
-
-  // Ensure each player's capture UI state matches engine truth.
-  serverPlayers.forEach((sp) => {
-    if (!sp) return;
-
-    const newCpId = _tmpPlayerToCpId[sp.id]; // undefined if not on any point
-    const oldPoint = sp.getCapturePoint();
-
-    if (newCpId === undefined) {
-      if (oldPoint) {
-        sp.setCapturePoint(null);
-        stopCaptureTickLoop(sp.id);
-      }
-      return;
-    }
-
-    const cpWrap = serverCapturePoints[newCpId];
-    if (!cpWrap) return;
-
-    const newPoint = cpWrap.resolveHandle("syncCapturePointPlayersOnPointFromEngine/player");
-    if (!newPoint) return;
-
-    // No mod.GetCapturePointId in your SDK; compare capture point handle directly
-    if (!oldPoint || oldPoint !== newPoint) {
-      sp.setCapturePoint(newPoint);
-      void startCaptureTickLoop(sp.id);
-    }
-
-    sp.updateUIPlayersOnPoint();
-    sp.updateUIProgress();
-  });
-
-  // Clear only keys we set this sync (no new object alloc)
-  _tmpPlayerToCpIdClear();
-}
-
-
-function ForceRemovePlayerFromAllCapturePoints(playerId: number): void {
-  stopCaptureTickLoop(playerId);
-
-  // Remove from all tracked capture points.
-  Object.values(serverCapturePoints).forEach((cp) => cp.removeOnPoint(playerId));
-
-  // Clear their local capture UI state if they are still known on server.
-  const p = serverPlayers.get(playerId);
-  if (p) {
-    p.setCapturePoint(null);
-
-    // These widgets exist only in live; guard in case they are not built yet.
-    if (p.friendlyCapWidget) mod.SetUITextLabel(p.friendlyCapWidget, mod.Message(0));
-    if (p.enemyCapWidget) mod.SetUITextLabel(p.enemyCapWidget, mod.Message(0));
-    if (p.activeFlagWidget) mod.SetUITextLabel(p.activeFlagWidget, mod.Message(0));
-  }
-
-  // Refresh UI for everyone still on points.
-  Object.values(serverCapturePoints).forEach((cp) => cp.updateUIforPlayersOnPoint());
-}
-function markCaptureCredit(cpId: number, playerId: number): void {
-  if (!captureCreditByCpId[cpId]) captureCreditByCpId[cpId] = {};
-  captureCreditByCpId[cpId][playerId] = true;
-}
-
-function clearCaptureCredit(cpId: number): void {
-  captureCreditByCpId[cpId] = {};
-}
-
-function Mode_OnPlayerEnterCapturePoint(eventPlayer: mod.Player, eventCapturePoint: mod.CapturePoint): void {
-  const id = modlib.getPlayerId(eventPlayer);
-  const cpId = mod.GetObjId(eventCapturePoint);
-
-  if (gameStatus !== 3) return;
-  if (isCipherTransitionObjectiveEventSuppressed()) return;
-
-  const team = mod.GetTeam(eventPlayer);
-  const cp = serverCapturePoints[cpId];
-  const player = serverPlayers.get(id);
-
-  if (!cp || !isObjectiveCpId(cpId)) return;
-
-  const before = cp.getOnPoint();
-  cp.addOnPoint(id);
-
-  const lastEnter = lastEnterPointSfxTickByPlayerId[id] ?? -999999;
-  if (phaseTickCount - lastEnter >= ENTER_POINT_SFX_COOLDOWN_TICKS) {
-    lastEnterPointSfxTickByPlayerId[id] = phaseTickCount;
-
-    if (mod.Equals(cp.getOwner(), team) || mod.Equals(cp.getOwner(), teamNeutral)) playThumpFriendly(eventPlayer);
-    else playThumpEnemy(eventPlayer);
-  }
-
-  const onpoint = cp.getOnPoint();
-  const myIdx: 0 | 1 = mod.Equals(team, team1) ? 0 : 1;
-  const otherIdx: 0 | 1 = myIdx === 0 ? 1 : 0;
-
-  const myBefore = before[myIdx];
-  const myAfter = onpoint[myIdx];
-  const enemyAfter = onpoint[otherIdx];
-
-  const ownerTeam = cp.getOwner();
-
-  const teammateJoined = myBefore >= 1 && myAfter >= 2 && enemyAfter === 0 && !mod.Equals(ownerTeam, team);
-
-  if (teammateJoined) {
-    if (canPlayCpSfx(SFX_JOIN_CD_TICKS, lastJoinSfxTickByCp, cpId)) {
-      markCpSfx(lastJoinSfxTickByCp, cpId);
-
-      serverPlayers.forEach((sp) => {
-        if (!mod.Equals(mod.GetTeam(sp.player), team)) return;
-
-        const onCp = sp.getCapturePoint();
-        if (!onCp) return;
-        if (mod.GetObjId(onCp) !== cpId) return;
-        if (sp.id === id) return;
-
-        playTickFriendly(sp.player);
-      });
-    }
-  }
-
-  if (player) {
-    player.setCapturePoint(eventCapturePoint);
-    void startCaptureTickLoop(id);
-  }
-
-  if (isObjectiveActiveForCurrentHalf(cpId)) {
-    tryDeliverCipherKeyForCarrierAtObjective(id, cpId);
-  }
-  
-  cp.updateUIforPlayersOnPoint();
-}
-
-function Mode_OnPlayerExitCapturePoint(eventPlayer: mod.Player, eventCapturePoint: mod.CapturePoint): void {
-  const id = modlib.getPlayerId(eventPlayer);
-  const cpId = mod.GetObjId(eventCapturePoint);
-
-  if (gameStatus !== 3) return;
-  if (isCipherTransitionObjectiveEventSuppressed()) return;
-
-  const cp = serverCapturePoints[cpId];
-  if (!cp || !isObjectiveCpId(cpId)) return;
-
-  cp.removeOnPoint(id);
-
-  const p = serverPlayers.get(id);
-  if (p) {
-    p.setCapturePoint(null);
-    stopCaptureTickLoop(id);
-
-  }
-
-  cp.updateUIforPlayersOnPoint();
-}
-
-function repairObjectiveCapturePointNativeEvent(eventName: string, eventCapturePoint: mod.CapturePoint): void {
-  if (gameStatus !== 3) return;
-  if (isCipherTransitionObjectiveEventSuppressed()) return;
-
-  const cpId = mod.GetObjId(eventCapturePoint);
-  if (!isScriptedObjectiveCapturePointId(cpId)) return;
-  if (objectiveSurfaceSyncInProgress) {
-    objectiveSurfaceSyncQueued = true;
-    return;
-  }
-
-  const activeCpId = getLogicalObjectiveCpIdForSurfaceCpId(cpId) ?? cpId;
-  const activeCp = serverCapturePoints[activeCpId];
-  if (!activeCp || !isObjectiveCpId(activeCpId)) {
-    ensureObjectiveEngineOwnerMatchesScript(cpId, eventName);
-    return;
-  }
-
-  syncLiveHybridObjectiveSurfaceState(eventName, true);
-  updateObjectiveCaptureInteractionForCp(activeCpId);
-  updateCipherCounterWorldIconForCp(activeCpId, true);
-
-  serverPlayers.forEach((p) => UpdateTopFlagColorsForPlayer(p));
-}
-
-function Mode_OnCapturePointCaptured(eventCapturePoint: mod.CapturePoint): void {
-  repairObjectiveCapturePointNativeEvent("Mode_OnCapturePointCaptured", eventCapturePoint);
-}
-
-function Mode_OnCapturePointLost(eventCapturePoint: mod.CapturePoint): void {
-  repairObjectiveCapturePointNativeEvent("Mode_OnCapturePointLost", eventCapturePoint);
-}
-
-function Mode_OnCapturePointCapturing(eventCapturePoint: mod.CapturePoint): void {
-  repairObjectiveCapturePointNativeEvent("Mode_OnCapturePointCapturing", eventCapturePoint);
 }
 
 /* =================================================================================================
@@ -27751,10 +24573,6 @@ function Mode_OnPlayerDied(
       return;
     }
 
-    if (initialization[3] === true) {
-      syncLiveHybridObjectiveSurfaceState("Mode_OnPlayerDied");
-    }
-
     botObjectiveNextThinkAtSec = 0;
     requestCipherTransitionReconcile("OnPlayerDied");
   } catch (err) {
@@ -27828,35 +24646,6 @@ function Mode_OnPlayerEnterAreaTrigger(eventPlayer: mod.Player, eventAreaTrigger
     return;
   }
 
-  if (triggerId === BOMB_PICKUP_TRIGGER_ID) {
-    if (!BOMB_USE_PICKUP_AREA_TRIGGER_AUTHORITY) return;
-    if (!bombPickupTriggerEnabled) return;
-    if (bombCarrierPlayerId !== undefined) return;
-
-    const pBomb = serverPlayers.get(playerId);
-    if (!pBomb) return;
-    if (!pBomb.isDeployed) return;
-    if (!mod.IsPlayerValid(eventPlayer)) return;
-    if (!isPlayerAlive(eventPlayer)) return;
-
-    const team = getCipherKeyTeamSnapshot(playerId) ?? pBomb.team;
-    if (!mod.Equals(team, team1) && !mod.Equals(team, team2)) return;
-
-    const fromDroppedBomb = hasDroppedBombRuntimeObjects();
-
-    tryUnspawnAllLootForBombFlow("area_trigger_pickup");
-
-    if (fromDroppedBomb) {
-      clearDroppedBombRuntimeObjects();
-    }
-    clearBombBaseRuntimeLootSpawner();
-    transferBombToPlayerAsCarrier(pBomb, fromDroppedBomb, "area_watch");
-
-    setBombPickupTriggerEnabled(false);
-    setBombBaseAvailabilityState(false);
-    return;
-  }
-
   const p = serverPlayers.get(playerId);
   if (!p) return;
 
@@ -27866,13 +24655,7 @@ function Mode_OnPlayerEnterAreaTrigger(eventPlayer: mod.Player, eventAreaTrigger
     return;
   }
 
-  // Existing damage zone
-  if (triggerId === DAMAGE_TRIGGER_ID) {
-    playerInDamageZone[playerId] = true;
-    return;
-  }
-
-  // Restricted areas: shared 7003 + team-specific HQ protection areas.
+  // Cairo has one authored restricted area (7003).
   if (isRestrictedAreaTriggerId(triggerId)) {
     const playerTeam = mod.GetTeam(eventPlayer);
     if (!isRestrictedTriggerForPlayer(triggerId, playerTeam)) return;
@@ -27925,12 +24708,6 @@ function Mode_OnPlayerExitAreaTrigger(eventPlayer: mod.Player, eventAreaTrigger:
     return;
   }
 
-  // Existing damage zone
-  if (triggerId === DAMAGE_TRIGGER_ID) {
-    playerInDamageZone[playerId] = false;
-    return;
-  }
-
   if (triggerId === COMBAT_BOUNDARY_TRIGGER_ID) {
     const p = serverPlayers.get(playerId);
     if (!p) return;
@@ -27951,66 +24728,6 @@ function Mode_OnPlayerExitAreaTrigger(eventPlayer: mod.Player, eventAreaTrigger:
     return;
   }
 
-}
-
-function Mode_OnMCOMArmed(eventMCOM: mod.MCOM): void {
-  disableHardObjectiveMcoms("Mode_OnMCOMArmed");
-  if (gameStatus !== 3) return;
-  if (isCipherTransitionObjectiveEventSuppressed()) return;
-
-  const cpId = resolveObjectiveCpIdFromMcomEvent(eventMCOM);
-  if (cpId === undefined) {
-    logObjectiveNativeEventFlow("armed_unmapped", eventMCOM, cpId);
-    return;
-  }
-
-  safeEnableObjectiveMcomByCpId(cpId, false, "Mode_OnMCOMArmed", true);
-  reapplyLiveHybridObjectiveSurfaceStateForCp(cpId, "Mode_OnMCOMArmed");
-  logObjectiveNativeEventFlow("armed_ignored", eventMCOM, cpId);
-}
-
-function Mode_OnMCOMDefused(eventMCOM: mod.MCOM): void {
-  disableHardObjectiveMcoms("Mode_OnMCOMDefused");
-  if (gameStatus !== 3) return;
-  if (isCipherTransitionObjectiveEventSuppressed()) return;
-
-  const cpId = resolveObjectiveCpIdFromMcomEvent(eventMCOM);
-  if (cpId === undefined) {
-    logObjectiveNativeEventFlow("defused_unmapped", eventMCOM, cpId);
-    return;
-  }
-
-  safeEnableObjectiveMcomByCpId(cpId, false, "Mode_OnMCOMDefused", true);
-  reapplyLiveHybridObjectiveSurfaceStateForCp(cpId, "Mode_OnMCOMDefused");
-  logObjectiveNativeEventFlow("defused_ignored", eventMCOM, cpId);
-}
-
-function Mode_OnMCOMDestroyed(eventMCOM: mod.MCOM): void {
-  disableHardObjectiveMcoms("Mode_OnMCOMDestroyed");
-  if (gameStatus !== 3) return;
-  if (isCipherTransitionObjectiveEventSuppressed()) return;
-
-  const cpId = resolveObjectiveCpIdFromMcomEvent(eventMCOM);
-  if (cpId === undefined) {
-    logObjectiveNativeEventFlow("destroyed_unmapped", eventMCOM, cpId);
-    return;
-  }
-
-  safeEnableObjectiveMcomByCpId(cpId, false, "Mode_OnMCOMDestroyed", true);
-  reapplyLiveHybridObjectiveSurfaceStateForCp(cpId, "Mode_OnMCOMDestroyed");
-  logObjectiveNativeEventFlow("destroyed_ignored", eventMCOM, cpId);
-}
-
-function Mode_OngoingMCOM(eventMCOM: mod.MCOM): void {
-  disableHardObjectiveMcoms("Mode_OngoingMCOM");
-  if (gameStatus !== 3) return;
-  if (isCipherTransitionObjectiveEventSuppressed()) return;
-
-  const cpId = resolveObjectiveCpIdFromMcomEvent(eventMCOM);
-  if (cpId === undefined) return;
-
-  safeEnableObjectiveMcomByCpId(cpId, false, "Mode_OngoingMCOM", true);
-  reapplyLiveHybridObjectiveSurfaceStateForCp(cpId, "Mode_OngoingMCOM");
 }
 
 function Mode_OnAIMoveToFailed(eventPlayer: mod.Player): void {
@@ -28059,7 +24776,7 @@ function Mode_OnSpawnerSpawned(eventPlayer: mod.Player, eventSpawner: mod.Spawne
   }
 }
 
-export function isSquadObliterationLivePhase(): boolean {
+export function isCipherLivePhase(): boolean {
   return gameStatus === 3;
 }
 
@@ -28083,24 +24800,10 @@ export const adminRuntimeHandlers = {
   onPlayerUIButtonEvent: Mode_OnPlayerUIButtonEvent,
 };
 
-export const objectiveRuntimeHandlers = {
-  onPlayerEnterCapturePoint: Mode_OnPlayerEnterCapturePoint,
-  onPlayerExitCapturePoint: Mode_OnPlayerExitCapturePoint,
-  onCapturePointCaptured: Mode_OnCapturePointCaptured,
-  onCapturePointLost: Mode_OnCapturePointLost,
-  onCapturePointCapturing: Mode_OnCapturePointCapturing,
-  onOngoingMcom: Mode_OngoingMCOM,
-  onMcomArmed: Mode_OnMCOMArmed,
-  onMcomDefused: Mode_OnMCOMDefused,
-  onMcomDestroyed: Mode_OnMCOMDestroyed,
-};
-
 export const botRuntimeHandlers = {
   onAiMoveToFailed: Mode_OnAIMoveToFailed,
   onAiMoveToSucceeded: Mode_OnAIMoveToSucceeded,
   onSpawnerSpawned: Mode_OnSpawnerSpawned,
-  onRayCastHit: Mode_OnRayCastHit,
-  onRayCastMissed: Mode_OnRayCastMissed,
 };
 
 export const combatRuntimeHandlers = {

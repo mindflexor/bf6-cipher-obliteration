@@ -1,243 +1,157 @@
-import fs from 'fs';
-import path from 'path';
+import fs from 'node:fs';
+import path from 'node:path';
 
-const EXPECTED_OBJECTIVE_MCOM_IDS = [7101, 7102, 7201, 7202];
-const EXPECTED_CAPTURE_POINT_IDS = [201, 202, 301, 302];
-const EXPECTED_NEUTRAL_CAPTURE_POINT_IDS = [203, 204, 303, 304];
-const EXPECTED_OBJECTIVE_TRIGGER_IDS = [401, 402, 502, 503];
-const EXPECTED_OBJECTIVE_COUNTER_WORLD_ICON_IDS = [221, 222, 322, 323];
-const EXPECTED_LIVE_HQ_IDS = [1, 2, 3, 4];
-const EXPECTED_PRESENCE_TRIGGER_IDS = [901, 902, 903, 904];
-const EXPECTED_SPAWN_ANCHOR_IDS = [
+const REQUIRED_OBJECTS = [
+    ...[1, 2, 3, 4, 8888, 8889].map((id) => ({ id, type: 'HQ_PlayerSpawner', label: 'HQ' })),
+    ...[201, 202, 203, 204, 301, 302, 303, 304].map((id) => ({ id, type: 'CapturePoint', label: 'display CapturePoint' })),
+    ...[401, 402, 403, 404, 889, 901, 902, 903, 904, 7003, 9999].map((id) => ({ id, type: 'AreaTrigger', label: 'AreaTrigger' })),
+    ...[2001, 2002, 2003, 2004, 2101, 2102, 2103, 2104].map((id) => ({ id, type: 'InteractPoint', label: 'InteractPoint' })),
+    ...[221, 222, 223, 321, 890, 891, 5001, 5002, 5003, 5004].map((id) => ({ id, type: 'WorldIcon', label: 'WorldIcon' })),
+    ...[8085, 8086].map((id) => ({ id, type: 'AI_Spawner', label: 'bot spawner' })),
+    { id: 200, type: 'Sector', label: 'first-half sector' },
+    { id: 300, type: 'Sector', label: 'second-half sector' },
+    { id: 3100, type: 'Sector', label: 'key-anchor sector' },
+    { id: 4646, type: 'FixedCamera', label: 'postmatch camera' },
+    { id: 4747, type: 'FiringRange_MatDecal_01', label: 'postmatch anchor' },
+];
+
+const REQUIRED_SPATIAL_ANCHORS = [
+    215, 216, 217, 218, 3101, 3102, 3103,
     1411, 1412, 1413, 1414, 1415, 1421, 1422, 1423, 1424, 1425,
     2311, 2312, 2313, 2314, 2315, 2321, 2322, 2323, 2324, 2325,
     3411, 3412, 3413, 3414, 3415, 3421, 3422, 3423, 3424, 3425,
     4311, 4312, 4313, 4314, 4315, 4321, 4322, 4323, 4324, 4325,
-];
-const EXPECTED_FIRST_DEPLOY_ANCHOR_IDS = [
-    1511, 1512, 1513, 1514,
-    3511, 3512, 3513, 3514,
-];
-const EXPECTED_POSTMATCH_OBJECTS = [
-    { id: 4747, type: 'FiringRange_MatDecal_01', label: 'Postmatch runtime spawn parent' },
-    { id: 4646, type: 'FixedCamera', label: 'Postmatch fixed camera' },
-];
-const FORBIDDEN_AUTHORING_POSTMATCH_OBJECT_IDS = [
-    4545, 4546, 4547, 4548, 4550, 4551, 4552, 4553, 4554, 4555, 4556, 4557, 4558, 4559,
-];
-const EXPECTED_OBJECTIVE_SECTORS = [
-    { sectorId: 200, capturePointIds: [201, 202], mcomIds: [7101, 7102] },
-    { sectorId: 300, capturePointIds: [301, 302], mcomIds: [7201, 7202] },
-    { sectorId: 210, capturePointIds: [203, 204], mcomIds: [] },
-    { sectorId: 310, capturePointIds: [303, 304], mcomIds: [] },
+    1511, 1512, 1513, 1514, 3511, 3512, 3513, 3514,
 ];
 
-function parseArgs(argv) {
-    for (let i = 0; i < argv.length; i++) {
-        const arg = argv[i];
-        if (arg === '--input' || arg === '-i') {
-            return argv[i + 1];
-        }
-        if (!arg.startsWith('-')) {
-            return arg;
-        }
-    }
-    return undefined;
+const REQUIRED_NODE_VISUALS = [
+    ...[211, 212, 213, 311].map((id) => ({ id, type: 'FX_Car_Fire_M_GS' })),
+    ...[611, 612, 613, 711].map((id) => ({ id, type: 'FX_CarFire_FrameCrawl' })),
+    ...[8101, 8102, 8103, 8201].map((id) => ({ id, type: 'FX_Vehicle_Car_Destruction_Death_Explosion_PTV' })),
+];
+
+const FORBIDDEN_IDS = new Set([
+    400, 7001, 5101, 5102, 6001, 3111, 7101, 7102, 7103, 7104, 7201, 7202,
+    331, 332, 333, 334, 335, 336, 337, 338, 339, 340,
+    341, 342, 343, 344, 345, 346, 347, 348, 349,
+    4501, 4502, 4503, 4504, 4505, 4506, 4507, 4508, 4509, 4510,
+    4511, 4512, 4513, 4514, 4515, 4601, 4602, 4603, 4604, 4605,
+]);
+
+const FORBIDDEN_PATHS = new Set([
+    'CO Components/Sector_First_Half/Capture Points/CapturePointA/LootSpawner',
+]);
+
+const REQUIRED_SPATIAL_PATHS = new Set([
+    'CombatArea',
+    'CombatArea/AreaTrigger',
+    'Camera3D/DeployCam',
+]);
+
+function parseInput(argv) {
+    const index = argv.findIndex((arg) => arg === '--input' || arg === '-i');
+    if (index >= 0) return argv[index + 1];
+    return argv.find((arg) => !arg.startsWith('-'));
 }
 
-function getObjectObjId(entry) {
-    const raw = entry?.ObjId;
-    const value = typeof raw === 'number' ? raw : Number(raw);
+function objIdOf(entry) {
+    const value = Number(entry?.ObjId);
     return Number.isFinite(value) ? value : undefined;
 }
 
-function asArray(value) {
-    return Array.isArray(value) ? value : [];
+function sameNumbers(actual, expected) {
+    const left = [...actual].map(Number).sort((a, b) => a - b);
+    const right = [...expected].map(Number).sort((a, b) => a - b);
+    return left.length === right.length && left.every((value, index) => value === right[index]);
 }
 
-function sortedNumeric(values) {
-    return [...values].sort((a, b) => a - b);
-}
+const inputPath = parseInput(process.argv.slice(2));
+if (!inputPath) throw new Error('Usage: node scripts/validate-authored-spatial.js --input <spatial.json>');
 
-function sameNumberSet(actual, expected) {
-    if (actual.length !== expected.length) return false;
-    const actualSorted = sortedNumeric(actual);
-    const expectedSorted = sortedNumeric(expected);
-    for (let i = 0; i < actualSorted.length; i++) {
-        if (actualSorted[i] !== expectedSorted[i]) return false;
-    }
-    return true;
-}
+const resolvedPath = path.resolve(inputPath);
+const parsed = JSON.parse(fs.readFileSync(resolvedPath, 'utf8'));
+const objects = parsed?.Portal_Dynamic;
+if (!Array.isArray(objects)) throw new Error(`Missing Portal_Dynamic array: ${resolvedPath}`);
 
-function formatObjectRef(entry) {
-    const objId = getObjectObjId(entry);
-    const name = typeof entry?.name === 'string' ? entry.name : 'unknown';
-    const type = typeof entry?.type === 'string' ? entry.type : 'unknown';
-    return `${name}/${type}/${objId ?? 'no-objid'}`;
-}
-
-function fail(errors) {
-    console.error('Authored spatial validation failed:');
-    for (const error of errors) {
-        console.error(`- ${error}`);
-    }
-    process.exit(1);
-}
-
-const inputPath = parseArgs(process.argv.slice(2));
-if (!inputPath) {
-    console.error('Usage: node scripts/validate-authored-spatial.js --input <path-to-spatial.json>');
-    process.exit(1);
-}
-
-const resolvedInputPath = path.resolve(inputPath);
-if (!fs.existsSync(resolvedInputPath)) {
-    console.error(`Spatial export not found: ${resolvedInputPath}`);
-    process.exit(1);
-}
-
-const raw = fs.readFileSync(resolvedInputPath, 'utf8');
-const parsed = JSON.parse(raw);
-const objects = Array.isArray(parsed?.Portal_Dynamic) ? parsed.Portal_Dynamic : undefined;
-if (!objects) {
-    console.error('Spatial export is missing the Portal_Dynamic array.');
-    process.exit(1);
-}
-
-const objectsByPath = new Map();
-const objectsByObjId = new Map();
+const byId = new Map();
+const byPath = new Map();
+const errors = [];
 for (const entry of objects) {
     if (typeof entry?.id === 'string') {
-        objectsByPath.set(entry.id, entry);
+        if (byPath.has(entry.id)) errors.push(`Duplicate spatial path ${entry.id}.`);
+        byPath.set(entry.id, entry);
     }
-    const objId = getObjectObjId(entry);
-    if (objId === undefined) continue;
-    const list = objectsByObjId.get(objId) ?? [];
-    list.push(entry);
-    objectsByObjId.set(objId, list);
+    const id = objIdOf(entry);
+    if (id === undefined) continue;
+    const matches = byId.get(id) ?? [];
+    matches.push(entry);
+    byId.set(id, matches);
 }
 
-const errors = [];
-
-function validateObjectIds(ids, expectedType, label) {
-    for (const id of ids) {
-        const matches = objectsByObjId.get(id) ?? [];
-        if (matches.length !== 1) {
-            errors.push(`${label} ObjId ${id} must appear exactly once, found ${matches.length}.`);
-            continue;
-        }
-        if (expectedType && matches[0]?.type !== expectedType) {
-            errors.push(`${label} ObjId ${id} must resolve to ${expectedType}, found ${formatObjectRef(matches[0])}.`);
-        }
+const requireObject = ({ id, type, label = 'object' }) => {
+    const matches = byId.get(id) ?? [];
+    if (matches.length !== 1) {
+        errors.push(`${label} ${id} must appear exactly once; found ${matches.length}.`);
+        return;
     }
+    if (type && matches[0]?.type !== type) {
+        errors.push(`${label} ${id} must be ${type}; found ${matches[0]?.type ?? 'unknown'}.`);
+    }
+};
+
+for (const [id, matches] of byId) {
+    if (matches.length > 1) errors.push(`ObjId ${id} is duplicated ${matches.length} times.`);
 }
+for (const required of REQUIRED_OBJECTS) requireObject(required);
+for (const id of REQUIRED_SPATIAL_ANCHORS) requireObject({ id, type: 'FiringRange_MatDecal_01', label: 'spatial anchor' });
+for (const required of REQUIRED_NODE_VISUALS) requireObject({ ...required, label: 'node visual' });
 
-function validateObjectiveTriggerIds(ids) {
-    for (const id of ids) {
-        const matches = objectsByObjId.get(id) ?? [];
-        if (matches.length < 1) {
-            errors.push(`Objective trigger ObjId ${id} must appear at least once, found ${matches.length}.`);
-            continue;
-        }
+for (const id of FORBIDDEN_IDS) {
+    if ((byId.get(id) ?? []).length > 0) errors.push(`Forbidden legacy ObjId ${id} is still authored.`);
+}
+for (const objectPath of FORBIDDEN_PATHS) {
+    if (byPath.has(objectPath)) errors.push(`Forbidden legacy object is still authored: ${objectPath}`);
+}
+for (const objectPath of REQUIRED_SPATIAL_PATHS) {
+    if (!byPath.has(objectPath)) errors.push(`Required spatial-only object is missing: ${objectPath}`);
+}
+if (objects.some((entry) => entry?.type === 'MCOM')) errors.push('The Cipher spatial must not contain native MCOM objects.');
 
-        const activeMatches = matches.filter((entry) => {
-            const objectPath = typeof entry?.id === 'string' ? entry.id : '';
-            return !objectPath.toLowerCase().includes('neutral');
-        });
-        if (activeMatches.length !== 1) {
-            errors.push(`Objective trigger ObjId ${id} must have exactly one active trigger, found ${activeMatches.length}.`);
-        }
-
-        for (const match of matches) {
-            if (match?.type !== 'AreaTrigger') {
-                errors.push(`Objective trigger ObjId ${id} must resolve to AreaTrigger, found ${formatObjectRef(match)}.`);
+for (const entry of objects) {
+    for (const referenceField of ['CapturePoints', 'MCOMs', 'InfantrySpawns']) {
+        for (const reference of entry?.[referenceField] ?? []) {
+            if (!byPath.has(reference)) {
+                errors.push(`${entry.id ?? entry.ObjId ?? 'unknown'} ${referenceField} references missing object ${reference}.`);
             }
         }
     }
 }
 
-for (const mcomId of EXPECTED_OBJECTIVE_MCOM_IDS) {
-    const matches = objectsByObjId.get(mcomId) ?? [];
-    if (matches.length !== 1) {
-        errors.push(`ObjId ${mcomId} must appear exactly once, found ${matches.length}.`);
-        continue;
+for (const expectation of [
+    { id: 200, capturePoints: [201, 202, 203, 204] },
+    { id: 300, capturePoints: [301, 302, 303, 304] },
+]) {
+    const sector = (byId.get(expectation.id) ?? [])[0];
+    if (!sector) continue;
+    const cpIds = (sector.CapturePoints ?? []).map((ref) => objIdOf(byPath.get(ref))).filter(Number.isFinite);
+    if (!sameNumbers(cpIds, expectation.capturePoints)) {
+        errors.push(`Sector ${expectation.id} CapturePoints must be ${expectation.capturePoints.join(', ')}; found ${cpIds.join(', ') || 'none'}.`);
     }
-    if (matches[0]?.type !== 'MCOM') {
-        errors.push(`ObjId ${mcomId} must resolve to an MCOM, found ${formatObjectRef(matches[0])}.`);
-    }
+    if ((sector.MCOMs ?? []).length > 0) errors.push(`Sector ${expectation.id} must not reference MCOMs.`);
 }
 
-for (const capturePointId of EXPECTED_CAPTURE_POINT_IDS) {
-    const matches = objectsByObjId.get(capturePointId) ?? [];
-    if (matches.length !== 1) {
-        errors.push(`Capture point ObjId ${capturePointId} must appear exactly once, found ${matches.length}.`);
-        continue;
-    }
-    if (matches[0]?.type !== 'CapturePoint') {
-        errors.push(
-            `Capture point ObjId ${capturePointId} must resolve to a CapturePoint, found ${formatObjectRef(matches[0])}.`
-        );
-    }
-}
-
-for (const capturePointId of EXPECTED_NEUTRAL_CAPTURE_POINT_IDS) {
-    const matches = objectsByObjId.get(capturePointId) ?? [];
-    if (matches.length !== 1) {
-        errors.push(`Neutral capture point ObjId ${capturePointId} must appear exactly once, found ${matches.length}.`);
-        continue;
-    }
-    if (matches[0]?.type !== 'CapturePoint') {
-        errors.push(
-            `Neutral capture point ObjId ${capturePointId} must resolve to a CapturePoint, found ${formatObjectRef(matches[0])}.`
-        );
-    }
-}
-
-validateObjectiveTriggerIds(EXPECTED_OBJECTIVE_TRIGGER_IDS);
-validateObjectIds(EXPECTED_OBJECTIVE_COUNTER_WORLD_ICON_IDS, 'WorldIcon', 'Objective counter world icon');
-validateObjectIds(EXPECTED_LIVE_HQ_IDS, 'HQ_PlayerSpawner', 'Live HQ');
-validateObjectIds(EXPECTED_PRESENCE_TRIGGER_IDS, 'AreaTrigger', 'Presence-grid trigger');
-validateObjectIds(EXPECTED_SPAWN_ANCHOR_IDS, undefined, 'Spawn anchor');
-validateObjectIds(EXPECTED_FIRST_DEPLOY_ANCHOR_IDS, 'FiringRange_MatDecal_01', 'First-deploy spawn anchor');
-for (const expected of EXPECTED_POSTMATCH_OBJECTS) {
-    validateObjectIds([expected.id], expected.type, expected.label);
-}
-for (const id of FORBIDDEN_AUTHORING_POSTMATCH_OBJECT_IDS) {
-    const matches = objectsByObjId.get(id) ?? [];
-    if (matches.length > 0) {
-        errors.push(`Runtime-spawned postmatch prop ObjId ${id} must not be authored in the spatial, found ${matches.length}.`);
-    }
-}
-
-for (const expectedSector of EXPECTED_OBJECTIVE_SECTORS) {
-    const sectorMatches = objectsByObjId.get(expectedSector.sectorId) ?? [];
-    if (sectorMatches.length !== 1 || sectorMatches[0]?.type !== 'Sector') {
-        errors.push(`Sector ${expectedSector.sectorId} must resolve exactly once as a Sector, found ${sectorMatches.length}.`);
-        continue;
-    }
-
-    const sector = sectorMatches[0];
-    const resolvedCapturePointIds = asArray(sector.CapturePoints)
-        .map((ref) => getObjectObjId(objectsByPath.get(ref)))
-        .filter((value) => value !== undefined);
-    if (!sameNumberSet(resolvedCapturePointIds, expectedSector.capturePointIds)) {
-        errors.push(
-            `Sector ${expectedSector.sectorId} must reference CapturePoint ObjIds ${expectedSector.capturePointIds.join(', ')}, found ${resolvedCapturePointIds.join(', ') || 'none'}.`
-        );
-    }
-
-    const resolvedMcomIds = asArray(sector.MCOMs)
-        .map((ref) => getObjectObjId(objectsByPath.get(ref)))
-        .filter((value) => value !== undefined);
-    if (!sameNumberSet(resolvedMcomIds, expectedSector.mcomIds)) {
-        errors.push(
-            `Sector ${expectedSector.sectorId} must reference MCOM ObjIds ${expectedSector.mcomIds.join(', ')}, found ${resolvedMcomIds.join(', ') || 'none'}.`
-        );
+for (const id of [1, 2, 3, 4, 8888, 8889]) {
+    const hq = (byId.get(id) ?? [])[0];
+    if (!hq) continue;
+    for (const spawnRef of hq.InfantrySpawns ?? []) {
+        if (!byPath.has(spawnRef)) errors.push(`HQ ${id} references missing SpawnPoint ${spawnRef}.`);
     }
 }
 
 if (errors.length > 0) {
-    fail(errors);
+    console.error('Cairo spatial validation failed:');
+    for (const error of errors) console.error(`- ${error}`);
+    process.exit(1);
 }
 
-console.log(`Authored spatial validation passed for ${resolvedInputPath}`);
+console.log(`Cairo spatial validation passed: ${resolvedPath}`);

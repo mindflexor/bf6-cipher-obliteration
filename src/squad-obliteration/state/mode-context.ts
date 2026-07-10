@@ -1,6 +1,6 @@
 import { AUDIO_CONFIG } from '../config/audio.ts';
 import { BOMB_CONFIG } from '../config/bomb.ts';
-import { SQUAD_OBJECTIVE_CONFIGS, SQUAD_ROUTING_CAPTURE_POINT_IDS } from '../config/objectives.ts';
+import { CIPHER_OBJECTIVE_CONFIGS, CIPHER_ROUTING_CAPTURE_POINT_IDS } from '../config/objectives.ts';
 import { PHASE_CONFIG } from '../config/phases.ts';
 import { WORLD_IDS, type WorldIdsConfig } from '../config/world-ids.ts';
 import { RULES } from '../config/rules.ts';
@@ -19,18 +19,23 @@ export interface ModeContext {
     ui: typeof UI_CONFIG;
     spawnRouting: typeof SPAWN_ROUTING_CONFIG;
     objectives: {
-        definitions: typeof SQUAD_OBJECTIVE_CONFIGS;
-        routingCapturePointIds: typeof SQUAD_ROUTING_CAPTURE_POINT_IDS;
+        definitions: typeof CIPHER_OBJECTIVE_CONFIGS;
+        routingCapturePointIds: typeof CIPHER_ROUTING_CAPTURE_POINT_IDS;
     };
 }
 
 export function createModeContext(): ModeContext {
     const runtime = createRuntimeState();
 
-    for (const definition of SQUAD_OBJECTIVE_CONFIGS) {
+    for (const definition of CIPHER_OBJECTIVE_CONFIGS) {
         runtime.capturePoints.set(
             definition.cpId,
-            new CapturePointState(mod.GetCapturePoint(definition.cpId), definition.cpId, definition.lane)
+            new CapturePointState(
+                definition.cpId,
+                definition.lane,
+                definition.half,
+                definition.defendingTeamId
+            )
         );
     }
 
@@ -44,8 +49,8 @@ export function createModeContext(): ModeContext {
         ui: UI_CONFIG,
         spawnRouting: SPAWN_ROUTING_CONFIG,
         objectives: {
-            definitions: SQUAD_OBJECTIVE_CONFIGS,
-            routingCapturePointIds: SQUAD_ROUTING_CAPTURE_POINT_IDS,
+            definitions: CIPHER_OBJECTIVE_CONFIGS,
+            routingCapturePointIds: CIPHER_ROUTING_CAPTURE_POINT_IDS,
         },
     };
 }

@@ -4,9 +4,8 @@ export type ObjectiveLane = 'A' | 'B' | 'C' | 'D';
 export type ObjectiveHalf = 1 | 2;
 export type ObjectiveSide = 'north' | 'south';
 
-export interface SquadObjectiveConfig {
+export interface CipherObjectiveConfig {
     cpId: number;
-    mcomId?: number;
     lane: ObjectiveLane;
     displayLane?: ObjectiveLane;
     half: ObjectiveHalf;
@@ -17,10 +16,9 @@ export interface SquadObjectiveConfig {
     countsForRouting: boolean;
 }
 
-export const SQUAD_OBJECTIVE_CONFIGS: SquadObjectiveConfig[] = [
+export const CIPHER_OBJECTIVE_CONFIGS: CipherObjectiveConfig[] = [
     {
         cpId: WORLD_IDS.capturePoints.a,
-        mcomId: 7101,
         lane: 'A',
         displayLane: 'A',
         half: 1,
@@ -32,7 +30,6 @@ export const SQUAD_OBJECTIVE_CONFIGS: SquadObjectiveConfig[] = [
     },
     {
         cpId: WORLD_IDS.capturePoints.b,
-        mcomId: 7102,
         lane: 'B',
         displayLane: 'B',
         half: 1,
@@ -44,7 +41,6 @@ export const SQUAD_OBJECTIVE_CONFIGS: SquadObjectiveConfig[] = [
     },
     {
         cpId: WORLD_IDS.capturePoints.c,
-        mcomId: 7103,
         lane: 'C',
         displayLane: 'C',
         half: 1,
@@ -56,7 +52,6 @@ export const SQUAD_OBJECTIVE_CONFIGS: SquadObjectiveConfig[] = [
     },
     {
         cpId: WORLD_IDS.capturePoints.d,
-        mcomId: 7104,
         lane: 'D',
         displayLane: 'D',
         half: 1,
@@ -112,7 +107,7 @@ export const SQUAD_OBJECTIVE_CONFIGS: SquadObjectiveConfig[] = [
     },
 ];
 
-export const SQUAD_ROUTING_CAPTURE_POINT_IDS: number[] = [
+export const CIPHER_ROUTING_CAPTURE_POINT_IDS: number[] = [
     WORLD_IDS.capturePoints.a,
     WORLD_IDS.capturePoints.b,
     WORLD_IDS.capturePoints.c,
