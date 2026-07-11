@@ -32,6 +32,19 @@ export interface PureNodeState {
     rebootDeadline?: number;
 }
 
+export type PurePostmatchStatKind = 'eliminations' | 'destroyed' | 'keyTime' | 'moralSupport';
+
+export interface PurePostmatchCandidate {
+    playerId: number;
+    scoreboard: [number, number, number, number, number];
+}
+
+export interface PurePostmatchSlot {
+    playerId: number;
+    statKind: PurePostmatchStatKind;
+    statValue: number;
+}
+
 export interface PureCipherState {
     phase: PureCipherPhase;
     half: 1 | 2;
@@ -203,4 +216,56 @@ export function processPureNodeReboots(state: PureCipherState, nowSeconds: numbe
             node.rebootDeadline = undefined;
         }
     }
+}
+
+function getPurePostmatchStatValue(
+    candidate: PurePostmatchCandidate,
+    statKind: PurePostmatchStatKind
+): number {
+    if (statKind === 'eliminations') return candidate.scoreboard[1];
+    if (statKind === 'destroyed') return candidate.scoreboard[4];
+    if (statKind === 'keyTime') return candidate.scoreboard[3];
+    return candidate.scoreboard[0];
+}
+
+export function selectPurePostmatchSlots(candidates: PurePostmatchCandidate[]): PurePostmatchSlot[] {
+    const statKinds: PurePostmatchStatKind[] = ['eliminations', 'destroyed', 'keyTime', 'moralSupport'];
+    const remaining = candidates.slice();
+    const slots: PurePostmatchSlot[] = [];
+    for (const statKind of statKinds) {
+        if (remaining.length === 0) break;
+        remaining.sort((a, b) => {
+            const statDifference = getPurePostmatchStatValue(b, statKind) - getPurePostmatchStatValue(a, statKind);
+            if (statDifference !== 0) return statDifference;
+            const scoreDifference = b.scoreboard[0] - a.scoreboard[0];
+            if (statKind !== 'moralSupport' && scoreDifference !== 0) return scoreDifference;
+            if (statKind === 'moralSupport' && scoreDifference !== 0) return -scoreDifference;
+            return a.playerId - b.playerId;
+        });
+        const selected = remaining.shift() as PurePostmatchCandidate;
+        slots.push({
+            playerId: selected.playerId,
+            statKind,
+            statValue: getPurePostmatchStatValue(selected, statKind),
+        });
+    }
+    return slots;
+}
+
+export function getPurePostmatchCountdown(
+    endTick: number,
+    currentTick: number,
+    tickRate: number
+): number {
+    if (tickRate <= 0) return 0;
+    return Math.max(0, Math.ceil(Math.max(0, endTick - currentTick) / tickRate));
+}
+
+export function isPurePostmatchTeleportCurrent(
+    expectedSession: number,
+    currentSession: number,
+    expectedNativeObjId: number,
+    currentNativeObjId: number
+): boolean {
+    return expectedSession === currentSession && expectedNativeObjId === currentNativeObjId;
 }

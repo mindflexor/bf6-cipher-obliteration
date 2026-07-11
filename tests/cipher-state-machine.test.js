@@ -9,9 +9,12 @@ import {
     createPureRespawnRoute,
     deliverPureKey,
     disconnectPurePlayer,
+    getPurePostmatchCountdown,
+    isPurePostmatchTeleportCurrent,
     pickUpPureKey,
     processPureNodeReboots,
     resetPureCipherMatch,
+    selectPurePostmatchSlots,
     transitionPureCipherPhase,
 } from '../src/squad-obliteration/state/cipher-state-machine.ts';
 
@@ -25,6 +28,37 @@ test('phase flow reaches half two, sudden death, postmatch, and reset', () => {
     resetPureCipherMatch(state);
     assert.equal(state.phase, 'prematch');
     assert.deepEqual(state.score, [0, 0]);
+});
+
+test('postmatch fills four deterministic slots even when every stat is zero', () => {
+    const players = [4, 2, 3, 1].map((playerId) => ({
+        playerId,
+        scoreboard: [0, 0, 0, 0, 0],
+    }));
+    const slots = selectPurePostmatchSlots(players);
+    assert.equal(slots.length, 4);
+    assert.deepEqual(slots.map((slot) => slot.playerId), [1, 2, 3, 4]);
+    assert.equal(new Set(slots.map((slot) => slot.playerId)).size, 4);
+    assert.deepEqual(slots.map((slot) => slot.statKind), [
+        'eliminations',
+        'destroyed',
+        'keyTime',
+        'moralSupport',
+    ]);
+});
+
+test('postmatch uses available players, tick countdown, and rejects stale teleport identity', () => {
+    const slots = selectPurePostmatchSlots([
+        { playerId: 7, scoreboard: [50, 3, 0, 0, 0] },
+        { playerId: 8, scoreboard: [25, 0, 0, 10, 0] },
+    ]);
+    assert.equal(slots.length, 2);
+    assert.equal(getPurePostmatchCountdown(600, 0, 30), 20);
+    assert.equal(getPurePostmatchCountdown(600, 30, 30), 19);
+    assert.equal(getPurePostmatchCountdown(600, 600, 30), 0);
+    assert.equal(isPurePostmatchTeleportCurrent(4, 4, 101, 101), true);
+    assert.equal(isPurePostmatchTeleportCurrent(4, 5, 101, 101), false);
+    assert.equal(isPurePostmatchTeleportCurrent(4, 4, 101, 202), false);
 });
 
 test('reconnect restores score while reused ids invalidate stale work', () => {

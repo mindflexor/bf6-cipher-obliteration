@@ -34,6 +34,7 @@ import { RULES } from '../config/rules.ts';
 import { SPAWN_ROUTING_CONFIG } from '../config/spawn-routing.ts';
 import { WORLD_IDS } from '../config/world-ids.ts';
 import { modlib } from '../utils/mod-compat.ts';
+import { Timers } from 'bf6-portal-utils/timers/index.ts';
 
 /* =================================================================================================
    1) CORE CONFIGURATION
@@ -419,6 +420,7 @@ let cipherLiveKeyWatchdogLastLogAtSec = -999999;
 let cipherLiveKeyWatchdogHalf: CipherHalfIndex = 1;
 let cipherLiveKeyWatchdogStage: CipherMatchStage = "half1";
 let cipherSecondHalfDeployRequiredByPlayerId: { [playerId: number]: boolean } = {};
+let cipherTransitionRosterLastDiagnostic = "";
 let cipherSecondHalfDeployReadyByPlayerId: { [playerId: number]: boolean } = {};
 let cipherTransitionDeploySeenByPlayerId: { [playerId: number]: boolean } = {};
 let cipherTransitionDeployAckTokenByPlayerId: { [playerId: number]: number | undefined } = {};
@@ -484,6 +486,7 @@ let postmatchEndStep = 0;
 let postmatchWinnerTeam: mod.Team = teamNeutral;
 let postmatchEndTimer: number | undefined = undefined;
 let postmatchEndToken = 0;
+let postmatchEndTick = 0;
 let transitionFallbackActive = false;
 let transitionFallbackNextAllowedTick = 0;
 let transitionWarnedByKey: { [key: string]: boolean } = {};
@@ -848,8 +851,6 @@ const CIPHER_NODE_ACTIVE_ENEMY_VFX_ASSET: mod.RuntimeSpawn_Common =
   (mod.RuntimeSpawn_Common as any).FX_EODBot_Active_Enemy;
 const CIPHER_NODE_ACTIVE_SFX_ASSET: mod.RuntimeSpawn_Common =
   (mod.RuntimeSpawn_Common as any).SFX_GameModes_Gauntlet_Mission_Circuit_TerminalSpotLoop_SimpleLoop3D;
-const CIPHER_NODE_REBOOT_VFX_ASSET: mod.RuntimeSpawn_Common =
-  (mod.RuntimeSpawn_Common as any).FX_RepairTool_Sparks_Damage;
 const CIPHER_NODE_REBOOT_SFX_ASSET: mod.RuntimeSpawn_Common =
   (mod.RuntimeSpawn_Common as any).SFX_GameModes_Gauntlet_Mission_Beacons_Beeping_SimpleLoop3D;
 const CIPHER_NODE_LOOP_SFX_VOLUME = 0.45;
@@ -931,6 +932,7 @@ CIPHER_NODE_POLYGON_VERTEX_OFFSETS_BY_CP_ID[CP_D_SECOND_HALF_ID] = CIPHER_NODE_P
 const CIPHER_SPAWN_ENEMY_DANGER_RADIUS_METERS = 18;
 const CIPHER_RESPAWN_ROUTE_EVALUATION_SECONDS = SPAWN_ROUTING_CONFIG.routeEvaluationDurationSeconds;
 const CIPHER_RESPAWN_ROUTE_TICK_SECONDS = SPAWN_ROUTING_CONFIG.routeEvaluationTickSeconds;
+const CIPHER_RESPAWN_ROUTE_TICK_MS = mod.Max(1, CIPHER_RESPAWN_ROUTE_TICK_SECONDS * 1000);
 const CIPHER_RESPAWN_OBJECTIVE_PRESSURE_RADIUS_METERS = SPAWN_ROUTING_CONFIG.objectivePressureRadiusMeters;
 const CIPHER_RESPAWN_CANDIDATE_SAFETY_RADIUS_METERS = SPAWN_ROUTING_CONFIG.queuedCandidateSafetyRadiusMeters;
 const CIPHER_RESPAWN_REROUTE_SAFETY_RADIUS_METERS = SPAWN_ROUTING_CONFIG.rerouteSafetyRadiusMeters;
@@ -987,13 +989,17 @@ type CipherRespawnRouteJob = {
   currentCandidate?: CipherQueuedSpawnAnchor;
   finalizedCandidate?: CipherQueuedSpawnAnchor;
   nextEvaluationAtSec: number;
+  timerHandle?: number;
   dangerDetected: boolean;
   sessionToken: number | undefined;
   expectedMatchStage: CipherMatchStage;
+  expectedHalf: CipherHalfIndex;
   lifeGeneration: number;
+  status: "evaluating" | "finalized" | "settling" | "consumed" | "cancelled";
+  deployedNativeObjId?: number;
 };
 
-let cipherPresenceZoneActivePlayersByZone: { [zone: string]: { [playerId: number]: mod.Team } } = {};
+let cipherPresenceZoneActivePlayersByZone: { [zone: string]: { [playerId: number]: number } } = {};
 let cipherPresenceZonesByPlayerId: { [playerId: number]: { [zone: string]: boolean } } = {};
 let cipherAnchorPositionByObjectId: { [objectId: number]: CipherVectorSnapshot | undefined } = {};
 let cipherObjectiveAnchorPositionByCpId: { [cpId: number]: CipherVectorSnapshot | undefined } = {};
@@ -1226,6 +1232,9 @@ const CIPHER_NATIVE_BOMB_ENEMY_HIDDEN_SECONDS = 2.0;
 const CIPHER_NATIVE_BOMB_CARRIER_RESYNC_SECONDS = 0.75;
 let cipherNativeMinimapBombObject: mod.Object | undefined = undefined;
 let cipherNativeMinimapBombHandle: any | undefined = undefined;
+type CipherNativeBombLifetime = "absent" | "active" | "destroying";
+let cipherNativeMinimapBombGeneration = 0;
+let cipherNativeMinimapBombLifetime: CipherNativeBombLifetime = "absent";
 let cipherNativeMinimapBombLastPos: mod.Vector | undefined = undefined;
 let cipherNativeMinimapBombWarnedUnavailable = false;
 let cipherNativeMinimapBombCarrierPlayerId: number | undefined = undefined;
@@ -2176,21 +2185,26 @@ function clearDroppedBombRuntimeObjects(): void {
   bombDroppedReturnDeadlineAtSec = 0;
   bombDroppedWorldIconLastShownSeconds = -1;
 
-  if (bombDroppedWorldIconHandle) {
+  // Detach the generation's references before touching the engine. Cleanup can
+  // re-enter through native callbacks, and a second pass must see no live icon.
+  const worldIconHandle = bombDroppedWorldIconHandle;
+  const worldIconObject = bombDroppedWorldIconObject;
+  bombDroppedWorldIconObject = undefined;
+  bombDroppedWorldIconHandle = undefined;
+
+  if (worldIconHandle) {
     try {
-      mod.EnableWorldIconText(bombDroppedWorldIconHandle, false);
+      mod.EnableWorldIconText(worldIconHandle, false);
     } catch (_errText) {}
     try {
-      mod.EnableWorldIconImage(bombDroppedWorldIconHandle, false);
+      mod.EnableWorldIconImage(worldIconHandle, false);
     } catch (_err) {}
   }
 
-  if (bombDroppedWorldIconObject) {
-    unspawnObjectSafe(bombDroppedWorldIconObject, "dropped world icon object", false);
+  if (worldIconObject) {
+    unspawnObjectSafe(worldIconObject, "dropped world icon object", false);
   }
   // Same safety rule as base icon: never unspawn a raw WorldIcon handle as an Object.
-  bombDroppedWorldIconObject = undefined;
-  bombDroppedWorldIconHandle = undefined;
   if (bombCarrierPlayerId === undefined) {
     clearCipherNativeMinimapBomb("clear_dropped_runtime");
   }
@@ -2219,6 +2233,7 @@ function getCipherNativeMinimapBombPosition(sourcePos: mod.Vector | undefined): 
 }
 
 function trySetNativeBombTeam(team: mod.Team, context: string): void {
+  if (cipherNativeMinimapBombLifetime !== "active") return;
   if (!cipherNativeMinimapBombHandle) return;
   try {
     (mod as any).SetBombTeam(cipherNativeMinimapBombHandle, team);
@@ -2229,6 +2244,7 @@ function trySetNativeBombTeam(team: mod.Team, context: string): void {
 }
 
 function trySetNativeBombGlobalVisibility(visible: boolean, context: string, force: boolean = false): void {
+  if (cipherNativeMinimapBombLifetime !== "active") return;
   if (!cipherNativeMinimapBombHandle) return;
   if (!force && cipherNativeMinimapBombLastGlobalVisible === visible) return;
   try {
@@ -2240,6 +2256,7 @@ function trySetNativeBombGlobalVisibility(visible: boolean, context: string, for
 }
 
 function configureCipherNativeBombAfterSpawn(ownerTeam: mod.Team, context: string): void {
+  if (cipherNativeMinimapBombLifetime !== "active") return;
   if (!cipherNativeMinimapBombHandle) return;
 
   try {
@@ -2257,6 +2274,7 @@ function configureCipherNativeBombAfterSpawn(ownerTeam: mod.Team, context: strin
 }
 
 function forceReleaseCipherNativeBombCarrier(context: string): void {
+  if (cipherNativeMinimapBombLifetime !== "active") return;
   if (!cipherNativeMinimapBombHandle) return;
 
   try {
@@ -2273,39 +2291,27 @@ function forceReleaseCipherNativeBombCarrier(context: string): void {
 
 function removeCipherNativeBombCarrierState(context: string): void {
   forceReleaseCipherNativeBombCarrier(context);
-
-  if (cipherNativeMinimapBombHandle) {
-    try {
-      (mod as any).ForceBombUnspawn(cipherNativeMinimapBombHandle);
-    } catch (_errForceUnspawn) {}
-  }
-
   cipherNativeMinimapBombCarrierPlayerId = undefined;
   cipherNativeMinimapBombLastGiveAtSec = -999999;
   cipherNativeMinimapBombLastGlobalVisible = undefined;
 }
 
 function clearCipherNativeMinimapBomb(context: string): void {
-  removeCipherNativeBombCarrierState(context);
-
-  if (cipherNativeMinimapBombHandle) {
-    try {
-      (mod as any).ForceBombUnspawn(cipherNativeMinimapBombHandle);
-    } catch (_errForceUnspawn) {}
+  if (cipherNativeMinimapBombLifetime === "destroying") return;
+  if (!cipherNativeMinimapBombHandle && !cipherNativeMinimapBombObject) {
+    cipherNativeMinimapBombLifetime = "absent";
+    return;
   }
 
-  if (cipherNativeMinimapBombObject) {
-    try {
-      mod.UnspawnObject(cipherNativeMinimapBombObject);
-    } catch (err) {
-      LogRuntimeError("NativeBomb/clear/object/" + context, err);
-    }
-  } else if (cipherNativeMinimapBombHandle) {
-    try {
-      mod.UnspawnObject(cipherNativeMinimapBombHandle as mod.Object);
-    } catch (_errUnspawnHandle) {}
-  }
+  const generation = cipherNativeMinimapBombGeneration;
+  const handle = cipherNativeMinimapBombHandle;
+  const object = cipherNativeMinimapBombObject;
+  const wasCarried = cipherNativeMinimapBombCarrierPlayerId !== undefined;
 
+  // Invalidate the generation before the first native call. If ForceBombDrop or
+  // ForceBombUnspawn synchronously causes another script event, it cannot reuse
+  // or destroy these handles again.
+  cipherNativeMinimapBombLifetime = "destroying";
   cipherNativeMinimapBombObject = undefined;
   cipherNativeMinimapBombHandle = undefined;
   cipherNativeMinimapBombLastPos = undefined;
@@ -2313,6 +2319,33 @@ function clearCipherNativeMinimapBomb(context: string): void {
   cipherNativeMinimapBombCarrierTeamId = 0;
   cipherNativeMinimapBombLastGiveAtSec = -999999;
   cipherNativeMinimapBombLastGlobalVisible = undefined;
+
+  if (wasCarried && handle) {
+    try {
+      (mod as any).ForceBombDrop(handle);
+    } catch (_errDrop) {}
+  }
+
+  let destroyedByBombApi = false;
+  if (handle) {
+    try {
+      (mod as any).ForceBombUnspawn(handle);
+      destroyedByBombApi = true;
+    } catch (_errForceUnspawn) {}
+  }
+
+  // This is an alternative destruction path, never a second destruction call.
+  if (!destroyedByBombApi && object) {
+    try {
+      mod.UnspawnObject(object);
+    } catch (err) {
+      LogRuntimeError("NativeBomb/clear/object/" + context, err);
+    }
+  }
+
+  if (cipherNativeMinimapBombGeneration === generation) {
+    cipherNativeMinimapBombLifetime = "absent";
+  }
 }
 
 function spawnCipherNativeBombAtPosition(pos: mod.Vector, ownerTeam: mod.Team, context: string): void {
@@ -2330,8 +2363,10 @@ function spawnCipherNativeBombAtPosition(pos: mod.Vector, ownerTeam: mod.Team, c
   try {
     const spawned = mod.SpawnObject(asset, pos, CIPHER_NATIVE_MINIMAP_BOMB_ROTATION) as unknown;
     const resolved = resolveObjectFromUnknown(spawned);
+    cipherNativeMinimapBombGeneration += 1;
     cipherNativeMinimapBombHandle = spawned;
     cipherNativeMinimapBombObject = resolved.object;
+    cipherNativeMinimapBombLifetime = "active";
     cipherNativeMinimapBombLastPos = pos;
     cipherNativeMinimapBombCarrierPlayerId = undefined;
     configureCipherNativeBombAfterSpawn(ownerTeam, context);
@@ -2339,12 +2374,16 @@ function spawnCipherNativeBombAtPosition(pos: mod.Vector, ownerTeam: mod.Team, c
     LogRuntimeError("NativeBomb/spawn/" + context, err);
     cipherNativeMinimapBombHandle = undefined;
     cipherNativeMinimapBombObject = undefined;
+    cipherNativeMinimapBombLifetime = "absent";
     cipherNativeMinimapBombLastPos = undefined;
   }
 }
 
 function moveCipherNativeMinimapBombToPosition(pos: mod.Vector, context: string): void {
+  if (cipherNativeMinimapBombLifetime !== "active") return;
   if (!cipherNativeMinimapBombHandle && !cipherNativeMinimapBombObject) return;
+
+  const generation = cipherNativeMinimapBombGeneration;
 
   if (cipherNativeMinimapBombObject) {
     try {
@@ -2355,6 +2394,10 @@ function moveCipherNativeMinimapBombToPosition(pos: mod.Vector, context: string)
         const current = mod.GetObjectPosition(cipherNativeMinimapBombObject);
         mod.MoveObject(cipherNativeMinimapBombObject, mod.Subtract(pos, current));
       }
+      if (
+        cipherNativeMinimapBombLifetime !== "active" ||
+        cipherNativeMinimapBombGeneration !== generation
+      ) return;
       cipherNativeMinimapBombLastPos = pos;
       cipherNativeMinimapBombCarrierPlayerId = undefined;
       return;
@@ -2393,7 +2436,10 @@ function spawnOrMoveCipherNativeMinimapBomb(sourcePos: mod.Vector | undefined, c
 
   const ownerTeam = getNativeBombCurrentOwnerTeam();
 
-  if (!cipherNativeMinimapBombHandle && !cipherNativeMinimapBombObject) {
+  if (
+    cipherNativeMinimapBombLifetime !== "active" ||
+    (!cipherNativeMinimapBombHandle && !cipherNativeMinimapBombObject)
+  ) {
     spawnCipherNativeBombAtPosition(nativePos, ownerTeam, context);
     return;
   }
@@ -2421,6 +2467,7 @@ function resetCipherNativeBombCarrierVisibilityPulse(carrierId: number | undefin
 }
 
 function updateCipherNativeBombCarrierVisibility(nowSec: number, context: string): void {
+  if (cipherNativeMinimapBombLifetime !== "active") return;
   if (!cipherNativeMinimapBombHandle) return;
   if (bombCarrierPlayerId === undefined) {
     resetCipherNativeBombCarrierVisibilityPulse(undefined, nowSec, context + "_no_carrier_reset");
@@ -2456,6 +2503,7 @@ function updateCipherNativeBombCarrierVisibility(nowSec: number, context: string
 }
 
 function giveCipherNativeBombToCarrier(carrier: Player, nowSec: number, context: string): void {
+  if (cipherNativeMinimapBombLifetime !== "active") return;
   if (!mod.IsPlayerValid(carrier.player)) return;
 
   const carrierTeam = getCipherKeyTeamSnapshot(carrier.id) ?? carrier.team;
@@ -3081,11 +3129,13 @@ function clearBombBaseRuntimeLootSpawner(): void {
 }
 
 function clearBombDroppedRuntimeLootSpawner(): void {
-  if (bombDroppedRuntimeLootSpawnerObject) {
-    unspawnObjectSafe(bombDroppedRuntimeLootSpawnerObject, "dropped runtime loot spawner");
-  }
+  // Clear references first so repeated/reentrant cleanup is idempotent.
+  const object = bombDroppedRuntimeLootSpawnerObject;
   bombDroppedRuntimeLootSpawnerObject = undefined;
   bombDroppedRuntimeLootSpawnerHandle = undefined;
+  if (object) {
+    unspawnObjectSafe(object, "dropped runtime loot spawner");
+  }
 }
 
 function spawnRuntimeLootSpawnerAt(position: mod.Vector, context: string): RuntimeLootSpawnerSpawnValidation {
@@ -3814,7 +3864,8 @@ function resetCipherSpawnRoutingState(): void {
   cancelAllCipherRespawnRouteJobs();
   cipherPresenceZoneActivePlayersByZone = {};
   cipherPresenceZonesByPlayerId = {};
-  cipherAnchorPositionByObjectId = {};
+  // Anchor vectors are immutable for the loaded map. Keep the validated cache
+  // across phase resets so respawn jobs never resolve SpatialObjects mid-match.
   cipherObjectiveAnchorPositionByCpId = {};
   cipherObjectiveAnchorPositionSnapshotByCpId = {};
   cipherPlayerPositionSnapshotByPlayerId = {};
@@ -3828,6 +3879,28 @@ function resetCipherSpawnRoutingState(): void {
   cipherPendingSpawnJobs = [];
   cipherUrgentSpawnJobs = [];
   cipherRespawnRouteJobByPlayerId = {};
+}
+
+function warmCipherSpawnAnchorPositionCache(): void {
+  cipherAnchorPositionByObjectId = {};
+  const groups: number[][] = [
+    CIPHER_FIRST_DEPLOY_NORTH_ANCHORS,
+    CIPHER_FIRST_DEPLOY_SOUTH_ANCHORS,
+    CIPHER_NORTH_EAST_NORTH_ANCHORS,
+    CIPHER_NORTH_EAST_SOUTH_ANCHORS,
+    CIPHER_NORTH_WEST_NORTH_ANCHORS,
+    CIPHER_NORTH_WEST_SOUTH_ANCHORS,
+    CIPHER_SOUTH_EAST_NORTH_ANCHORS,
+    CIPHER_SOUTH_EAST_SOUTH_ANCHORS,
+    CIPHER_SOUTH_WEST_NORTH_ANCHORS,
+    CIPHER_SOUTH_WEST_SOUTH_ANCHORS,
+  ];
+  for (let groupIndex = 0; groupIndex < groups.length; groupIndex++) {
+    const ids = groups[groupIndex];
+    for (let anchorIndex = 0; anchorIndex < ids.length; anchorIndex++) {
+      getCachedCipherAnchorPosition(ids[anchorIndex]);
+    }
+  }
 }
 
 function clearCipherSpawnJobQueues(): void {
@@ -3853,7 +3926,7 @@ function markCipherPresenceZoneActive(playerId: number, triggerId: number): void
 
   let players = cipherPresenceZoneActivePlayersByZone[zone];
   if (!players) players = {};
-  players[playerId] = mod.GetTeam(sp.player);
+  players[playerId] = modlib.getTeamId(sp.team);
   cipherPresenceZoneActivePlayersByZone[zone] = players;
 }
 
@@ -4107,7 +4180,7 @@ function getCipherStrictQuadrantForSideAndLane(side: CipherMapSide, lane: Cipher
 function isCipherPresenceEntryCountableEnemy(
   playerId: number,
   zone: CipherPresenceZone,
-  storedTeam: mod.Team | undefined,
+  storedTeamId: number | undefined,
   enemyTeam: mod.Team
 ): boolean {
   const sp = serverPlayers.get(playerId);
@@ -4118,7 +4191,7 @@ function isCipherPresenceEntryCountableEnemy(
     stale = true;
   } else {
     currentTeam = mod.GetTeam(sp.player);
-    if (storedTeam !== undefined && !mod.Equals(currentTeam, storedTeam)) {
+    if (storedTeamId !== undefined && modlib.getTeamId(currentTeam) !== storedTeamId) {
       stale = true;
     }
   }
@@ -4405,6 +4478,12 @@ function chooseCipherSpawnAnchorForPlayer(
 }
 
 function cancelCipherRespawnRouteJobForPlayer(playerId: number): void {
+  const job = cipherRespawnRouteJobByPlayerId[playerId];
+  if (job) {
+    job.status = "cancelled";
+    if (job.timerHandle !== undefined) Timers.clearInterval(job.timerHandle);
+    delete cipherQueuedAnchorByPlayerId[playerId];
+  }
   delete cipherRespawnRouteJobByPlayerId[playerId];
 }
 
@@ -4427,22 +4506,20 @@ function invalidateCipherRespawnRouteJobForPlayer(playerId: number): void {
 }
 
 function isCipherRespawnRouteJobCurrent(job: CipherRespawnRouteJob): boolean {
+  if (job.status !== "evaluating") return false;
   if (cipherRespawnRouteTokenByPlayerId[job.playerId] !== job.token) return false;
   if (!isCurrentPlayerSession(job.playerId, job.sessionToken)) return false;
   if (job.lifeGeneration !== getPlayerLifeGeneration(job.playerId)) return false;
   if (gameStatus !== 3) return false;
   if (cipherMatchStage !== job.expectedMatchStage) return false;
+  if (cipherCurrentHalf !== job.expectedHalf) return false;
   if (isCipherLiveTransitionActive()) return false;
   if (isCipherSuddenDeathActive()) return false;
 
   const sp = serverPlayers.get(job.playerId);
-  if (!sp || !mod.IsPlayerValid(sp.player)) return false;
+  if (!sp) return false;
   if (sp.isDeployed) return false;
-
-  const team = mod.GetTeam(sp.player);
-  const teamId = modlib.getTeamId(team);
-  if (teamId !== job.teamId) return false;
-  return mod.Equals(team, team1) || mod.Equals(team, team2);
+  return job.teamId === 1 || job.teamId === 2;
 }
 
 function getCipherActiveObjectiveDefsForDefendingTeam(team: mod.Team): ObjectiveDefinition[] {
@@ -4524,15 +4601,8 @@ function isCipherRespawnCandidateSafe(
 
 function finalizeCipherRespawnRouteJobForPlayer(playerId: number, source: string): void {
   const job = cipherRespawnRouteJobByPlayerId[playerId];
-  if (!job) return;
-
-  const sp = serverPlayers.get(playerId);
-  if (!sp || !mod.IsPlayerValid(sp.player)) {
-    invalidateCipherRespawnRouteJobForPlayer(playerId);
-    return;
-  }
-
-  const team = mod.GetTeam(sp.player);
+  if (!job || job.status !== "evaluating") return;
+  const team = mod.GetTeam(job.teamId);
   let candidate = job.finalizedCandidate ?? job.currentCandidate;
   if (!candidate || !isCipherQueuedSpawnAnchorValidForTeam(candidate, team)) {
     candidate = selectCipherRespawnRouteCandidate(
@@ -4544,11 +4614,15 @@ function finalizeCipherRespawnRouteJobForPlayer(playerId: number, source: string
   }
 
   if (candidate) {
+    job.finalizedCandidate = candidate;
     cipherQueuedAnchorByPlayerId[playerId] = candidate;
   }
-
+  if (job.timerHandle !== undefined) {
+    Timers.clearInterval(job.timerHandle);
+    job.timerHandle = undefined;
+  }
+  job.status = "finalized";
   void source;
-  cancelCipherRespawnRouteJobForPlayer(playerId);
 }
 
 function sealCipherRespawnRouteJobForDeploy(playerId: number, source: string): void {
@@ -4559,6 +4633,7 @@ function sealCipherRespawnRouteJobForDeploy(playerId: number, source: string): v
     job.lifeGeneration !== getPlayerLifeGeneration(playerId) ||
     gameStatus !== 3 ||
     cipherMatchStage !== job.expectedMatchStage ||
+    cipherCurrentHalf !== job.expectedHalf ||
     isCipherLiveTransitionActive()
   ) {
     invalidateCipherRespawnRouteJobForPlayer(playerId);
@@ -4570,15 +4645,21 @@ function sealCipherRespawnRouteJobForDeploy(playerId: number, source: string): v
     invalidateCipherRespawnRouteJobForPlayer(playerId);
     return;
   }
-  const candidate = job.finalizedCandidate ?? job.currentCandidate;
-  if (candidate && isCipherQueuedSpawnAnchorValidForTeam(candidate, mod.GetTeam(sp.player))) {
-    cipherQueuedAnchorByPlayerId[playerId] = candidate;
+  if (job.status === "evaluating") finalizeCipherRespawnRouteJobForPlayer(playerId, "deploy_before_timer");
+  const candidate = job.finalizedCandidate;
+  const team = mod.GetTeam(job.teamId);
+  if (!candidate || !isCipherQueuedSpawnAnchorValidForTeam(candidate, team)) {
+    invalidateCipherRespawnRouteJobForPlayer(playerId);
+    return;
   }
+  cipherQueuedAnchorByPlayerId[playerId] = candidate;
+  job.status = "settling";
+  job.deployedNativeObjId = sp.nativeObjId;
+  settleAndConsumeCipherRespawnRoute(playerId, job.token);
   void source;
-  cancelCipherRespawnRouteJobForPlayer(playerId);
 }
 
-function tickCipherRespawnRouteJob(playerId: number, token: number, nowSec: number): void {
+function tickCipherRespawnRouteJob(playerId: number, token: number): void {
   const job = cipherRespawnRouteJobByPlayerId[playerId];
   if (!job || job.token !== token) return;
   if (!isCipherRespawnRouteJobCurrent(job)) {
@@ -4586,15 +4667,9 @@ function tickCipherRespawnRouteJob(playerId: number, token: number, nowSec: numb
     return;
   }
 
-  const sp = serverPlayers.get(playerId);
-  if (!sp || !mod.IsPlayerValid(sp.player)) {
-    invalidateCipherRespawnRouteJobForPlayer(playerId);
-    return;
-  }
-
-  const team = mod.GetTeam(sp.player);
+  const team = mod.GetTeam(job.teamId);
   job.currentSecond += 1;
-  job.nextEvaluationAtSec = nowSec + CIPHER_RESPAWN_ROUTE_TICK_SECONDS;
+  job.nextEvaluationAtSec = getCurrentSchedulerNowSeconds() + CIPHER_RESPAWN_ROUTE_TICK_SECONDS;
 
   if (job.currentSecond === 1) {
     job.currentCandidate = selectCipherRespawnRouteCandidate(
@@ -4645,18 +4720,6 @@ function tickCipherRespawnRouteJob(playerId: number, token: number, nowSec: numb
   }
 }
 
-function processCipherRespawnRouteJobs(nowSec: number): void {
-  let processed = 0;
-  const budget = 2;
-  for (const playerIdKey in cipherRespawnRouteJobByPlayerId) {
-    if (processed >= budget) break;
-    const job = cipherRespawnRouteJobByPlayerId[Number(playerIdKey)];
-    if (!job || nowSec < job.nextEvaluationAtSec) continue;
-    processed += 1;
-    tickCipherRespawnRouteJob(job.playerId, job.token, nowSec);
-  }
-}
-
 function shouldStartCipherRespawnRouteJobForPlayer(playerId: number, wasDeployed: boolean): boolean {
   if (!wasDeployed) return false;
   if (gameStatus !== 3) return false;
@@ -4665,8 +4728,8 @@ function shouldStartCipherRespawnRouteJobForPlayer(playerId: number, wasDeployed
   if (isCipherRuntimeBotPlayerId(playerId)) return false;
 
   const sp = serverPlayers.get(playerId);
-  if (!sp || !mod.IsPlayerValid(sp.player)) return false;
-  const team = mod.GetTeam(sp.player);
+  if (!sp) return false;
+  const team = sp.team;
   return mod.Equals(team, team1) || mod.Equals(team, team2);
 }
 
@@ -4675,9 +4738,9 @@ function startCipherRespawnRouteJobForPlayer(playerId: number, wasDeployed: bool
 
   cancelCipherRespawnRouteJobForPlayer(playerId);
   const sp = serverPlayers.get(playerId);
-  if (!sp || !mod.IsPlayerValid(sp.player)) return;
+  if (!sp) return;
 
-  const team = mod.GetTeam(sp.player);
+  const team = sp.team;
   const token = nextCipherRespawnRouteToken(playerId);
   const nowSec = getCurrentSchedulerNowSeconds();
   const job: CipherRespawnRouteJob = {
@@ -4690,11 +4753,111 @@ function startCipherRespawnRouteJobForPlayer(playerId: number, wasDeployed: bool
     dangerDetected: false,
     sessionToken: ensurePlayerSessionToken(playerId),
     expectedMatchStage: cipherMatchStage,
+    expectedHalf: cipherCurrentHalf,
     lifeGeneration: getPlayerLifeGeneration(playerId),
+    status: "evaluating",
   };
 
   cipherRespawnRouteJobByPlayerId[playerId] = job;
+  job.timerHandle = Timers.setInterval(
+    () => tickCipherRespawnRouteJob(playerId, token),
+    CIPHER_RESPAWN_ROUTE_TICK_MS
+  );
   void source;
+}
+
+function settleAndConsumeCipherRespawnRoute(playerId: number, token: number): void {
+  const job = cipherRespawnRouteJobByPlayerId[playerId];
+  if (!job || job.token !== token || job.status !== "settling") return;
+
+  const sp = serverPlayers.get(playerId);
+  if (
+    !sp ||
+    !isCurrentPlayerSession(playerId, job.sessionToken) ||
+    job.lifeGeneration !== getPlayerLifeGeneration(playerId) ||
+    job.deployedNativeObjId !== sp.nativeObjId ||
+    gameStatus !== 3 ||
+    cipherMatchStage !== job.expectedMatchStage ||
+    cipherCurrentHalf !== job.expectedHalf ||
+    isCipherLiveTransitionActive() ||
+    isCipherSuddenDeathActive() ||
+    !sp.isDeployed ||
+    !mod.IsPlayerValid(sp.player) ||
+    !isPlayerAliveSafe(sp.player)
+  ) {
+    invalidateCipherRespawnRouteJobForPlayer(playerId);
+    delete cipherQueuedAnchorByPlayerId[playerId];
+    return;
+  }
+
+  const player = sp.player;
+  if (getObjIdSafe(player) !== job.deployedNativeObjId) {
+    invalidateCipherRespawnRouteJobForPlayer(playerId);
+    delete cipherQueuedAnchorByPlayerId[playerId];
+    return;
+  }
+
+  const team = mod.GetTeam(player);
+  if (modlib.getTeamId(team) !== job.teamId || isNativeFriendlyOrSquadSpawn(player, playerId)) {
+    invalidateCipherRespawnRouteJobForPlayer(playerId);
+    delete cipherQueuedAnchorByPlayerId[playerId];
+    return;
+  }
+
+  let candidate = job.finalizedCandidate;
+  if (!candidate || !isCipherQueuedSpawnAnchorValidForTeam(candidate, team)) {
+    invalidateCipherRespawnRouteJobForPlayer(playerId);
+    delete cipherQueuedAnchorByPlayerId[playerId];
+    return;
+  }
+
+  let anchorPos = getCachedCipherAnchorPosition(candidate.anchorObjectId);
+  if (!anchorPos) {
+    invalidateCipherRespawnRouteJobForPlayer(playerId);
+    delete cipherQueuedAnchorByPlayerId[playerId];
+    return;
+  }
+
+  refreshCipherPlayerPositionSnapshots();
+  if (!isCipherAnchorSafeFromEnemiesWithinRadius(anchorPos, team, CIPHER_RESPAWN_REROUTE_SAFETY_RADIUS_METERS)) {
+    const alternative = selectCipherRespawnRouteCandidate(
+      playerId,
+      team,
+      CIPHER_RESPAWN_REROUTE_SAFETY_RADIUS_METERS,
+      false
+    );
+    if (!alternative) {
+      invalidateCipherRespawnRouteJobForPlayer(playerId);
+      delete cipherQueuedAnchorByPlayerId[playerId];
+      return;
+    }
+    const alternativePos = getCachedCipherAnchorPosition(alternative.anchorObjectId);
+    if (!alternativePos) {
+      invalidateCipherRespawnRouteJobForPlayer(playerId);
+      delete cipherQueuedAnchorByPlayerId[playerId];
+      return;
+    }
+    candidate = alternative;
+    anchorPos = alternativePos;
+  }
+
+  const yawRadians = computeCipherTeleportYawTowardObjective(anchorPos, team, candidate);
+  // Consume before crossing the engine boundary. A synchronous callback cannot
+  // observe a retryable route for this soldier.
+  job.status = "consumed";
+  delete cipherRespawnRouteJobByPlayerId[playerId];
+  delete cipherQueuedAnchorByPlayerId[playerId];
+  clearCipherSpawnJobsForPlayer(playerId);
+
+  try {
+    mod.Teleport(player, anchorPos, yawRadians);
+    cipherPlayerPositionSnapshotByPlayerId[playerId] = snapshotVector(anchorPos);
+    const teamKey = getCipherTeamRoutingKey(team);
+    cipherLastSpawnRegionByTeamId[teamKey] = copyCipherSpawnRegion(candidate.region);
+    cipherLastSpawnRegionAtSecByTeamId[teamKey] = getCurrentSchedulerNowSeconds();
+  } catch (err) {
+    LogRuntimeError("CipherRespawnSettledTeleport/" + String(playerId) + "/" + String(candidate.anchorObjectId), err);
+  }
 }
 
 function getCipherAttackObjectiveCenterForSide(side: CipherMapSide): mod.Vector | undefined {
@@ -6141,7 +6304,8 @@ function completeDisconnectedBombCarrierDrop(
 function scheduleBombCarrierDropAfterCombatEvent(
   playerId: number,
   reason: DeferredBombCarrierDropReason,
-  dropPositionOverride?: mod.Vector
+  dropPositionOverride?: mod.Vector,
+  cachedTeamOverride?: mod.Team
 ): void {
   if (bombCarrierPlayerId === undefined) return;
   if (bombCarrierPlayerId !== playerId) return;
@@ -6153,7 +6317,7 @@ function scheduleBombCarrierDropAfterCombatEvent(
 
   const cachedDropPosition = getSafeCipherCarrierDropPosition(playerId, dropPositionOverride);
   const cachedCarrier = serverPlayers.get(playerId);
-  let cachedCarrierTeam = getCipherKeyTeamSnapshot(playerId) ?? cachedCarrier?.team ?? teamNeutral;
+  let cachedCarrierTeam = cachedTeamOverride ?? getCipherKeyTeamSnapshot(playerId) ?? cachedCarrier?.team ?? teamNeutral;
   if (!mod.Equals(cachedCarrierTeam, team1) && !mod.Equals(cachedCarrierTeam, team2)) {
     cachedCarrierTeam = teamNeutral;
   }
@@ -6935,15 +7099,8 @@ function getCipherNodeRebootRemainingSeconds(cpId: number): number {
 }
 
 function showCipherNodeRebootingDeniedMessage(playerId: number, cpId: number): void {
-  const sp = serverPlayers.get(playerId);
-  if (!sp || !mod.IsPlayerValid(sp.player)) return;
-
-  const cp = serverCapturePoints[cpId];
-  const symbol = getObjectiveLaneSymbol(cpId, cp ? cp.symbol : "A");
-  modlib.ShowHighlightedGameModeMessage(
-    mod.Message((mod.stringkeys as any).CipherNodeCannotScoreRebooting, symbol),
-    sp.player
-  );
+  void playerId;
+  void cpId;
 }
 
 function startCipherNodeReboot(cpId: number, attackingTeam: mod.Team, context: string): void {
@@ -6956,8 +7113,6 @@ function startCipherNodeReboot(cpId: number, attackingTeam: mod.Team, context: s
   cipherNodeOverloadedByTeamByCpId[cpId] = attackingTeam;
   const token = (cipherNodeRebootTokenByCpId[cpId] ?? 0) + 1;
   cipherNodeRebootTokenByCpId[cpId] = token;
-
-  const cp = serverCapturePoints[cpId];
 
   if (isObjectiveCaptureAttemptActive(cpId)) endObjectiveCaptureAttempt(cpId);
   // Keep the active-half CapturePoint marker visible while the node reboots.
@@ -6977,27 +7132,6 @@ function startCipherNodeReboot(cpId: number, attackingTeam: mod.Team, context: s
   );
   playObjectiveDisableEmpPresentationForCp(cpId, attackingTeam);
   playObjectiveAwardSuccessSfxToAll();
-
-  const symbol = getObjectiveLaneSymbol(cpId, cp ? cp.symbol : "A");
-  if (modlib.Equals(attackingTeam, team1)) {
-    modlib.ShowHighlightedGameModeMessage(
-      mod.Message((mod.stringkeys as any).CipherObjectiveDisabled, symbol),
-      team1
-    );
-    modlib.ShowHighlightedGameModeMessage(
-      mod.Message((mod.stringkeys as any).CipherObjectiveDisabledEnemy, symbol),
-      team2
-    );
-  } else if (modlib.Equals(attackingTeam, team2)) {
-    modlib.ShowHighlightedGameModeMessage(
-      mod.Message((mod.stringkeys as any).CipherObjectiveDisabled, symbol),
-      team2
-    );
-    modlib.ShowHighlightedGameModeMessage(
-      mod.Message((mod.stringkeys as any).CipherObjectiveDisabledEnemy, symbol),
-      team1
-    );
-  }
 
   clearObjectivePendingAward(cpId);
   clearObjectiveSuccessfulArmContext(cpId);
@@ -7032,11 +7166,6 @@ function reactivateCipherNode(cpId: number, token: number, context: string): voi
   syncObjectiveArmedPendingVisualStateForCp(cpId);
   syncLiveHybridObjectiveSurfaceState("reactivateCipherNode/" + context, true);
   updateCipherCounterWorldIconForCp(cpId, true);
-
-  const cp = serverCapturePoints[cpId];
-  const symbol = getObjectiveLaneSymbol(cpId, cp ? cp.symbol : "A");
-  modlib.ShowHighlightedGameModeMessage(mod.Message((mod.stringkeys as any).CipherNodeRebooted, symbol), team1);
-  modlib.ShowHighlightedGameModeMessage(mod.Message((mod.stringkeys as any).CipherNodeRebooted, symbol), team2);
 
 }
 
@@ -7627,10 +7756,8 @@ function getCipherNodePolygonEndpointPositionsForCp(cpId: number): mod.Vector[] 
   return positions;
 }
 
-function getCipherNodeActiveVfxAssetForCp(cpId: number): mod.RuntimeSpawn_Common {
-  const owningTeam = getObjectiveDefendingTeamForCurrentHalf(cpId);
-  if (mod.Equals(owningTeam, team1)) return CIPHER_NODE_ACTIVE_FRIENDLY_VFX_ASSET;
-  return CIPHER_NODE_ACTIVE_ENEMY_VFX_ASSET;
+function getCipherNodeActiveVfxAssetForCp(_cpId: number): mod.RuntimeSpawn_Common {
+  return CIPHER_NODE_ACTIVE_FRIENDLY_VFX_ASSET;
 }
 
 function warnCipherCounterRuntimeIconMissingOnce(key: string, cpId: number, reason: string): void {
@@ -8162,9 +8289,15 @@ function updateCipherNodeVisualForCp(cpId: number, force: boolean = false): void
     cipherNodeActiveVfxByCpId[cpId] = list;
     spawnCipherNodeLoopSfxForCp(cpId, CIPHER_NODE_ACTIVE_SFX_ASSET, centerPos);
   } else {
-    const vfx = spawnObjectiveAwardRuntimeFxAtPosition(CIPHER_NODE_REBOOT_VFX_ASSET, centerPos);
     const list: Array<mod.VFX | mod.Object> = [];
-    if (vfx) list.push(vfx);
+    const endpointPositions = getCipherNodePolygonEndpointPositionsForCp(cpId);
+    for (let i = 0; i < endpointPositions.length; i++) {
+      const vfx = spawnObjectiveAwardRuntimeFxAtPosition(
+        CIPHER_NODE_ACTIVE_ENEMY_VFX_ASSET,
+        endpointPositions[i]
+      );
+      if (vfx) list.push(vfx);
+    }
     cipherNodeRebootVfxByCpId[cpId] = list;
     spawnCipherNodeLoopSfxForCp(cpId, CIPHER_NODE_REBOOT_SFX_ASSET, centerPos);
   }
@@ -10073,36 +10206,33 @@ let postMatchWidgetsToDelete: string[] = [];
 
 const POSTMATCH_SHOWCASE_PARENT_ID = WORLD_IDS.postmatch.anchor;
 const POSTMATCH_CAMERA_ID = WORLD_IDS.postmatch.camera;
-const POSTMATCH_SHOWCASE_HEAD_TEXT_Y_OFFSET_METERS = 2.4;
-const POSTMATCH_SHOWCASE_FEET_TEXT_Y_OFFSET_METERS = -0.25;
 const POSTMATCH_RESULT_TEXT_Y = -360;
-const POSTMATCH_SCORE_TEXT_Y = -275;
-const POSTMATCH_HINT_TEXT_Y = -215;
+const POSTMATCH_SCORE_TEXT_Y = -295;
 const POSTMATCH_RESULT_TEXT_WIDTH = 900;
 const POSTMATCH_RESULT_TEXT_HEIGHT = 120;
 const POSTMATCH_SCORE_TEXT_WIDTH = 160;
 const POSTMATCH_SCORE_TEXT_HEIGHT = 56;
-const POSTMATCH_HINT_TEXT_WIDTH = 900;
-const POSTMATCH_HINT_TEXT_HEIGHT = 44;
-const POSTMATCH_HINT_TEXT_SIZE = 28;
 const POSTMATCH_END_TIMER_TEXT_Y = -160;
 const POSTMATCH_END_TIMER_TEXT_WIDTH = 900;
 const POSTMATCH_END_TIMER_TEXT_HEIGHT = 44;
 const POSTMATCH_END_TIMER_TEXT_SIZE = 26;
 
 type PostmatchShowcaseStatKind = "eliminations" | "destroyed" | "keyTime" | "moralSupport";
-type PostmatchShowcaseIconKind = "head" | "feet";
 
 type PostmatchShowcaseSlot = {
   anchorId: number;
   statKind: PostmatchShowcaseStatKind;
   player: Player;
   statValue: number;
-  headIconObject?: mod.Object;
-  headIconHandle?: mod.WorldIcon;
-  feetIconObject?: mod.Object;
-  feetIconHandle?: mod.WorldIcon;
 };
+
+const POSTMATCH_SHOWCASE_SCREEN_X = [-346.76, -136.88, 82.13, 301.14];
+const POSTMATCH_SHOWCASE_PLAYER_Y = -225.09;
+const POSTMATCH_SHOWCASE_STAT_Y = 139.92;
+const POSTMATCH_SHOWCASE_CARD_WIDTH = 206.46;
+const POSTMATCH_SHOWCASE_CARD_HEIGHT = 74.33;
+const POSTMATCH_SHOWCASE_TELEPORT_DELAYS_MS = [100, 250, 500, 900, 1400];
+let postmatchShowcaseTeleportTokenByPlayerId: { [playerId: number]: number | undefined } = {};
 
 type PostmatchQuaternion = {
   w: number;
@@ -10229,13 +10359,6 @@ const POSTMATCH_SHOWCASE_SLOT_CONFIGS: { anchorId: number; statKind: PostmatchSh
   { anchorId: 4547, statKind: "keyTime" },
   { anchorId: 4548, statKind: "moralSupport" },
 ];
-const POSTMATCH_SHOWCASE_STAT_PRIORITY: PostmatchShowcaseStatKind[] = [
-  "eliminations",
-  "destroyed",
-  "keyTime",
-  "moralSupport",
-];
-
 let postmatchShowcaseSlots: PostmatchShowcaseSlot[] = [];
 let postmatchShowcaseCameraAppliedByPlayerId: { [playerId: number]: boolean } = {};
 
@@ -11181,12 +11304,6 @@ function deletePrematchButtonWidgetsForPlayer(player: mod.Player): void {
 function DeletePrematchButtonWidgetsForAllPlayers(): void {
   for (let i = 0; i < STALE_PREMATCH_BUTTON_WIDGET_NAMES.length; i++) {
     safeDeleteAllWidgetsByName(STALE_PREMATCH_BUTTON_WIDGET_NAMES[i]);
-  }
-
-  const allPlayers = mod.AllPlayers();
-  for (let i = 0; i < mod.CountOf(allPlayers); i++) {
-    const player = mod.ValueInArray(allPlayers, i) as mod.Player;
-    deletePrematchButtonWidgetsForPlayer(player);
   }
 
   serverPlayers.forEach((playerInfo) => {
@@ -14834,9 +14951,6 @@ function resetCipherObjectivesForCurrentStage(context: string): void {
 }
 
 function showCipherPhaseNoticeForAllPlayers(messageKey: any, fallbackText: string, durationSeconds: number = 3): void {
-  const message = getStringMessageWithFallback(messageKey, fallbackText);
-  modlib.ShowHighlightedGameModeMessage(message, team1);
-  modlib.ShowHighlightedGameModeMessage(message, team2);
   if (gameStatus === 3) {
     showBombNoticeForAllPlayers(messageKey, fallbackText, durationSeconds);
   }
@@ -15837,8 +15951,7 @@ const CIPHER_DEPLOY_READY_FREEZE_INPUTS: mod.RestrictedInputs[] = [
 
 function isRequiredSecondHalfDeployPlayer(p: Player): boolean {
   if (!isValidHumanPlayerState(p)) return false;
-  const team = mod.GetTeam(p.player);
-  if (!mod.Equals(team, team1) && !mod.Equals(team, team2)) return false;
+  if (!mod.Equals(p.team, team1) && !mod.Equals(p.team, team2)) return false;
   return true;
 }
 
@@ -15850,6 +15963,7 @@ function resetCipherSecondHalfDeployPlayerTracking(): void {
   cipherTransitionTeleportedByPlayerId = {};
   cipherTransitionDeployReconcileCursor = 0;
   cipherTransitionDeployLastHudStateKey = "";
+  cipherTransitionRosterLastDiagnostic = "";
   cipherTransitionForceDeployQueue = [];
   cipherTransitionForceDeployIssuedTokenByPlayerId = {};
   cipherTransitionForceFinishToken = 0;
@@ -16090,27 +16204,11 @@ function refreshCipherTransitionDeployRequiredRoster(source: string): void {
   if (cipherSecondHalfTransitionStage !== "deploy") return;
   const presentRequiredIds: { [playerId: number]: boolean } = {};
 
-  try {
-    const allPlayers = mod.AllPlayers();
-    for (let i = 0; i < mod.CountOf(allPlayers); i++) {
-      const eventPlayer = mod.ValueInArray(allPlayers, i) as mod.Player;
-      const identity = tryGetSafeEventPlayerIdentity(eventPlayer);
-      if (!identity || identity.isBot || (identity.teamId !== 1 && identity.teamId !== 2)) continue;
-      if (isCipherRuntimeBotPlayerId(identity.playerId)) continue;
-
-      const p = adoptLatestHumanPlayerHandleFromEvent(identity, eventPlayer, true);
-      if (!p) continue;
-      presentRequiredIds[p.id] = true;
-      cipherSecondHalfDeployRequiredByPlayerId[p.id] = true;
-    }
-  } catch (err) {
-    LogRuntimeError("TransitionDeployRoster/" + source, err);
-    serverPlayers.forEach((p) => {
-      if (!isRequiredSecondHalfDeployPlayer(p)) return;
-      presentRequiredIds[p.id] = true;
-      cipherSecondHalfDeployRequiredByPlayerId[p.id] = true;
-    });
-  }
+  serverPlayers.forEach((p) => {
+    if (!isRequiredSecondHalfDeployPlayer(p)) return;
+    presentRequiredIds[p.id] = true;
+    cipherSecondHalfDeployRequiredByPlayerId[p.id] = true;
+  });
 
   for (const key in cipherSecondHalfDeployRequiredByPlayerId) {
     const playerId = Number(key);
@@ -16123,6 +16221,21 @@ function refreshCipherTransitionDeployRequiredRoster(source: string): void {
   }
 
   pruneCipherTransitionDeployTracking(source + "_post");
+
+  const counts = getCipherDeployCounts();
+  let deployed = 0;
+  for (const key in presentRequiredIds) {
+    const p = serverPlayers.get(Number(key));
+    if (p?.isDeployed === true) deployed += 1;
+  }
+  const diagnostic = String(counts.required) + "/" + String(counts.ready) + "/" + String(deployed);
+  if (diagnostic !== cipherTransitionRosterLastDiagnostic) {
+    cipherTransitionRosterLastDiagnostic = diagnostic;
+    emitPlayerLifecycleDiagnostic(
+      "TRANSITION_ROSTER required=" + String(counts.required) +
+        " ready=" + String(counts.ready) + " deployed=" + String(deployed)
+    );
+  }
 }
 
 function reconcileCipherTransitionDeployReadiness(source: string): void {
@@ -17396,9 +17509,6 @@ function logCipherTransitionCheckpoint(name: string): void {
   const key = String(cipherTransitionWorkToken) + "/" + name;
   if (liveTransitionCheckpointSeenByKey[key] === true) return;
   liveTransitionCheckpointSeenByKey[key] = true;
-  try {
-    mod.DisplayHighlightedWorldLogMessage(mod.Message("[CIPHER TRANSITION] {}", name));
-  } catch (_err) {}
 }
 
 function enqueueCipherTransitionWork(
@@ -18356,8 +18466,9 @@ function enterPostmatchFromLive(forcedWinner?: mod.Team): void {
   postmatchEndStep = 0;
   postmatchEndStepTick = 0;
   postmatchEndStepAtSec = 0;
-  schedulePostmatchEndGameModeFallback("enter_postmatch");
   gameStatus = 4;
+  postmatchEndTick = serverTickCount + POSTMATCH_TIME * TICK_RATE;
+  schedulePostmatchEndGameModeFallback("enter_postmatch");
   mod.SetSpawnMode(mod.SpawnModes.AutoSpawn);
   prepareAllPostmatchPlayers("enter_postmatch");
   schedulePostmatchPlayerStateReassert("enter_postmatch_reassert", 250);
@@ -18711,7 +18822,7 @@ class ActivePlayerMap extends Map<number, Player> {
       if (!player) return;
       try {
         if (!mod.IsPlayerValid(player.player)) return;
-        if (mod.GetObjId(player.player) !== playerId) return;
+        if (mod.GetObjId(player.player) !== player.nativeObjId) return;
       } catch (_errValid) {
         return;
       }
@@ -18735,6 +18846,7 @@ type DisconnectedPlayerSnapshot = {
 };
 type PendingPlayerSession = {
   playerId: number;
+  nativeObjId: number;
   player: mod.Player;
   sessionToken: number;
   joinedAtMs: number;
@@ -18760,22 +18872,16 @@ type PlayerLeaveCleanupJob = {
   cachedPosition: mod.Vector | undefined;
   cachedTeam: mod.Team;
 };
-type PlayerUndeployCleanupJob = {
-  playerId: number;
-  sessionToken: number;
-  wasDeployed: boolean;
-  expectedGameStatus: number;
-  expectedMatchStage: CipherMatchStage;
-  expectedTransitionToken: number;
-};
 const disconnectedPlayerSnapshotById: { [playerId: number]: DisconnectedPlayerSnapshot | undefined } = {};
 let pendingPlayerSessionById: { [playerId: number]: PendingPlayerSession | undefined } = {};
 let playerActivatedSessionTokenByPlayerId: { [playerId: number]: number | undefined } = {};
 let playerDeployHydrationQueue: PlayerDeployHydrationJob[] = [];
 let playerDeployHydrationQueuedByPlayerId: { [playerId: number]: boolean | undefined } = {};
 let playerLeaveCleanupQueue: PlayerLeaveCleanupJob[] = [];
-let playerUndeployCleanupQueue: PlayerUndeployCleanupJob[] = [];
-let playerUndeployCleanupQueuedByPlayerId: { [playerId: number]: boolean | undefined } = {};
+let playerLifecycleAdminRefreshPending = false;
+let playerLifecyclePrematchRefreshPending = false;
+let playerLifecycleSuddenDeathRefreshPending = false;
+let playerLifecycleScoreboardRefreshPending = false;
 const PLAYER_JOIN_STABILIZE_MS = 2000;
 const PLAYER_JOIN_REQUIRED_STABLE_SAMPLES = 2;
 const PLAYER_JOIN_WATCHDOG_MS = 10000;
@@ -18788,6 +18894,7 @@ let cipherSuddenDeathJoinCleanupQueuedByPlayerId: { [playerId: number]: boolean 
 
 type SafeEventPlayerIdentity = {
   playerId: number;
+  nativeObjId: number;
   team: mod.Team;
   teamId: number;
   isBot: boolean;
@@ -18830,7 +18937,7 @@ function ensurePlayerSessionToken(playerId: number): number {
 function tryGetSafeEventPlayerIdOnly(eventPlayer: mod.Player): number | undefined {
   try {
     if (!mod.IsPlayerValid(eventPlayer)) return undefined;
-    return mod.GetObjId(eventPlayer);
+    return modlib.getPlayerId(eventPlayer);
   } catch (_err) {
     return undefined;
   }
@@ -18839,11 +18946,13 @@ function tryGetSafeEventPlayerIdOnly(eventPlayer: mod.Player): number | undefine
 function tryGetSafeEventPlayerIdentity(eventPlayer: mod.Player): SafeEventPlayerIdentity | undefined {
   try {
     if (!mod.IsPlayerValid(eventPlayer)) return undefined;
-    const playerId = mod.GetObjId(eventPlayer);
+    const playerId = modlib.getPlayerId(eventPlayer);
+    const nativeObjId = mod.GetObjId(eventPlayer);
     const team = mod.GetTeam(eventPlayer);
     const teamId = mod.Equals(team, team1) ? 1 : mod.Equals(team, team2) ? 2 : 0;
     return {
       playerId,
+      nativeObjId,
       team,
       teamId,
       isBot: isBotBackfillPlayerSafe(eventPlayer),
@@ -18865,8 +18974,10 @@ function adoptLatestHumanPlayerHandleFromEvent(
 
   const p = serverPlayers.get(identity.playerId);
   if (!p) return undefined;
+  if (p.nativeObjId !== identity.nativeObjId) return undefined;
 
   p.player = eventPlayer;
+  p.nativeObjId = identity.nativeObjId;
   p.team = identity.team;
   serverPlayers.set(identity.playerId, p);
   ensurePlayerSessionToken(identity.playerId);
@@ -18980,8 +19091,10 @@ function resetUniversalPlayerLifecycleQueues(clearReconnectSnapshots: boolean): 
   playerDeployHydrationQueue = [];
   playerDeployHydrationQueuedByPlayerId = {};
   playerLeaveCleanupQueue = [];
-  playerUndeployCleanupQueue = [];
-  playerUndeployCleanupQueuedByPlayerId = {};
+  playerLifecycleAdminRefreshPending = false;
+  playerLifecyclePrematchRefreshPending = false;
+  playerLifecycleSuddenDeathRefreshPending = false;
+  playerLifecycleScoreboardRefreshPending = false;
   liveHudBuiltSessionTokenByPlayerId = {};
   if (clearReconnectSnapshots) {
     for (const key in disconnectedPlayerSnapshotById) {
@@ -19050,6 +19163,43 @@ function clearVolatilePlayerSessionState(playerId: number, source: string): void
   delete dmgQueuedGiverObjId[playerId];
 }
 
+function emitPlayerLifecycleDiagnostic(message: string): void {
+  void message;
+}
+
+function clearDisconnectedPlayerStateDataOnly(playerId: number, leaving?: Player): void {
+  if (leaving) resetPlayerSessionRefsForJoin(leaving, false);
+
+  clearVolatilePlayerSessionState(playerId, "disconnect_immediate");
+  playerDeployHydrationQueue = playerDeployHydrationQueue.filter((job) => job.playerId !== playerId);
+  delete playerDeployHydrationQueuedByPlayerId[playerId];
+
+  restrictedAreaCountdownToken[playerId] = (restrictedAreaCountdownToken[playerId] ?? 0) + 1;
+  cancelPendingRestrictedLethalConfirmForPlayer(playerId);
+  clearAllRestrictedTriggerStateForPlayer(playerId);
+  delete playerInRestrictedArea[playerId];
+  delete playerInMandownByPlayerId[playerId];
+  delete restrictedAreaFeedbackSuppressedByPlayerId[playerId];
+  delete restrictedAreaRootWidgetByPlayerId[playerId];
+  delete restrictedAreaCounterWidgetByPlayerId[playerId];
+
+  delete readyTextBuiltByPlayerId[playerId];
+  delete readyTextWidgetByPlayerId[playerId];
+  liveHudBuiltByPlayerId[playerId] = false;
+  delete liveHudBuiltSessionTokenByPlayerId[playerId];
+  delete liveHudBuildQueuedByPlayerId[playerId];
+  delete cipherAdminPanelVisibleByPlayerId[playerId];
+  delete cipherSuddenDeathEliminatedByPlayerId[playerId];
+  clearPrematch889StateForPlayer(playerId);
+  clearBombCarrierDeployRestoreCacheForPlayer(playerId);
+  clearCipherKeyHudCacheForPlayer(playerId);
+
+  cipherKeyActivePlayerIdsSnapshot = cipherKeyActivePlayerIdsSnapshot.filter((id) => id !== playerId);
+  delete cipherKeyPlayerByIdSnapshot[playerId];
+  delete cipherKeyTeamByPlayerIdSnapshot[playerId];
+  delete cipherKeyTeamIdByPlayerIdSnapshot[playerId];
+}
+
 function pruneCipherTransitionDeployTracking(source: string): void {
   if (cipherSecondHalfTransitionStage !== "deploy") return;
 
@@ -19084,55 +19234,30 @@ function pruneCipherTransitionDeployTracking(source: string): void {
 function settleJoinedPlayerForCurrentPhase(p: Player, source: string): void {
   if (!p || !mod.IsPlayerValid(p.player)) return;
 
-  p.setTeam();
-
-  if (prematchHealthInside889ByPlayerId[p.id] === undefined) {
-    prematchHealthInside889ByPlayerId[p.id] = false;
-  }
-
-  delete prematchHealthAppliedMaxByPlayerId[p.id];
-  assignCipherAdminFromJoiningPlayerIfNeeded(p.player);
-
   if (gameStatus === 0 || gameStatus === -1) {
+    mod.SetRedeployTime(p.player, 0);
     mod.EnablePlayerDeploy(p.player, true);
-    applyPrematch889HealthForPlayer(p.id);
-    refreshPrematchReadyStateUi();
-    applyPhaseInputRestrictionsForPlayer(p.player);
     return;
   }
 
   if (gameStatus === 1) {
+    mod.SetRedeployTime(p.player, 0);
     mod.EnablePlayerDeploy(p.player, true);
-    applyPhaseInputRestrictionsForPlayer(p.player);
-    applyPrematch889HealthForPlayer(p.id);
-    stripLoadoutToMeleeOnly(p.player);
     return;
   }
 
   if (gameStatus === 2) {
+    mod.SetRedeployTime(p.player, 0);
     mod.EnablePlayerDeploy(p.player, true);
-    applyPhaseInputRestrictionsForPlayer(p.player);
-    applyPrematch889HealthForPlayer(p.id);
-    requestTransitionSpawn(p.id, "join_settle_prelive/" + source);
     return;
   }
 
   if (gameStatus === 4) {
     mod.EnablePlayerDeploy(p.player, true);
-    SafeSetWidgetVisibleByName("PostMatchContainer", true);
-    preparePostmatchPlayerState(p, "join_settle/" + source);
-    const slot = findPostmatchShowcaseSlotForPlayerId(p.id);
-    if (slot) {
-      slot.player = p;
-      applyPostmatchShowcaseSlot(slot);
-    }
     return;
   }
 
   if (gameStatus !== 3) return;
-
-  p.updateScoreboard();
-  markCipherKeyHudDirtyForPlayer(p.id);
 
   if (cipherSecondHalfTransitionActive || cipherSuddenDeathTransitionActive) {
     try {
@@ -19143,7 +19268,7 @@ function settleJoinedPlayerForCurrentPhase(p: Player, source: string): void {
 
     if (cipherSecondHalfTransitionStage === "deploy") {
       markCipherSecondHalfDeployRequiredForPlayer(p);
-      refreshCipherTransitionDeployRequiredRoster("join_settle_transition/" + source);
+      requestCipherTransitionReconcile("join_settle_transition/" + source);
       mod.EnablePlayerDeploy(p.player, true);
     } else {
       mod.EnablePlayerDeploy(p.player, false);
@@ -19161,20 +19286,15 @@ function settleJoinedPlayerForCurrentPhase(p: Player, source: string): void {
     if (cipherSuddenDeathJoinAliveExemptByPlayerId[p.id] !== true) {
       cipherSuddenDeathEliminatedByPlayerId[p.id] = true;
       playerInMandownByPlayerId[p.id] = true;
-      if (cipherSuddenDeathJoinCleanupQueuedByPlayerId[p.id] !== true) {
-        cipherSuddenDeathJoinCleanupQueuedByPlayerId[p.id] = true;
-        scheduleCipherSuddenDeathEliminatedPlayerCleanup(p.id, "join_settle_sudden_death");
-      }
     }
 
-    updateCipherSuddenDeathAliveHudForAllPlayers();
+    playerLifecycleSuddenDeathRefreshPending = true;
     mod.EnablePlayerDeploy(p.player, false);
     return;
   }
 
   try {
     mod.SetRedeployTime(p.player, REDEPLOY_TIME);
-    clearCipherLiveInputRestrictionsForPlayer(p.player);
     mod.EnablePlayerDeploy(p.player, true);
   } catch (errLiveJoinSetup) {
     LogRuntimeError("JoinSettle/liveSetup/" + source + "/" + String(p.id), errLiveJoinSetup);
@@ -19206,28 +19326,19 @@ function activatePendingPlayerSession(pending: PendingPlayerSession): void {
 
   const isPrematchAdmission = !gameModeStarted || gameStatus === -1 || gameStatus === 0;
 
-  // Session cleanup is best-effort. A stale private UI handle must never prevent a
-  // valid human from being admitted to the prematch roster or from deploying.
+  // Clear only script-owned state here. Native UI and soldier setup are deferred
+  // until the current handle produces OnPlayerDeployed.
   try {
     clearVolatilePlayerSessionState(pending.playerId, "pending_join_activate");
   } catch (err) {
     LogRuntimeError("PendingJoinActivate/clearVolatile/" + String(pending.playerId), err);
   }
-  try {
-    deleteCipherTransitionHudForPlayer(pending.playerId);
-  } catch (err) {
-    LogRuntimeError("PendingJoinActivate/deleteTransitionHud/" + String(pending.playerId), err);
-  }
-  try {
-    deleteCipherSuddenDeathAliveHudForPlayer(pending.playerId);
-  } catch (err) {
-    LogRuntimeError("PendingJoinActivate/deleteSuddenDeathHud/" + String(pending.playerId), err);
-  }
 
-  const player = new Player(pending.player);
+  const player = new Player(pending.player, pending.playerId, pending.nativeObjId, identity.team);
   const snapshot = disconnectedPlayerSnapshotById[pending.playerId];
   if (snapshot) player.restorePersistentSnapshot(snapshot);
   player.player = pending.player;
+  player.nativeObjId = pending.nativeObjId;
   player.team = identity.team;
   player.isDeployed = pending.deployAckSeen;
 
@@ -19236,6 +19347,9 @@ function activatePendingPlayerSession(pending: PendingPlayerSession): void {
   serverPlayers.set(player.id, player);
   playerActivatedSessionTokenByPlayerId[player.id] = pending.sessionToken;
   delete pendingPlayerSessionById[player.id];
+  emitPlayerLifecycleDiagnostic(
+    "JOIN_ACTIVATED logicalId=" + String(player.id) + " session=" + String(pending.sessionToken)
+  );
 
   if (isPrematchAdmission) {
     try {
@@ -19245,13 +19359,6 @@ function activatePendingPlayerSession(pending: PendingPlayerSession): void {
       mod.EnablePlayerDeploy(player.player, true);
     } catch (err) {
       LogRuntimeError("PendingJoinActivate/prematchDeployUnlock/" + String(player.id), err);
-    }
-    // Make the player visible in the ready-up roster immediately. Do not wait for
-    // OnPlayerDeployed because that event cannot fire while deployment is locked.
-    try {
-      refreshPrematchReadyStateUi();
-    } catch (err) {
-      LogRuntimeError("PendingJoinActivate/prematchRoster/" + String(player.id), err);
     }
   }
 
@@ -19273,14 +19380,6 @@ function activatePendingPlayerSession(pending: PendingPlayerSession): void {
     }
   }
 
-  try {
-    mod.DisplayHighlightedWorldLogMessage(
-      pending.isReconnect
-        ? mod.Message(mod.stringkeys.PlayerReconnected, player.player, player.id)
-        : mod.Message(mod.stringkeys.PlayerJoined, player.player, player.id)
-    );
-  } catch (_errJoinLog) {}
-
   delete disconnectedPlayerSnapshotById[player.id];
 
   if (pending.deployAckSeen) {
@@ -19294,7 +19393,10 @@ function activatePendingPlayerSession(pending: PendingPlayerSession): void {
     queuePlayerDeployHydration(player.id);
   }
 
-  refreshCipherKeyPlayerSnapshots("pending_join_activate");
+  cipherKeyActivePlayerIdsSnapshot = [];
+  cipherKeyPlayerByIdSnapshot = {};
+  cipherKeyTeamByPlayerIdSnapshot = {};
+  cipherKeyTeamIdByPlayerIdSnapshot = {};
   requestCipherTransitionReconcile("pending_join_activate");
 }
 
@@ -19310,7 +19412,13 @@ function processPendingPlayerSessions(): boolean {
     if (nowMs < pending.nextRetryAtMs) continue;
 
     const identity = tryGetSafeEventPlayerIdentity(pending.player);
-    if (!identity || identity.playerId !== pending.playerId || identity.isBot || (identity.teamId !== 1 && identity.teamId !== 2)) {
+    if (
+      !identity ||
+      identity.playerId !== pending.playerId ||
+      identity.nativeObjId !== pending.nativeObjId ||
+      identity.isBot ||
+      (identity.teamId !== 1 && identity.teamId !== 2)
+    ) {
       pending.stableSamples = 0;
       pending.stableTeamId = 0;
       pending.nextRetryAtMs = nowMs + 1000;
@@ -19355,8 +19463,12 @@ function hydrateDeployedHumanPlayer(job: PlayerDeployHydrationJob): void {
   if (!p || !mod.IsPlayerValid(p.player)) return;
   const player = p.player;
   const playerId = p.id;
+  if (mod.GetObjId(player) !== p.nativeObjId) return;
   p.team = mod.GetTeam(player);
   p.isDeployed = true;
+
+  assignCipherAdminFromJoiningPlayerIfNeeded(player);
+  p.updateScoreboard();
 
   clearScoreboardDeathCountForPlayerLife(playerId);
   delete playerInMandownByPlayerId[playerId];
@@ -19427,6 +19539,8 @@ function hydrateDeployedHumanPlayer(job: PlayerDeployHydrationJob): void {
   if (firstDeploy && getCipherQueuedSpawnAnchorForPlayer(playerId) === undefined) {
     requestCipherSpawnAnchorForPlayer(playerId, true);
   }
+  const liveRespawnRoute = cipherRespawnRouteJobByPlayerId[playerId];
+  if (liveRespawnRoute && liveRespawnRoute.status === "settling") return;
   if (getCipherQueuedSpawnAnchorForPlayer(playerId) !== undefined || firstDeploy) {
     requestCipherSpawnTeleportForPlayer(playerId, true);
   }
@@ -19452,134 +19566,46 @@ function processPlayerLeaveCleanupQueue(): boolean {
   if (!job) return false;
   const playerId = job.playerId;
   try {
-    clearVolatilePlayerSessionState(playerId, "leave_cleanup");
-    deletePlayerLiveHudWidgets(playerId, job.sessionToken);
-    safeDeleteWidgetByName(getPrematchReadyTextWidgetName(playerId, job.sessionToken));
-    safeDeleteWidgetByName("ReadyText" + playerId);
-    delete readyTextBuiltByPlayerId[playerId];
-    delete readyTextWidgetByPlayerId[playerId];
-    cleanupRestrictedAreaUiForPlayer(playerId);
-    deleteCipherSuddenDeathAliveHudForPlayer(playerId);
-    liveHudBuiltByPlayerId[playerId] = false;
-    delete liveHudBuiltSessionTokenByPlayerId[playerId];
-    forceDeleteCipherAdminPanelForPlayerId(playerId);
     if (cipherAdminPlayerId === playerId) {
       cipherAdminPlayerId = undefined;
-      clearCipherAdminInteractPoint("admin_left");
     }
-    mod.DisplayHighlightedWorldLogMessage(mod.Message(mod.stringkeys.PlayerDisconnected, playerId));
     if (job.wasCarrier) {
-      scheduleBombCarrierDropAfterCombatEvent(playerId, "disconnect", job.cachedPosition);
+      scheduleBombCarrierDropAfterCombatEvent(playerId, "disconnect", job.cachedPosition, job.cachedTeam);
     }
-    clearBombCarrierDeployRestoreCacheForPlayer(playerId);
     delete lastKnownLivePositionByPlayerId[playerId];
-    delete cipherSuddenDeathEliminatedByPlayerId[playerId];
-    clearPrematch889StateForPlayer(playerId);
-    clearAllObjectiveAreaTriggerStateForPlayer(playerId);
-    clearCipherPresenceForPlayer(playerId);
-    invalidateCipherRespawnRouteJobForPlayer(playerId);
-    clearCipherKeyHudCacheForPlayer(playerId);
-    ensureCipherAdminAssigned();
-    if (isCipherSuddenDeathActive()) updateCipherSuddenDeathAliveHudForAllPlayers();
-    if (gameStatus === 0 || gameStatus === -1) refreshPrematchReadyStateUi();
+    playerLifecycleAdminRefreshPending = true;
+    playerLifecycleSuddenDeathRefreshPending = isCipherSuddenDeathActive();
+    playerLifecyclePrematchRefreshPending = gameStatus === 0 || gameStatus === -1;
+    playerLifecycleScoreboardRefreshPending = true;
     requestCipherTransitionReconcile("leave_cleanup");
-    void job.cachedTeam;
   } catch (err) {
     LogRuntimeError("PlayerLeaveCleanup/" + String(playerId), err);
   }
   return true;
 }
 
-function processPlayerUndeployCleanupQueue(): boolean {
-  const job = playerUndeployCleanupQueue.shift();
-  if (!job) return false;
-  delete playerUndeployCleanupQueuedByPlayerId[job.playerId];
-  if (!isQueuedPlayerWorkCurrent(
-    job.playerId,
-    job.sessionToken,
-    job.expectedGameStatus,
-    job.expectedMatchStage,
-    job.expectedTransitionToken
-  )) return true;
-  const p = serverPlayers.get(job.playerId);
-  if (!p || !mod.IsPlayerValid(p.player)) return true;
-  const player = p.player;
-  const id = p.id;
-  beginNextPlayerLife(id);
-  const keepTransitionReady =
-    cipherSecondHalfTransitionStage === "deploy" &&
-    cipherSecondHalfDeployReadyByPlayerId[id] === true &&
-    cipherTransitionDeployAckTokenByPlayerId[id] === getCipherSecondHalfForceDeployToken();
-
-  closeCipherAdminPanelForPlayerId(id);
-  dmgSpreadClearForPlayer(player);
-  prematchHealthInside889ByPlayerId[id] = false;
-  delete prematchHealthAppliedMaxByPlayerId[id];
-  p.isDeployed = keepTransitionReady;
-  if (!keepTransitionReady) clearCipherSecondHalfDeployReadyForPlayer(id);
-  invalidateBombDeployLoadoutApplyForPlayer(id);
-  invalidateBombCarrierRestoreInsertForPlayer(id);
-  resetRestrictedAreaStateForPlayer(id);
-  clearAllObjectiveAreaTriggerStateForPlayer(id);
-  clearCipherPresenceForPlayer(id);
-  // A teleport/anchor job from the dead life must never execute on the next soldier.
-  clearCipherSpawnJobsForPlayer(id);
-  delete cipherQueuedAnchorByPlayerId[id];
-  cancelObjectiveCaptureAttemptsForPlayer(id);
-
-  if (isCipherLiveTransitionActive()) {
-    if (cipherSecondHalfTransitionStage === "deploy") {
-      setCipherSecondHalfDeployFreezeForPlayer(player, keepTransitionReady, "transition_deploy_undeploy");
-    } else {
-      applyPhaseInputRestrictionsForPlayer(player);
-    }
-    mod.SetRedeployTime(player, 0);
-    return true;
+function processPlayerLifecycleDeferredFanout(): void {
+  if (playerLifecycleAdminRefreshPending) {
+    playerLifecycleAdminRefreshPending = false;
+    ensureCipherAdminAssigned();
   }
-
-  const suddenDeathScriptForcedUndeploy =
-    cipherSuddenDeathForcedUndeployTokenByPlayerId[id] !== undefined;
-  if (suddenDeathScriptForcedUndeploy && isCipherSuddenDeathActive()) {
-    delete cipherSuddenDeathForcedUndeployTokenByPlayerId[id];
-    mod.SetRedeployTime(player, 9999);
-    return true;
+  if (playerLifecycleSuddenDeathRefreshPending) {
+    playerLifecycleSuddenDeathRefreshPending = false;
+    updateCipherSuddenDeathAliveHudForAllPlayers();
   }
-
-  if (gameStatus === 3 && bombCarrierPlayerId === id) {
-    const pos = tryGetPlayerPositionSafe(player);
-    if (pos) lastKnownLivePositionByPlayerId[id] = pos;
-    scheduleBombCarrierDropAfterCombatEvent(id, "undeploy", pos);
+  if (playerLifecyclePrematchRefreshPending) {
+    playerLifecyclePrematchRefreshPending = false;
+    refreshPrematchReadyStateUi();
   }
-  if (
-    isCipherSuddenDeathActive() &&
-    !isCipherLiveStartSettling() &&
-    job.wasDeployed &&
-    !isPlayerAliveSafe(player) &&
-    getCurrentSchedulerNowSeconds() >= cipherSuddenDeathUndeployIgnoreUntilSec
-  ) {
-    consumeCipherSuddenDeathLife(id, "undeploy_supervisor");
-    return true;
+  if (playerLifecycleScoreboardRefreshPending) {
+    playerLifecycleScoreboardRefreshPending = false;
+    UpdateScoreboard();
   }
-  if (gameStatus === 1 || gameStatus === 2) {
-    applyPhaseInputRestrictionsForPlayer(player);
-    mod.SetRedeployTime(player, 0);
-    requestTransitionSpawn(id, "UndeployCleanup_Transition");
-    return true;
-  }
-  if (gameStatus === 3) {
-    if (getCurrentSchedulerNowSeconds() >= cipherPhaseTransitionUndeployIgnoreUntilSec) {
-      startCipherRespawnRouteJobForPlayer(id, job.wasDeployed, "UndeployCleanup_Live");
-      recordScoreboardDeathForPlayer(p);
-    }
-  }
-  requestCipherTransitionReconcile("undeploy_cleanup");
-  return true;
 }
 
 function processPlayerLifecycleSupervisor(): void {
   if (processPlayerLeaveCleanupQueue()) return;
   if (processPendingPlayerSessions()) return;
-  if (processPlayerUndeployCleanupQueue()) return;
   processPlayerDeployHydrationQueue();
 }
 
@@ -19665,7 +19691,7 @@ function isValidHumanPlayerState(p: Player | undefined): p is Player {
 
   try {
     if (!mod.IsPlayerValid(p.player)) return false;
-    if (mod.GetObjId(p.player) !== p.id) return false;
+    if (mod.GetObjId(p.player) !== p.nativeObjId) return false;
   } catch (_errValid) {
     return false;
   }
@@ -19689,6 +19715,8 @@ function getValidHumanPlayerById(playerId: number): Player | undefined {
 function isCurrentEventPlayerReference(playerId: number, eventPlayer: mod.Player): boolean {
   const identity = tryGetSafeEventPlayerIdentity(eventPlayer);
   if (!identity || identity.playerId !== playerId) return false;
+  const current = serverPlayers.get(playerId);
+  if (!current || current.nativeObjId !== identity.nativeObjId) return false;
   if (!identity.isBot) adoptLatestHumanPlayerHandleFromEvent(identity, eventPlayer, false);
   return true;
 }
@@ -20552,6 +20580,7 @@ function cleanupRestrictedAreaUiForPlayer(playerId: number): void {
 class Player {
   public player: mod.Player;
   public id: number;
+  public nativeObjId: number;
   public team: mod.Team;
 
   public isDeployed: boolean;
@@ -20609,10 +20638,16 @@ class Player {
   private _firstDeploy: boolean;
   private _ready: boolean;
 
-    constructor(player: mod.Player) {
+    constructor(
+      player: mod.Player,
+      logicalPlayerId?: number,
+      nativeObjId?: number,
+      cachedTeam?: mod.Team
+    ) {
     this.player = player;
-    this.id = modlib.getPlayerId(this.player);
-    this.team = mod.GetTeam(this.player);
+    this.id = logicalPlayerId ?? modlib.getPlayerId(this.player);
+    this.nativeObjId = nativeObjId ?? mod.GetObjId(this.player);
+    this.team = cachedTeam ?? mod.GetTeam(this.player);
 
     this._scoreboard = [0, 0, 0, 0, 0];
     this._firstDeploy = true;
@@ -21474,6 +21509,7 @@ function resetLifecycleStateForFreshMatchStart(): void {
   postmatchEndStep = 0;
   postmatchEndStepTick = 0;
   postmatchEndStepAtSec = 0;
+  postmatchEndTick = 0;
   postmatchWinnerTeam = teamNeutral;
   cipherCurrentHalf = 1;
   cipherMatchStage = "half1";
@@ -22298,21 +22334,9 @@ function isBetterPostmatchShowcaseCandidate(
 }
 
 function isPostmatchShowcaseStatSelectable(p: Player, statKind: PostmatchShowcaseStatKind): boolean {
-  if (statKind === "moralSupport") return true;
-  return getPostmatchShowcaseStatValue(p, statKind) > 0;
-}
-
-function hasPostmatchShowcaseSelectablePlayer(
-  candidates: Player[],
-  usedPlayerIds: { [playerId: number]: boolean },
-  statKind: PostmatchShowcaseStatKind
-): boolean {
-  for (let i = 0; i < candidates.length; i++) {
-    const candidate = candidates[i];
-    if (usedPlayerIds[candidate.id] === true) continue;
-    if (isPostmatchShowcaseStatSelectable(candidate, statKind)) return true;
-  }
-  return false;
+  void p;
+  void statKind;
+  return true;
 }
 
 function selectPostmatchShowcasePlayer(
@@ -22331,22 +22355,6 @@ function selectPostmatchShowcasePlayer(
   return best;
 }
 
-function selectNextPostmatchShowcaseStatKind(
-  candidates: Player[],
-  usedPlayerIds: { [playerId: number]: boolean },
-  startIndex: number
-): { statKind: PostmatchShowcaseStatKind; nextIndex: number } | undefined {
-  for (let i = startIndex; i < POSTMATCH_SHOWCASE_STAT_PRIORITY.length; i++) {
-    const statKind = POSTMATCH_SHOWCASE_STAT_PRIORITY[i];
-    if (!hasPostmatchShowcaseSelectablePlayer(candidates, usedPlayerIds, statKind)) continue;
-    return {
-      statKind,
-      nextIndex: i + 1,
-    };
-  }
-  return undefined;
-}
-
 function buildPostmatchShowcaseSlots(): PostmatchShowcaseSlot[] {
   const winner = getWinningTeam();
   if (mod.Equals(winner, teamNeutral)) return [];
@@ -22362,20 +22370,15 @@ function buildPostmatchShowcaseSlots(): PostmatchShowcaseSlot[] {
 
   const usedPlayerIds: { [playerId: number]: boolean } = {};
   const slots: PostmatchShowcaseSlot[] = [];
-  let statPriorityIndex = 0;
   for (let i = 0; i < POSTMATCH_SHOWCASE_SLOT_CONFIGS.length; i++) {
     const config = POSTMATCH_SHOWCASE_SLOT_CONFIGS[i];
-    const selectedStat = selectNextPostmatchShowcaseStatKind(candidates, usedPlayerIds, statPriorityIndex);
-    if (!selectedStat) break;
-
-    statPriorityIndex = selectedStat.nextIndex;
-    const player = selectPostmatchShowcasePlayer(candidates, usedPlayerIds, selectedStat.statKind);
-    if (!player) continue;
+    const player = selectPostmatchShowcasePlayer(candidates, usedPlayerIds, config.statKind);
+    if (!player) break;
     slots.push({
       anchorId: config.anchorId,
-      statKind: selectedStat.statKind,
+      statKind: config.statKind,
       player,
-      statValue: getPostmatchShowcaseStatValue(player, selectedStat.statKind),
+      statValue: getPostmatchShowcaseStatValue(player, config.statKind),
     });
   }
   return slots;
@@ -22419,8 +22422,18 @@ function applyPostmatchShowcaseMovementLockForPlayer(player: mod.Player): void {
   if (shouldSkipHumanInputRestrictionsForPlayer(player)) return;
 
   clearCipherLiveInputRestrictionsForPlayer(player);
-  mod.EnableInputRestriction(player, mod.RestrictedInputs.MoveForwardBack, true);
-  mod.EnableInputRestriction(player, mod.RestrictedInputs.MoveLeftRight, true);
+  setPostmatchRestrictedInputsForPlayer(
+    player,
+    [
+      mod.RestrictedInputs.MoveForwardBack,
+      mod.RestrictedInputs.MoveLeftRight,
+      mod.RestrictedInputs.Jump,
+      mod.RestrictedInputs.Sprint,
+      mod.RestrictedInputs.Crouch,
+      mod.RestrictedInputs.Prone,
+    ],
+    true
+  );
 }
 
 function applyPostmatchLosingInputLockForPlayer(player: mod.Player): void {
@@ -22451,6 +22464,10 @@ function clearPostmatchShowcaseMovementLockForPlayer(player: mod.Player): void {
   try {
     mod.EnableInputRestriction(player, mod.RestrictedInputs.MoveForwardBack, false);
     mod.EnableInputRestriction(player, mod.RestrictedInputs.MoveLeftRight, false);
+    mod.EnableInputRestriction(player, mod.RestrictedInputs.Jump, false);
+    mod.EnableInputRestriction(player, mod.RestrictedInputs.Sprint, false);
+    mod.EnableInputRestriction(player, mod.RestrictedInputs.Crouch, false);
+    mod.EnableInputRestriction(player, mod.RestrictedInputs.Prone, false);
     mod.EnableInputRestriction(player, mod.RestrictedInputs.FireWeapon, false);
   } catch (_err) {}
 }
@@ -22571,182 +22588,6 @@ function tryMakePostmatchShowcasePlayerAlive(p: Player): boolean {
   return isPlayerAliveSafe(p.player);
 }
 
-function createOffsetPosition(base: mod.Vector, yOffset: number): mod.Vector {
-  return mod.Add(base, mod.CreateVector(0, yOffset, 0));
-}
-
-function configurePostmatchShowcaseWorldIcon(
-  handle: mod.WorldIcon,
-  pos: mod.Vector,
-  label: any,
-  color: mod.Vector
-): void {
-  mod.SetWorldIconPosition(handle, pos);
-  mod.SetWorldIconText(handle, label);
-  mod.SetWorldIconColor(handle, color);
-  mod.EnableWorldIconImage(handle, false);
-  mod.EnableWorldIconText(handle, true);
-}
-
-function spawnPostmatchShowcaseWorldIcon(
-  pos: mod.Vector,
-  label: any,
-  color: mod.Vector,
-  context: string
-): { object?: mod.Object; handle?: mod.WorldIcon } {
-  const spawned = spawnRuntimeCommonObjectSafe(mod.RuntimeSpawn_Common.WorldIcon, pos, BOMB_DROP_ROTATION, context);
-  if (!spawned.object) return {};
-
-  const handle = resolveRuntimeWorldIconHandle(spawned.object as unknown);
-  if (!handle) {
-    unspawnObjectSafe(spawned.object, context + "_unresolved", false);
-    return {};
-  }
-
-  try {
-    configurePostmatchShowcaseWorldIcon(handle, pos, label, color);
-  } catch (_errConfigure) {
-    unspawnObjectSafe(spawned.object, context + "_configure_failed", false);
-    return {};
-  }
-
-  return { object: spawned.object, handle };
-}
-
-function getPostmatchShowcaseIconObject(
-  slot: PostmatchShowcaseSlot,
-  iconKind: PostmatchShowcaseIconKind
-): mod.Object | undefined {
-  return iconKind === "head" ? slot.headIconObject : slot.feetIconObject;
-}
-
-function getPostmatchShowcaseIconHandle(
-  slot: PostmatchShowcaseSlot,
-  iconKind: PostmatchShowcaseIconKind
-): mod.WorldIcon | undefined {
-  return iconKind === "head" ? slot.headIconHandle : slot.feetIconHandle;
-}
-
-function setPostmatchShowcaseIconRefs(
-  slot: PostmatchShowcaseSlot,
-  iconKind: PostmatchShowcaseIconKind,
-  object: mod.Object | undefined,
-  handle: mod.WorldIcon | undefined
-): void {
-  if (iconKind === "head") {
-    slot.headIconObject = object;
-    slot.headIconHandle = handle;
-    return;
-  }
-
-  slot.feetIconObject = object;
-  slot.feetIconHandle = handle;
-}
-
-function clearPostmatchShowcaseWorldIconForSlot(
-  slot: PostmatchShowcaseSlot,
-  iconKind: PostmatchShowcaseIconKind,
-  context: string
-): void {
-  const object = getPostmatchShowcaseIconObject(slot, iconKind);
-  const handle = getPostmatchShowcaseIconHandle(slot, iconKind);
-
-  if (object) unspawnObjectSafe(object, context + " object", false);
-  else if (handle) unspawnObjectSafe(handle as unknown, context + " handle", false);
-
-  setPostmatchShowcaseIconRefs(slot, iconKind, undefined, undefined);
-}
-
-function resolvePostmatchShowcaseWorldIconForSlot(
-  slot: PostmatchShowcaseSlot,
-  iconKind: PostmatchShowcaseIconKind
-): mod.WorldIcon | undefined {
-  const existingHandle = getPostmatchShowcaseIconHandle(slot, iconKind);
-  if (existingHandle) return existingHandle;
-
-  const object = getPostmatchShowcaseIconObject(slot, iconKind);
-  if (!object) return undefined;
-
-  const resolvedHandle = resolveRuntimeWorldIconHandle(object as unknown);
-  if (!resolvedHandle) return undefined;
-
-  setPostmatchShowcaseIconRefs(slot, iconKind, object, resolvedHandle);
-  return resolvedHandle;
-}
-
-function ensurePostmatchShowcaseWorldIconForSlot(
-  slot: PostmatchShowcaseSlot,
-  iconKind: PostmatchShowcaseIconKind,
-  pos: mod.Vector,
-  label: any,
-  color: mod.Vector,
-  context: string
-): void {
-  let object = getPostmatchShowcaseIconObject(slot, iconKind);
-  let handle = resolvePostmatchShowcaseWorldIconForSlot(slot, iconKind);
-
-  if (object && !handle) {
-    clearPostmatchShowcaseWorldIconForSlot(slot, iconKind, context + "_stale");
-    object = undefined;
-  }
-
-  if (handle) {
-    try {
-      configurePostmatchShowcaseWorldIcon(handle, pos, label, color);
-      if (object) moveObjectToAbsolutePositionSafe(object, pos, context + "_move");
-      return;
-    } catch (_errConfigure) {
-      clearPostmatchShowcaseWorldIconForSlot(slot, iconKind, context + "_configure_failed");
-      object = undefined;
-      handle = undefined;
-    }
-  }
-
-  const spawned = spawnPostmatchShowcaseWorldIcon(pos, label, color, context);
-  setPostmatchShowcaseIconRefs(slot, iconKind, spawned.object, spawned.handle);
-}
-
-function clearPostmatchShowcaseRuntimeWorldIcons(): void {
-  for (let i = 0; i < postmatchShowcaseSlots.length; i++) {
-    const slot = postmatchShowcaseSlots[i];
-    clearPostmatchShowcaseWorldIconForSlot(slot, "head", "postmatch head icon");
-    clearPostmatchShowcaseWorldIconForSlot(slot, "feet", "postmatch feet icon");
-  }
-}
-
-function getPostmatchShowcaseBasePosition(slot: PostmatchShowcaseSlot): mod.Vector | undefined {
-  if (mod.IsPlayerValid(slot.player.player) && isPlayerAliveSafe(slot.player.player)) {
-    const playerPos = tryGetPlayerPositionSafe(slot.player.player);
-    if (playerPos) return playerPos;
-  }
-  return getPostmatchSpatialObjectPosition(slot.anchorId);
-}
-
-function updatePostmatchShowcaseWorldIconPositions(): void {
-  if (gameStatus !== 4) return;
-  for (let i = 0; i < postmatchShowcaseSlots.length; i++) {
-    const slot = postmatchShowcaseSlots[i];
-    const basePos = getPostmatchShowcaseBasePosition(slot);
-    if (!basePos) continue;
-    ensurePostmatchShowcaseWorldIconForSlot(
-      slot,
-      "head",
-      createOffsetPosition(basePos, POSTMATCH_SHOWCASE_HEAD_TEXT_Y_OFFSET_METERS),
-      mod.Message(mod.stringkeys.PostMatchPlayerName, slot.player.player),
-      COLOR_NEUTRAL,
-      "postmatch_head_worldicon_" + String(slot.anchorId)
-    );
-    ensurePostmatchShowcaseWorldIconForSlot(
-      slot,
-      "feet",
-      createOffsetPosition(basePos, POSTMATCH_SHOWCASE_FEET_TEXT_Y_OFFSET_METERS),
-      mod.Message(getPostmatchShowcaseStatLabelKey(slot.statKind), mod.Ceiling(slot.statValue)),
-      COLOR_FRIENDLY,
-      "postmatch_feet_worldicon_" + String(slot.anchorId)
-    );
-  }
-}
-
 function teleportPostmatchShowcaseSlotPlayer(slot: PostmatchShowcaseSlot, context: string): boolean {
   const player = slot.player.player;
   if (!mod.IsPlayerValid(player)) return false;
@@ -22771,94 +22612,84 @@ function teleportPostmatchShowcaseSlotPlayer(slot: PostmatchShowcaseSlot, contex
   }
 }
 
-function reassertPostmatchShowcaseSlotTeleport(playerId: number, context: string, delayMs: number): void {
+function startPostmatchShowcaseTeleportSequence(slot: PostmatchShowcaseSlot): void {
+  const playerId = slot.player.id;
   const sessionToken = ensurePlayerSessionToken(playerId);
   const expectedMatchStage = cipherMatchStage;
-  scheduleCipherGlobalTask(delayMs / 1000, "postmatch_slot_reassert/" + context, () => {
-    if (!isQueuedPlayerWorkCurrent(playerId, sessionToken, 4, expectedMatchStage)) return;
-    const latest = getValidHumanPlayerById(playerId);
-    if (!latest) return;
-    const slot = findPostmatchShowcaseSlotForPlayerId(playerId);
-    if (!slot) return;
-    slot.player = latest;
-    if (!isPlayerAliveSafe(slot.player.player)) return;
-    teleportPostmatchShowcaseSlotPlayer(slot, context);
-    applyPostmatchInputStateForPlayer(slot.player.player);
-    setPostmatchShowcaseCameraForPlayer(slot.player.player, true);
-  });
+  const expectedNativeObjId = slot.player.nativeObjId;
+  const sequenceToken = (postmatchShowcaseTeleportTokenByPlayerId[playerId] ?? 0) + 1;
+  postmatchShowcaseTeleportTokenByPlayerId[playerId] = sequenceToken;
+
+  const attemptTeleport = (context: string): void => {
+    if (postmatchShowcaseTeleportTokenByPlayerId[playerId] !== sequenceToken) return;
+    if (gameStatus !== 4 || cipherMatchStage !== expectedMatchStage) return;
+    if (!isCurrentPlayerSession(playerId, sessionToken)) return;
+    const latest = serverPlayers.get(playerId);
+    const currentSlot = findPostmatchShowcaseSlotForPlayerId(playerId);
+    if (!latest || !currentSlot) return;
+    if (latest.nativeObjId !== expectedNativeObjId) return;
+    if (!mod.IsPlayerValid(latest.player)) return;
+    if (mod.GetObjId(latest.player) !== expectedNativeObjId) return;
+    currentSlot.player = latest;
+    if (!tryMakePostmatchShowcasePlayerAlive(latest)) return;
+    latest.isDeployed = true;
+    applyPostmatchShowcaseMovementLockForPlayer(latest.player);
+    if (!teleportPostmatchShowcaseSlotPlayer(currentSlot, context)) return;
+    applyPostmatchInputStateForPlayer(latest.player);
+    setPostmatchShowcaseCameraForPlayer(latest.player, true);
+  };
+
+  attemptTeleport("sequence_immediate");
+
+  for (let i = 0; i < POSTMATCH_SHOWCASE_TELEPORT_DELAYS_MS.length; i++) {
+    const delayMs = POSTMATCH_SHOWCASE_TELEPORT_DELAYS_MS[i];
+    scheduleCipherGlobalTask(delayMs / 1000, "postmatch_slot_teleport/" + String(playerId), () => {
+      try {
+        attemptTeleport("sequence_" + String(delayMs));
+      } catch (err) {
+        LogRuntimeError("PostmatchShowcaseTeleportAttempt/" + String(playerId), err);
+      }
+    });
+  }
 }
+
 function applyPostmatchShowcaseSlot(slot: PostmatchShowcaseSlot): void {
   if (!slot || !slot.player) return;
   const playerId = slot.player.id;
-  if (isCipherRuntimeBotPlayerId(playerId) || isBotBackfillPlayerSafe(slot.player.player)) return;
-  const currentPlayer = getValidHumanPlayerById(playerId);
-  if (!currentPlayer) return;
+  const currentPlayer = serverPlayers.get(playerId);
+  if (!currentPlayer || !mod.IsPlayerValid(currentPlayer.player)) return;
+  if (mod.GetObjId(currentPlayer.player) !== currentPlayer.nativeObjId) return;
   slot.player = currentPlayer;
   const player = slot.player.player;
   if (!mod.IsPlayerValid(player)) return;
 
   if (!tryMakePostmatchShowcasePlayerAlive(slot.player)) return;
+  slot.player.isDeployed = true;
   applyPostmatchInputStateForPlayer(player);
-  const sessionToken = ensurePlayerSessionToken(playerId);
-  const expectedMatchStage = cipherMatchStage;
-
-  scheduleCipherGlobalTask(POSTMATCH_SHOWCASE_SPAWN_SETTLE_MS / 1000, "postmatch_slot_apply", () => {
-    if (!isQueuedPlayerWorkCurrent(playerId, sessionToken, 4, expectedMatchStage)) return;
-    const latest = getValidHumanPlayerById(playerId);
-    if (!latest) return;
-    const currentSlot = findPostmatchShowcaseSlotForPlayerId(playerId);
-    if (!currentSlot) return;
-    slot = currentSlot;
-    slot.player = latest;
-    if (!isPlayerAliveSafe(slot.player.player)) return;
-    if (teleportPostmatchShowcaseSlotPlayer(slot, "apply_settle_100")) {
-      applyPostmatchInputStateForPlayer(slot.player.player);
-      setPostmatchShowcaseCameraForPlayer(slot.player.player, true);
-      reassertPostmatchShowcaseSlotTeleport(playerId, "apply_reassert_350", 350);
-      reassertPostmatchShowcaseSlotTeleport(playerId, "apply_reassert_750", 750);
-      reassertPostmatchShowcaseSlotTeleport(playerId, "apply_reassert_1250", 1250);
-    }
-  });
+  startPostmatchShowcaseTeleportSequence(slot);
 }
 
 function applyPostmatchShowcaseSlots(): void {
   for (let i = 0; i < postmatchShowcaseSlots.length; i++) {
     applyPostmatchShowcaseSlot(postmatchShowcaseSlots[i]);
   }
-  updatePostmatchShowcaseWorldIconPositions();
-}
-
-function schedulePostmatchShowcaseReasserts(): void {
-  const delays = [0.1, 0.35, 0.75, 1.25];
-  for (let i = 0; i < delays.length; i++) {
-    scheduleCipherGlobalTask(delays[i], "postmatch_showcase_reassert", () => {
-      if (gameStatus !== 4 || initialization[4] !== true) return;
-      applyPostmatchShowcaseCameraAndInputForAllPlayers();
-      applyPostmatchShowcaseSlots();
-    });
-  }
-}
-
-function showPostmatchStatsMapHint(): void {
-  const message = mod.Message((mod.stringkeys as any).PostMatchStatsMapHint);
-  modlib.ShowHighlightedGameModeMessage(message, team1);
-  modlib.ShowHighlightedGameModeMessage(message, team2);
 }
 
 function beginPostmatchShowcase(): void {
-  clearPostmatchShowcaseRuntimeWorldIcons();
   postmatchShowcaseSlots = buildPostmatchShowcaseSlots();
+  buildPostmatchShowcaseScreenUi();
 
   showPostmatchShowcaseSpatialObjectsForPostmatch();
 
   applyPostmatchInputStateForAllPlayers();
   applyPostmatchShowcaseSlots();
-  schedulePostmatchShowcaseReasserts();
 }
 
 function clearPostmatchShowcaseState(): void {
-  clearPostmatchShowcaseRuntimeWorldIcons();
+  deletePostMatchReportUI();
   postmatchShowcaseSlots = [];
+  postmatchShowcaseTeleportTokenByPlayerId = {};
+  postmatchEndTick = 0;
 
   hidePostmatchShowcaseSpatialObjectsForPrematch();
 
@@ -22904,12 +22735,85 @@ function addPostMatchText(
     receiver as any
   );
 
+  const widget = mod.FindUIWidgetWithName(name);
+  if (widget) mod.SetUIWidgetDepth(widget, mod.UIDepth.AboveGameUI);
+
   postMatchWidgetsToDelete.push(name);
 }
 
 function setPostMatchText(name: string, label: any): void {
   const w = mod.FindUIWidgetWithName(name);
   if (w) mod.SetUITextLabel(w, label);
+}
+
+function addPostMatchContainer(
+  name: string,
+  posX: number,
+  posY: number,
+  color: mod.Vector,
+  alpha: number,
+  fill: mod.UIBgFill,
+  receiver: mod.Team
+): void {
+  const parent = mod.FindUIWidgetWithName("PostMatchContainer");
+  if (!parent) return;
+  mod.AddUIContainer(
+    name,
+    mod.CreateVector(posX, posY, 0),
+    mod.CreateVector(POSTMATCH_SHOWCASE_CARD_WIDTH, POSTMATCH_SHOWCASE_CARD_HEIGHT, 0),
+    mod.UIAnchor.Center,
+    parent,
+    true,
+    0,
+    color,
+    alpha,
+    fill,
+    receiver
+  );
+  const widget = mod.FindUIWidgetWithName(name);
+  if (widget) mod.SetUIWidgetDepth(widget, mod.UIDepth.AboveGameUI);
+  postMatchWidgetsToDelete.push(name);
+}
+
+function getPostmatchShowcaseColorForReceiver(receiver: mod.Team): mod.Vector {
+  const winner = getWinningTeam();
+  if (mod.Equals(winner, teamNeutral)) return COLOR_NEUTRAL;
+  return mod.Equals(receiver, winner) ? COLOR_FRIENDLY : COLOR_ENEMY;
+}
+
+function buildPostmatchShowcaseScreenUi(): void {
+  const receivers = [team1, team2];
+  const textColor = mod.CreateVector(1, 1, 1);
+  for (let receiverIndex = 0; receiverIndex < receivers.length; receiverIndex++) {
+    const receiver = receivers[receiverIndex];
+    const teamSuffix = String(modlib.getTeamId(receiver));
+    const color = getPostmatchShowcaseColorForReceiver(receiver);
+    for (let slotIndex = 0; slotIndex < postmatchShowcaseSlots.length && slotIndex < 4; slotIndex++) {
+      const slot = postmatchShowcaseSlots[slotIndex];
+      if (!slot) continue;
+      const x = POSTMATCH_SHOWCASE_SCREEN_X[slotIndex];
+      const suffix = "_" + teamSuffix + "_" + String(slotIndex + 1);
+      const playerContainer = "PM_PlayerContainer" + suffix;
+      const playerOutline = "PM_PlayerOutline" + suffix;
+      const playerText = "PM_PlayerText" + suffix;
+      const statContainer = "PM_StatContainer" + suffix;
+      const statOutline = "PM_StatOutline" + suffix;
+      const statText = "PM_StatText" + suffix;
+
+      addPostMatchContainer(playerContainer, x, POSTMATCH_SHOWCASE_PLAYER_Y, color, 0.5, mod.UIBgFill.Blur, receiver);
+      addPostMatchContainer(playerOutline, x, POSTMATCH_SHOWCASE_PLAYER_Y, color, 0.85, mod.UIBgFill.OutlineThick, receiver);
+      addPostMatchText(playerText, x, POSTMATCH_SHOWCASE_PLAYER_Y, POSTMATCH_SHOWCASE_CARD_WIDTH, 42, 20, textColor, 1, receiver, mod.UIAnchor.Center);
+      setPostMatchText(playerText, mod.Message(mod.stringkeys.PostMatchPlayerName, slot.player.player));
+
+      addPostMatchContainer(statContainer, x, POSTMATCH_SHOWCASE_STAT_Y, color, 0.5, mod.UIBgFill.Blur, receiver);
+      addPostMatchContainer(statOutline, x, POSTMATCH_SHOWCASE_STAT_Y, color, 0.85, mod.UIBgFill.OutlineThick, receiver);
+      addPostMatchText(statText, x, POSTMATCH_SHOWCASE_STAT_Y, POSTMATCH_SHOWCASE_CARD_WIDTH, 42, 20, textColor, 1, receiver, mod.UIAnchor.Center);
+      setPostMatchText(
+        statText,
+        mod.Message(getPostmatchShowcaseStatLabelKey(slot.statKind), mod.Ceiling(slot.statValue))
+      );
+    }
+  }
 }
 
 function BuildPostMatchReportUI(): void {
@@ -22958,7 +22862,7 @@ function BuildPostMatchReportUI(): void {
       POSTMATCH_SCORE_TEXT_Y,
       POSTMATCH_SCORE_TEXT_WIDTH,
       POSTMATCH_SCORE_TEXT_HEIGHT,
-      40,
+      52,
       COLOR_FRIENDLY,
       1,
       receiver,
@@ -22989,7 +22893,7 @@ function BuildPostMatchReportUI(): void {
       POSTMATCH_SCORE_TEXT_Y,
       POSTMATCH_SCORE_TEXT_WIDTH,
       POSTMATCH_SCORE_TEXT_HEIGHT,
-      40,
+      52,
       COLOR_ENEMY,
       1,
       receiver,
@@ -22998,23 +22902,6 @@ function BuildPostMatchReportUI(): void {
         setPostMatchText(
       "PM_EnemyScore_" + teamSuffix,
       mod.Message((mod.stringkeys as any).PostMatchScoreValue, mod.Ceiling(enemyScore))
-    );
-
-    addPostMatchText(
-      "PM_MapHint_" + teamSuffix,
-      0,
-      POSTMATCH_HINT_TEXT_Y,
-      POSTMATCH_HINT_TEXT_WIDTH,
-      POSTMATCH_HINT_TEXT_HEIGHT,
-      POSTMATCH_HINT_TEXT_SIZE,
-      COLOR_NEUTRAL,
-      1,
-      receiver,
-      mod.UIAnchor.Center
-    );
-    setPostMatchText(
-      "PM_MapHint_" + teamSuffix,
-      mod.Message((mod.stringkeys as any).PostMatchStatsMapHint)
     );
 
     addPostMatchText(
@@ -23060,12 +22947,13 @@ function InitializePostmatch(): void {
     postmatchEndStep = 0;
     postmatchEndStepTick = 0;
     postmatchEndStepAtSec = 0;
+    postmatchEndTick = serverTickCount + POSTMATCH_TIME * TICK_RATE;
     mod.SetSpawnMode(mod.SpawnModes.AutoSpawn);
     prepareAllPostmatchPlayers("InitializePostmatch");
     schedulePostmatchPlayerStateReassert("InitializePostmatch_reassert", 250);
     schedulePostmatchPlayerStateReassert("InitializePostmatch_reassert", 750);
     schedulePostmatchPlayerStateReassert("InitializePostmatch_reassert", 1500);
-    setPhaseCountdownDeadlineFromNow(POSTMATCH_TIME);
+    clearPhaseCountdownDeadline();
     schedulePostmatchEndGameModeFallback("InitializePostmatch");
     resetEngineSchedulerCadenceState();
     setLiveScorePanelVisible(false);
@@ -23100,7 +22988,6 @@ function InitializePostmatch(): void {
 
     BuildPostMatchReportUI();
     updatePostmatchEndTimerUi(POSTMATCH_TIME);
-    showPostmatchStatsMapHint();
     beginPostmatchShowcase();
     playPostMatchResultSfxOnce();
     initOk = true;
@@ -23138,11 +23025,6 @@ function LogRuntimeError(tag: string, err: any): void {
   if (serverTickCount - lastRuntimeErrorTick < TICK_RATE) return;
   lastRuntimeErrorTick = serverTickCount;
 
-  try {
-    mod.DisplayHighlightedWorldLogMessage(
-      mod.Message("[RUNTIME ERROR] {}: {}", tag, String(err))
-    );
-  } catch (_err) {}
 }
 
 function getInitializationFlagSummary(): string {
@@ -23329,6 +23211,7 @@ function getCurrentSchedulerNowSeconds(): number {
 }
 
 function shouldUseEngineScheduler(nowSec: number | undefined): nowSec is number {
+  if (gameStatus === 4) return false;
   if (isCipherTransitionClockActive()) return false;
   return USE_ENGINE_TIME_SCHEDULER && nowSec !== undefined;
 }
@@ -23551,6 +23434,7 @@ function bootstrapConnectedHumanPlayersForGameModeStart(startupHandles: mod.Play
       : 0;
     const pending: PendingPlayerSession = {
       playerId,
+      nativeObjId: identity?.nativeObjId ?? playerId,
       player: eventPlayer,
       sessionToken,
       // This is not a new network join; it is recovery of a player already present
@@ -23564,6 +23448,9 @@ function bootstrapConnectedHumanPlayersForGameModeStart(startupHandles: mod.Play
       watchdogLogged: false,
     };
     pendingPlayerSessionById[playerId] = pending;
+    emitPlayerLifecycleDiagnostic(
+      "JOIN_PENDING logicalId=" + String(playerId) + " session=" + String(sessionToken)
+    );
 
     if (stableTeamId > 0) {
       try {
@@ -23588,6 +23475,7 @@ function bootstrapConnectedHumanPlayersForGameModeStart(startupHandles: mod.Play
 function Mode_OnGameModeStarted(): void {
   const startupPlayerHandles = collectConnectedHumanPlayerHandlesForGameModeStart();
   resetLifecycleStateForFreshMatchStart();
+  warmCipherSpawnAnchorPositionCache();
   SetDepthAboveGameUI("PreMatchContainer");
   SetDepthAboveGameUI(PREMATCH_PANEL_WIDGET_NAME);
   SetCountdownOverlayVisible(false);
@@ -23658,6 +23546,7 @@ function OngoingGlobal_Inner(): void {
   processCipherScheduledTasks(nowSec);
   updatePerfTelemetryFrame(nowSec);
   processPlayerLifecycleSupervisor();
+  processPlayerLifecycleDeferredFanout();
   tickCipherAdminInteractFallback(nowSec);
   processPhasePlayerOperationQueue();
 
@@ -23742,7 +23631,6 @@ function OngoingGlobal_Inner(): void {
       return;
     }
 
-    processCipherRespawnRouteJobs(nowSec);
     processCipherSpawnJobs("live_scheduler");
 
     const visualNowSec = ENABLE_CARRIER_SUBTICK ? getVisualSubtickNowSec() : nowSec;
@@ -23858,26 +23746,17 @@ function OngoingGlobal_Inner(): void {
       InitializePostmatch();
       if (!initialization[4]) return;
     }
-    updatePostmatchShowcaseWorldIconPositions();
     if (postmatchEndStep !== 0) {
       return;
     }
 
-    let postmatchSecondDue = false;
-    if (useEngineSchedulerFrame) {
-      if (phaseCountdownDeadlineAtSec <= 0) setPhaseCountdownDeadlineFromNow(countDown);
-      const displaySeconds = clampCountdownDisplaySeconds(phaseCountdownDeadlineAtSec - nowSec);
-      if (displaySeconds !== phaseCountdownLastShownSeconds) {
-        phaseCountdownLastShownSeconds = displaySeconds;
-        countDown = displaySeconds;
-        updatePostmatchEndTimerUi(countDown);
-        postmatchSecondDue = true;
-      }
-    } else if (mod.Modulo(phaseTickCount, TICK_RATE) === 0) {
-      countDown -= 1;
-      if (countDown < 0) countDown = 0;
+    if (postmatchEndTick <= 0) postmatchEndTick = serverTickCount + countDown * TICK_RATE;
+    const remainingTicks = mod.Max(0, postmatchEndTick - serverTickCount);
+    const displaySeconds = mod.Max(0, mod.Ceiling(remainingTicks / TICK_RATE));
+    const postmatchSecondDue = displaySeconds !== countDown;
+    if (postmatchSecondDue) {
+      countDown = displaySeconds;
       updatePostmatchEndTimerUi(countDown);
-      postmatchSecondDue = true;
     }
 
     if (postmatchSecondDue && countDown === 0) {
@@ -23895,43 +23774,84 @@ function OngoingGlobal_Inner(): void {
 ================================================================================================= */
 
 function findServerPlayerByObjId(playerObjId: number): Player | undefined {
-  let found: Player | undefined = undefined;
-  serverPlayers.forEach((sp) => {
-    if (!sp || found) return;
-    try {
-      if (!mod.IsPlayerValid(sp.player)) return;
-      if (mod.GetObjId(sp.player) === playerObjId) found = sp;
-    } catch (_err) {}
-  });
-  return found;
+  for (const entry of serverPlayers.entries()) {
+    const sp = entry[1];
+    if (sp && sp.nativeObjId === playerObjId) return sp;
+  }
+  return undefined;
+}
+
+function findPendingPlayerSessionByObjId(playerObjId: number): PendingPlayerSession | undefined {
+  for (const key in pendingPlayerSessionById) {
+    const pending = pendingPlayerSessionById[Number(key)];
+    if (pending && pending.nativeObjId === playerObjId) return pending;
+  }
+  return undefined;
 }
 
 function Mode_OnPlayerJoinGame(eventPlayer: mod.Player): void {
   try {
-    const joiningId = tryGetSafeEventPlayerIdOnly(eventPlayer);
-    if (joiningId === undefined) return;
+    const identity = tryGetSafeEventPlayerIdentity(eventPlayer);
+    if (!identity || identity.isBot) return;
+    const joiningId = identity.playerId;
+    const joiningObjId = identity.nativeObjId;
+    emitPlayerLifecycleDiagnostic(
+      "JOIN_EVENT objId=" + String(joiningObjId) + " logicalId=" + String(joiningId)
+    );
 
     const pending = pendingPlayerSessionById[joiningId];
     if (pending && isCurrentPlayerSession(joiningId, pending.sessionToken)) {
-      pending.player = eventPlayer;
-      pending.stableTeamId = 0;
-      pending.stableSamples = 0;
-      pending.nextRetryAtMs = Date.now();
-      return;
+      if (pending.nativeObjId === joiningObjId) {
+        pending.player = eventPlayer;
+        return;
+      }
+      emitPlayerLifecycleDiagnostic(
+        "JOIN_REPLACED_STALE_HANDLE logicalId=" + String(joiningId) +
+          " oldObjId=" + String(pending.nativeObjId) + " newObjId=" + String(joiningObjId)
+      );
+      invalidatePlayerSessionForDisconnect(joiningId);
+      delete pendingPlayerSessionById[joiningId];
+      clearDisconnectedPlayerStateDataOnly(joiningId);
     }
 
     const active = serverPlayers.get(joiningId);
     if (
       active &&
       playerActivatedSessionTokenByPlayerId[joiningId] === playerSessionTokenByPlayerId[joiningId] &&
-      playerDisconnectedAtTickByPlayerId[joiningId] === undefined
+      playerDisconnectedAtTickByPlayerId[joiningId] === undefined &&
+      active.nativeObjId === joiningObjId
     ) return;
+
+    if (active) {
+      const oldSessionToken = playerSessionTokenByPlayerId[joiningId];
+      const oldObjId = active.nativeObjId;
+      const cachedPosition = lastKnownLivePositionByPlayerId[joiningId];
+      const cachedTeam = active.team;
+      const wasCarrier = gameStatus === 3 && bombCarrierPlayerId === joiningId;
+      rememberDisconnectedPlayerSnapshot(active);
+      emitPlayerLifecycleDiagnostic(
+        "JOIN_REPLACED_STALE_HANDLE logicalId=" + String(joiningId) +
+          " oldObjId=" + String(oldObjId) + " newObjId=" + String(joiningObjId)
+      );
+      invalidatePlayerSessionForDisconnect(joiningId);
+      delete playerActivatedSessionTokenByPlayerId[joiningId];
+      serverPlayers.delete(joiningId);
+      clearDisconnectedPlayerStateDataOnly(joiningId, active);
+      playerLeaveCleanupQueue.push({
+        playerId: joiningId,
+        sessionToken: oldSessionToken,
+        wasCarrier,
+        cachedPosition,
+        cachedTeam,
+      });
+    }
 
     const sessionToken = beginPlayerSessionForJoin(joiningId);
     delete playerActivatedSessionTokenByPlayerId[joiningId];
     serverPlayers.delete(joiningId);
     pendingPlayerSessionById[joiningId] = {
       playerId: joiningId,
+      nativeObjId: joiningObjId,
       player: eventPlayer,
       sessionToken,
       joinedAtMs: Date.now(),
@@ -23942,6 +23862,9 @@ function Mode_OnPlayerJoinGame(eventPlayer: mod.Player): void {
       deployAckSeen: false,
       watchdogLogged: false,
     };
+    emitPlayerLifecycleDiagnostic(
+      "JOIN_PENDING logicalId=" + String(joiningId) + " session=" + String(sessionToken)
+    );
     const keepPrematchDeployAvailable = !gameModeStarted || gameStatus === -1 || gameStatus === 0;
     try {
       // Midmatch joins remain quarantined until their handle/team is stable.
@@ -23951,13 +23874,9 @@ function Mode_OnPlayerJoinGame(eventPlayer: mod.Player): void {
     } catch (_errDeployLock) {}
 
     if (keepPrematchDeployAvailable) {
-      forceEnablePrematchDeploymentForKnownPlayers("OnPlayerJoinGame", [eventPlayer]);
       const prematchPending = pendingPlayerSessionById[joiningId];
-      const identity = tryGetSafeEventPlayerIdentity(eventPlayer);
       if (
         prematchPending &&
-        identity &&
-        !identity.isBot &&
         (identity.teamId === 1 || identity.teamId === 2) &&
         isCurrentPlayerSession(joiningId, prematchPending.sessionToken)
       ) {
@@ -23967,9 +23886,7 @@ function Mode_OnPlayerJoinGame(eventPlayer: mod.Player): void {
         try {
           activatePendingPlayerSession(prematchPending);
         } catch (err) {
-          // The periodic supervisor retries, but deployment remains available.
           LogRuntimeError("OnPlayerJoinGame/PrematchActivate/" + String(joiningId), err);
-          forceEnablePrematchDeploymentForKnownPlayers("OnPlayerJoinGame_retry", [eventPlayer]);
         }
       }
     }
@@ -23980,11 +23897,24 @@ function Mode_OnPlayerJoinGame(eventPlayer: mod.Player): void {
 
 function Mode_OnPlayerLeaveGame(eventNumber: number): void {
   try {
-    const playerId = eventNumber;
-    const pending = pendingPlayerSessionById[playerId];
-    const leaving = serverPlayers.get(playerId);
-    if (!pending && !leaving) return;
+    emitPlayerLifecycleDiagnostic("LEAVE_EVENT eventId=" + String(eventNumber));
+    const leaving = findServerPlayerByObjId(eventNumber) ?? serverPlayers.get(eventNumber);
+    const pending =
+      findPendingPlayerSessionByObjId(eventNumber) ?? pendingPlayerSessionById[eventNumber];
+    if (!pending && !leaving) {
+      emitPlayerLifecycleDiagnostic("LEAVE_UNRESOLVED eventId=" + String(eventNumber));
+      return;
+    }
+    const playerId = leaving?.id ?? pending?.playerId;
+    if (playerId === undefined) {
+      emitPlayerLifecycleDiagnostic("LEAVE_UNRESOLVED eventId=" + String(eventNumber));
+      return;
+    }
+    const nativeObjId = leaving?.nativeObjId ?? pending?.nativeObjId ?? eventNumber;
     const sessionToken = pending?.sessionToken ?? playerSessionTokenByPlayerId[playerId];
+    emitPlayerLifecycleDiagnostic(
+      "LEAVE_RESOLVED logicalId=" + String(playerId) + " objId=" + String(nativeObjId)
+    );
 
     if (leaving) {
       if (gameStatus === 3) leaving.addDeath();
@@ -23997,7 +23927,15 @@ function Mode_OnPlayerLeaveGame(eventNumber: number): void {
     delete pendingPlayerSessionById[playerId];
     delete playerActivatedSessionTokenByPlayerId[playerId];
     serverPlayers.delete(playerId);
-    delete playerDeployHydrationQueuedByPlayerId[playerId];
+    clearDisconnectedPlayerStateDataOnly(playerId, leaving);
+    if (pending) {
+      emitPlayerLifecycleDiagnostic("LEAVE_PENDING_REMOVED logicalId=" + String(playerId));
+    }
+    if (leaving) {
+      emitPlayerLifecycleDiagnostic(
+        "LEAVE_ACTIVE_REMOVED logicalId=" + String(playerId) + " session=" + String(sessionToken)
+      );
+    }
     playerLeaveCleanupQueue.push({ playerId, sessionToken, wasCarrier, cachedPosition, cachedTeam });
   } catch (err) {
     LogRuntimeError("OnPlayerLeaveGame", err);
@@ -24005,10 +23943,12 @@ function Mode_OnPlayerLeaveGame(eventNumber: number): void {
 }
 
 function recordPlayerDeployedMinimal(eventPlayer: mod.Player): void {
-  const playerId = tryGetSafeEventPlayerIdOnly(eventPlayer);
-  if (playerId === undefined) return;
+  const identity = tryGetSafeEventPlayerIdentity(eventPlayer);
+  if (!identity || identity.isBot) return;
+  const playerId = identity.playerId;
   const pending = pendingPlayerSessionById[playerId];
   if (pending && isCurrentPlayerSession(playerId, pending.sessionToken)) {
+    if (pending.nativeObjId !== identity.nativeObjId) return;
     pending.player = eventPlayer;
     pending.deployAckSeen = true;
     return;
@@ -24017,15 +23957,14 @@ function recordPlayerDeployedMinimal(eventPlayer: mod.Player): void {
   const sessionToken = playerSessionTokenByPlayerId[playerId];
   if (!p || sessionToken === undefined) return;
   if (playerActivatedSessionTokenByPlayerId[playerId] !== sessionToken) return;
-  const identity = tryGetSafeEventPlayerIdentity(eventPlayer);
-  if (!identity || identity.playerId !== playerId || identity.isBot) return;
+  if (p.nativeObjId !== identity.nativeObjId) return;
   p.player = eventPlayer;
   p.team = identity.team;
+  p.isDeployed = true;
   // Consume the countdown route before clearing stale queue work. The route belongs
   // to this life generation and must survive the deploy acknowledgement.
   sealCipherRespawnRouteJobForDeploy(playerId, "OnPlayerDeployed_Minimal");
   clearCipherSpawnJobsForPlayer(playerId);
-  p.isDeployed = true;
   if (cipherSecondHalfTransitionStage === "deploy" && isCipherLiveTransitionActive()) {
     const transitionToken = getCipherSecondHalfForceDeployToken();
     cipherSecondHalfDeployRequiredByPlayerId[playerId] = true;
@@ -24047,10 +23986,12 @@ async function Mode_OnPlayerDeployed(eventPlayer: mod.Player): Promise<void> {
 
 
 function recordPlayerUndeployedMinimal(eventPlayer: mod.Player): void {
-  const playerId = tryGetSafeEventPlayerIdOnly(eventPlayer);
-  if (playerId === undefined) return;
+  const identity = tryGetSafeEventPlayerIdentity(eventPlayer);
+  if (!identity || identity.isBot) return;
+  const playerId = identity.playerId;
   const pending = pendingPlayerSessionById[playerId];
   if (pending && isCurrentPlayerSession(playerId, pending.sessionToken)) {
+    if (pending.nativeObjId !== identity.nativeObjId) return;
     pending.player = eventPlayer;
     pending.deployAckSeen = false;
     return;
@@ -24059,24 +24000,84 @@ function recordPlayerUndeployedMinimal(eventPlayer: mod.Player): void {
   const sessionToken = playerSessionTokenByPlayerId[playerId];
   if (!p || sessionToken === undefined) return;
   if (playerActivatedSessionTokenByPlayerId[playerId] !== sessionToken) return;
+  if (p.nativeObjId !== identity.nativeObjId) return;
   p.player = eventPlayer;
   const wasDeployed = p.isDeployed === true;
+  invalidateCipherRespawnRouteJobForPlayer(playerId);
+  beginNextPlayerLife(playerId);
   const keepTransitionReady =
     cipherSecondHalfTransitionStage === "deploy" &&
     cipherSecondHalfDeployReadyByPlayerId[playerId] === true &&
     cipherTransitionDeployAckTokenByPlayerId[playerId] === getCipherSecondHalfForceDeployToken();
   p.isDeployed = keepTransitionReady;
   if (!keepTransitionReady) clearCipherSecondHalfDeployReadyForPlayer(playerId);
-  if (playerUndeployCleanupQueuedByPlayerId[playerId] === true) return;
-  playerUndeployCleanupQueuedByPlayerId[playerId] = true;
-  playerUndeployCleanupQueue.push({
-    playerId,
-    sessionToken,
-    wasDeployed,
-    expectedGameStatus: gameStatus,
-    expectedMatchStage: cipherMatchStage,
-    expectedTransitionToken: getQueuedPlayerWorkTransitionToken(),
-  });
+
+  closeCipherAdminPanelForPlayerId(playerId);
+  dmgSpreadClearForPlayer(eventPlayer);
+  prematchHealthInside889ByPlayerId[playerId] = false;
+  delete prematchHealthAppliedMaxByPlayerId[playerId];
+  invalidateBombDeployLoadoutApplyForPlayer(playerId);
+  invalidateBombCarrierRestoreInsertForPlayer(playerId);
+  resetRestrictedAreaStateForPlayer(playerId);
+  clearAllObjectiveAreaTriggerStateForPlayer(playerId);
+  clearCipherPresenceForPlayer(playerId);
+  clearCipherSpawnJobsForPlayer(playerId);
+  delete cipherQueuedAnchorByPlayerId[playerId];
+  cancelObjectiveCaptureAttemptsForPlayer(playerId);
+
+  if (isCipherLiveTransitionActive()) {
+    invalidateCipherRespawnRouteJobForPlayer(playerId);
+    if (cipherSecondHalfTransitionStage === "deploy") {
+      setCipherSecondHalfDeployFreezeForPlayer(eventPlayer, keepTransitionReady, "transition_deploy_undeploy");
+    } else {
+      applyPhaseInputRestrictionsForPlayer(eventPlayer);
+    }
+    mod.SetRedeployTime(eventPlayer, 0);
+    requestCipherTransitionReconcile("OnPlayerUndeploy_Transition");
+    return;
+  }
+
+  const suddenDeathScriptForcedUndeploy =
+    cipherSuddenDeathForcedUndeployTokenByPlayerId[playerId] !== undefined;
+  if (suddenDeathScriptForcedUndeploy && isCipherSuddenDeathActive()) {
+    delete cipherSuddenDeathForcedUndeployTokenByPlayerId[playerId];
+    invalidateCipherRespawnRouteJobForPlayer(playerId);
+    mod.SetRedeployTime(eventPlayer, 9999);
+    return;
+  }
+
+  if (gameStatus === 3 && bombCarrierPlayerId === playerId) {
+    const pos = tryGetPlayerPositionSafe(eventPlayer);
+    if (pos) lastKnownLivePositionByPlayerId[playerId] = pos;
+    scheduleBombCarrierDropAfterCombatEvent(playerId, "undeploy", pos);
+  }
+
+  if (
+    isCipherSuddenDeathActive() &&
+    !isCipherLiveStartSettling() &&
+    wasDeployed &&
+    !isPlayerAliveSafe(eventPlayer) &&
+    getCurrentSchedulerNowSeconds() >= cipherSuddenDeathUndeployIgnoreUntilSec
+  ) {
+    invalidateCipherRespawnRouteJobForPlayer(playerId);
+    consumeCipherSuddenDeathLife(playerId, "undeploy");
+    return;
+  }
+
+  if (gameStatus === 1 || gameStatus === 2) {
+    invalidateCipherRespawnRouteJobForPlayer(playerId);
+    applyPhaseInputRestrictionsForPlayer(eventPlayer);
+    mod.SetRedeployTime(eventPlayer, 0);
+    requestTransitionSpawn(playerId, "OnPlayerUndeploy_Transition");
+    return;
+  }
+
+  if (gameStatus === 3 && getCurrentSchedulerNowSeconds() >= cipherPhaseTransitionUndeployIgnoreUntilSec) {
+    startCipherRespawnRouteJobForPlayer(playerId, wasDeployed, "OnPlayerUndeploy_Live");
+    // Match the known-good script: mutate stored stats only. Engine-facing
+    // scoreboard rendering happens later from a safe deployed/global update.
+    p.addDeath();
+  }
   requestCipherTransitionReconcile("OnPlayerUndeploy_Minimal");
 }
 
@@ -24665,8 +24666,9 @@ function Mode_OnPlayerEarnedKillAssist(eventPlayer: mod.Player, eventOtherPlayer
 ================================================================================================= */
 
 function Mode_OnPlayerEnterAreaTrigger(eventPlayer: mod.Player, eventAreaTrigger: mod.AreaTrigger): void {
-  const triggerId = mod.GetObjId(eventAreaTrigger);
-  const playerId = modlib.getPlayerId(eventPlayer);
+  const triggerId = getObjIdSafe(eventAreaTrigger);
+  const playerId = getPlayerIdSafe(eventPlayer);
+  if (triggerId < 0 || playerId === undefined) return;
 
   if (triggerId === PREMATCH_HEALTH_AREA_TRIGGER_ID) {
     if (gameStatus === 0) {
@@ -24718,8 +24720,9 @@ function Mode_OnPlayerEnterAreaTrigger(eventPlayer: mod.Player, eventAreaTrigger
 
 
 function Mode_OnPlayerExitAreaTrigger(eventPlayer: mod.Player, eventAreaTrigger: mod.AreaTrigger): void {
-  const triggerId = mod.GetObjId(eventAreaTrigger);
-  const playerId = modlib.getPlayerId(eventPlayer);
+  const triggerId = getObjIdSafe(eventAreaTrigger);
+  const playerId = getPlayerIdSafe(eventPlayer);
+  if (triggerId < 0 || playerId === undefined) return;
 
   if (triggerId === PREMATCH_HEALTH_AREA_TRIGGER_ID) {
     if (gameStatus === 0) {
