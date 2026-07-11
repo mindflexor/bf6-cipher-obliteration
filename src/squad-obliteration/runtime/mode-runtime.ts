@@ -933,6 +933,11 @@ const CIPHER_SPAWN_ENEMY_DANGER_RADIUS_METERS = 18;
 const CIPHER_RESPAWN_ROUTE_EVALUATION_SECONDS = SPAWN_ROUTING_CONFIG.routeEvaluationDurationSeconds;
 const CIPHER_RESPAWN_ROUTE_TICK_SECONDS = SPAWN_ROUTING_CONFIG.routeEvaluationTickSeconds;
 const CIPHER_RESPAWN_ROUTE_TICK_MS = mod.Max(1, CIPHER_RESPAWN_ROUTE_TICK_SECONDS * 1000);
+const CIPHER_RESPAWN_POST_DEPLOY_DELAY_SECONDS = SPAWN_ROUTING_CONFIG.safeSpawnCheckDelaySeconds;
+const CIPHER_RESPAWN_POST_DEPLOY_DELAY_TICKS = mod.Max(
+  1,
+  mod.Ceiling(CIPHER_RESPAWN_POST_DEPLOY_DELAY_SECONDS * TICK_RATE)
+);
 const CIPHER_RESPAWN_OBJECTIVE_PRESSURE_RADIUS_METERS = SPAWN_ROUTING_CONFIG.objectivePressureRadiusMeters;
 const CIPHER_RESPAWN_CANDIDATE_SAFETY_RADIUS_METERS = SPAWN_ROUTING_CONFIG.queuedCandidateSafetyRadiusMeters;
 const CIPHER_RESPAWN_REROUTE_SAFETY_RADIUS_METERS = SPAWN_ROUTING_CONFIG.rerouteSafetyRadiusMeters;
@@ -980,6 +985,11 @@ type CipherSpawnJob = {
   expectedTransitionToken: number;
   lifeGeneration: number;
 };
+type CipherRespawnRouteStatus =
+  | "evaluating"
+  | "finalized"
+  | "consumed"
+  | "cancelled";
 type CipherRespawnRouteJob = {
   token: number;
   playerId: number;
@@ -995,10 +1005,8 @@ type CipherRespawnRouteJob = {
   expectedMatchStage: CipherMatchStage;
   expectedHalf: CipherHalfIndex;
   lifeGeneration: number;
-  status: "evaluating" | "finalized" | "settling" | "consumed" | "cancelled";
-  deployedNativeObjId?: number;
+  status: CipherRespawnRouteStatus;
 };
-
 let cipherPresenceZoneActivePlayersByZone: { [zone: string]: { [playerId: number]: number } } = {};
 let cipherPresenceZonesByPlayerId: { [playerId: number]: { [zone: string]: boolean } } = {};
 let cipherAnchorPositionByObjectId: { [objectId: number]: CipherVectorSnapshot | undefined } = {};
@@ -3965,6 +3973,14 @@ function getCachedCipherAnchorPosition(anchorId: number): mod.Vector | undefined
     const spatialAnchor = mod.GetSpatialObject(anchorId) as unknown as mod.Object;
     const position = mod.GetObjectPosition(spatialAnchor);
     const snapshot = snapshotVector(position);
+    if (
+      !Number.isFinite(snapshot.x) ||
+      !Number.isFinite(snapshot.y) ||
+      !Number.isFinite(snapshot.z)
+    ) {
+      delete cipherAnchorPositionByObjectId[anchorId];
+      return undefined;
+    }
     cipherAnchorPositionByObjectId[anchorId] = snapshot;
     return mod.CreateVector(snapshot.x, snapshot.y, snapshot.z);
   } catch (_err) {
@@ -4625,40 +4641,6 @@ function finalizeCipherRespawnRouteJobForPlayer(playerId: number, source: string
   void source;
 }
 
-function sealCipherRespawnRouteJobForDeploy(playerId: number, source: string): void {
-  const job = cipherRespawnRouteJobByPlayerId[playerId];
-  if (!job) return;
-  if (
-    !isCurrentPlayerSession(playerId, job.sessionToken) ||
-    job.lifeGeneration !== getPlayerLifeGeneration(playerId) ||
-    gameStatus !== 3 ||
-    cipherMatchStage !== job.expectedMatchStage ||
-    cipherCurrentHalf !== job.expectedHalf ||
-    isCipherLiveTransitionActive()
-  ) {
-    invalidateCipherRespawnRouteJobForPlayer(playerId);
-    return;
-  }
-
-  const sp = serverPlayers.get(playerId);
-  if (!sp || !mod.IsPlayerValid(sp.player)) {
-    invalidateCipherRespawnRouteJobForPlayer(playerId);
-    return;
-  }
-  if (job.status === "evaluating") finalizeCipherRespawnRouteJobForPlayer(playerId, "deploy_before_timer");
-  const candidate = job.finalizedCandidate;
-  const team = mod.GetTeam(job.teamId);
-  if (!candidate || !isCipherQueuedSpawnAnchorValidForTeam(candidate, team)) {
-    invalidateCipherRespawnRouteJobForPlayer(playerId);
-    return;
-  }
-  cipherQueuedAnchorByPlayerId[playerId] = candidate;
-  job.status = "settling";
-  job.deployedNativeObjId = sp.nativeObjId;
-  settleAndConsumeCipherRespawnRoute(playerId, job.token);
-  void source;
-}
-
 function tickCipherRespawnRouteJob(playerId: number, token: number): void {
   const job = cipherRespawnRouteJobByPlayerId[playerId];
   if (!job || job.token !== token) return;
@@ -4764,100 +4746,6 @@ function startCipherRespawnRouteJobForPlayer(playerId: number, wasDeployed: bool
     CIPHER_RESPAWN_ROUTE_TICK_MS
   );
   void source;
-}
-
-function settleAndConsumeCipherRespawnRoute(playerId: number, token: number): void {
-  const job = cipherRespawnRouteJobByPlayerId[playerId];
-  if (!job || job.token !== token || job.status !== "settling") return;
-
-  const sp = serverPlayers.get(playerId);
-  if (
-    !sp ||
-    !isCurrentPlayerSession(playerId, job.sessionToken) ||
-    job.lifeGeneration !== getPlayerLifeGeneration(playerId) ||
-    job.deployedNativeObjId !== sp.nativeObjId ||
-    gameStatus !== 3 ||
-    cipherMatchStage !== job.expectedMatchStage ||
-    cipherCurrentHalf !== job.expectedHalf ||
-    isCipherLiveTransitionActive() ||
-    isCipherSuddenDeathActive() ||
-    !sp.isDeployed ||
-    !mod.IsPlayerValid(sp.player) ||
-    !isPlayerAliveSafe(sp.player)
-  ) {
-    invalidateCipherRespawnRouteJobForPlayer(playerId);
-    delete cipherQueuedAnchorByPlayerId[playerId];
-    return;
-  }
-
-  const player = sp.player;
-  if (getObjIdSafe(player) !== job.deployedNativeObjId) {
-    invalidateCipherRespawnRouteJobForPlayer(playerId);
-    delete cipherQueuedAnchorByPlayerId[playerId];
-    return;
-  }
-
-  const team = mod.GetTeam(player);
-  if (modlib.getTeamId(team) !== job.teamId || isNativeFriendlyOrSquadSpawn(player, playerId)) {
-    invalidateCipherRespawnRouteJobForPlayer(playerId);
-    delete cipherQueuedAnchorByPlayerId[playerId];
-    return;
-  }
-
-  let candidate = job.finalizedCandidate;
-  if (!candidate || !isCipherQueuedSpawnAnchorValidForTeam(candidate, team)) {
-    invalidateCipherRespawnRouteJobForPlayer(playerId);
-    delete cipherQueuedAnchorByPlayerId[playerId];
-    return;
-  }
-
-  let anchorPos = getCachedCipherAnchorPosition(candidate.anchorObjectId);
-  if (!anchorPos) {
-    invalidateCipherRespawnRouteJobForPlayer(playerId);
-    delete cipherQueuedAnchorByPlayerId[playerId];
-    return;
-  }
-
-  refreshCipherPlayerPositionSnapshots();
-  if (!isCipherAnchorSafeFromEnemiesWithinRadius(anchorPos, team, CIPHER_RESPAWN_REROUTE_SAFETY_RADIUS_METERS)) {
-    const alternative = selectCipherRespawnRouteCandidate(
-      playerId,
-      team,
-      CIPHER_RESPAWN_REROUTE_SAFETY_RADIUS_METERS,
-      false
-    );
-    if (!alternative) {
-      invalidateCipherRespawnRouteJobForPlayer(playerId);
-      delete cipherQueuedAnchorByPlayerId[playerId];
-      return;
-    }
-    const alternativePos = getCachedCipherAnchorPosition(alternative.anchorObjectId);
-    if (!alternativePos) {
-      invalidateCipherRespawnRouteJobForPlayer(playerId);
-      delete cipherQueuedAnchorByPlayerId[playerId];
-      return;
-    }
-    candidate = alternative;
-    anchorPos = alternativePos;
-  }
-
-  const yawRadians = computeCipherTeleportYawTowardObjective(anchorPos, team, candidate);
-  // Consume before crossing the engine boundary. A synchronous callback cannot
-  // observe a retryable route for this soldier.
-  job.status = "consumed";
-  delete cipherRespawnRouteJobByPlayerId[playerId];
-  delete cipherQueuedAnchorByPlayerId[playerId];
-  clearCipherSpawnJobsForPlayer(playerId);
-
-  try {
-    mod.Teleport(player, anchorPos, yawRadians);
-    cipherPlayerPositionSnapshotByPlayerId[playerId] = snapshotVector(anchorPos);
-    const teamKey = getCipherTeamRoutingKey(team);
-    cipherLastSpawnRegionByTeamId[teamKey] = copyCipherSpawnRegion(candidate.region);
-    cipherLastSpawnRegionAtSecByTeamId[teamKey] = getCurrentSchedulerNowSeconds();
-  } catch (err) {
-    LogRuntimeError("CipherRespawnSettledTeleport/" + String(playerId) + "/" + String(candidate.anchorObjectId), err);
-  }
 }
 
 function getCipherAttackObjectiveCenterForSide(side: CipherMapSide): mod.Vector | undefined {
@@ -5013,8 +4901,18 @@ function processCipherSpawnJobs(source: string): void {
       completed = prepareCipherQueuedAnchorForPlayer(job.playerId);
     } else {
       const sp = serverPlayers.get(job.playerId);
-      if (sp && sp.isDeployed && mod.IsPlayerValid(sp.player) && isPlayerAliveSafe(sp.player)) {
-        completed = teleportCipherPlayerToRoutedAnchor(sp.player, job.playerId);
+      if (
+        sp &&
+        sp.isDeployed &&
+        mod.IsPlayerValid(sp.player) &&
+        isPlayerAliveSafe(sp.player) &&
+        (gameStatus !== 3 || isCipherLiveTransitionActive())
+      ) {
+        const teleported = teleportCipherPlayerToRoutedAnchor(sp.player, job.playerId);
+        // A post-deploy custom placement is attempted once. A failed placement
+        // intentionally retains the native HQ/friendly spawn and is not retried.
+        if (!teleported) delete cipherQueuedAnchorByPlayerId[job.playerId];
+        completed = true;
       }
     }
 
@@ -5086,7 +4984,11 @@ function computeCipherTeleportYawTowardObjective(
   return getCipherTeleportYawRadians(spawnPos, getCipherAttackObjectiveCenterForSide(queuedAnchor.side));
 }
 
-function teleportCipherPlayerToRoutedAnchor(player: mod.Player, playerId: number): boolean {
+function teleportCipherPlayerToRoutedAnchor(
+  player: mod.Player,
+  playerId: number,
+  allowRouteRefresh: boolean = true
+): boolean {
   if (!isCipherSpawnRoutingPhaseActive()) return false;
   if (!mod.IsPlayerValid(player)) return false;
   if (!isPlayerAliveSafe(player)) return false;
@@ -5096,6 +4998,7 @@ function teleportCipherPlayerToRoutedAnchor(player: mod.Player, playerId: number
   if (!mod.Equals(team, team1) && !mod.Equals(team, team2)) return false;
 
   if (getCipherQueuedSpawnAnchorForPlayer(playerId) === undefined) {
+    if (!allowRouteRefresh) return false;
     prepareCipherQueuedAnchorForPlayer(playerId);
   }
 
@@ -5103,6 +5006,7 @@ function teleportCipherPlayerToRoutedAnchor(player: mod.Player, playerId: number
   if (!queuedAnchor) return false;
   if (!isCipherQueuedSpawnAnchorValidForTeam(queuedAnchor, team)) {
     delete cipherQueuedAnchorByPlayerId[playerId];
+    if (!allowRouteRefresh) return false;
     if (!prepareCipherQueuedAnchorForPlayer(playerId, true)) return false;
   }
 
@@ -5115,6 +5019,7 @@ function teleportCipherPlayerToRoutedAnchor(player: mod.Player, playerId: number
   refreshCipherPlayerPositionSnapshots();
   if (finalQueuedAnchor.kind !== "firstDeploy" && !isCipherAnchorSafeFromEnemies(anchorPos, team)) {
     delete cipherQueuedAnchorByPlayerId[playerId];
+    if (!allowRouteRefresh) return false;
     if (!prepareCipherQueuedAnchorForPlayer(playerId, true)) return false;
 
     const safeQueuedAnchor = getCipherQueuedSpawnAnchorForPlayer(playerId);
@@ -5130,6 +5035,11 @@ function teleportCipherPlayerToRoutedAnchor(player: mod.Player, playerId: number
   }
 
   const yawRadians = computeCipherTeleportYawTowardObjective(anchorPos, team, finalQueuedAnchor);
+  // Consume all retryable placement state before crossing the engine boundary.
+  // A synchronous deploy/undeploy callback can therefore never observe this
+  // route as available for a second teleport attempt.
+  delete cipherQueuedAnchorByPlayerId[playerId];
+  clearCipherSpawnJobsForPlayer(playerId);
 
   try {
     (mod as any).Teleport(player, anchorPos, yawRadians);
@@ -5139,7 +5049,6 @@ function teleportCipherPlayerToRoutedAnchor(player: mod.Player, playerId: number
       cipherLastSpawnRegionByTeamId[teamKey] = copyCipherSpawnRegion(finalQueuedAnchor.region);
       cipherLastSpawnRegionAtSecByTeamId[teamKey] = getCurrentSchedulerNowSeconds();
     }
-    delete cipherQueuedAnchorByPlayerId[playerId];
     if (isCipherLiveTransitionActive()) {
       cipherTransitionTeleportedByPlayerId[playerId] = true;
     }
@@ -16618,8 +16527,9 @@ function handleCipherTransitionDeployedPlayer(
     }
 
     if (!teleported) {
-      requestCipherSpawnAnchorForPlayer(playerId, true);
-      requestCipherSpawnTeleportForPlayer(playerId, true);
+      // Keep the native transition HQ spawn. Do not retry custom placement from
+      // another scheduler lane after the single post-deploy attempt.
+      delete cipherQueuedAnchorByPlayerId[playerId];
     }
   }
 
@@ -18813,32 +18723,10 @@ function _tmpPlayerToCpIdClear(): void {
 }
 
 
-class ActivePlayerMap extends Map<number, Player> {
-  forEach(
-    callbackfn: (value: Player, key: number, map: Map<number, Player>) => void,
-    thisArg?: any
-  ): void {
-    super.forEach((player, playerId) => {
-      if (!player) return;
-      try {
-        if (!mod.IsPlayerValid(player.player)) return;
-        if (mod.GetObjId(player.player) !== player.nativeObjId) return;
-      } catch (_errValid) {
-        return;
-      }
-
-      // Runtime bots do not participate in the human join quarantine. Every
-      // human fan-out, however, must refer to the activated current session.
-      if (!isCipherRuntimeBotPlayerId(playerId)) {
-        if (pendingPlayerSessionById[playerId] !== undefined) return;
-        if (playerActivatedSessionTokenByPlayerId[playerId] !== playerSessionTokenByPlayerId[playerId]) return;
-      }
-      callbackfn.call(thisArg, player, playerId, this);
-    });
-  }
-}
-
-const serverPlayers = new ActivePlayerMap();
+// Keep player storage data-only. Engine validation belongs at the specific call
+// site that crosses an engine boundary; doing it implicitly from every fan-out
+// is unsafe while a player handle is changing between deploy-screen and soldier.
+const serverPlayers = new Map<number, Player>();
 type DisconnectedPlayerSnapshot = {
   playerId: number;
   scoreboard: number[];
@@ -18857,13 +18745,20 @@ type PendingPlayerSession = {
   deployAckSeen: boolean;
   watchdogLogged: boolean;
 };
-type PlayerDeployHydrationJob = {
+type SafeSpawnCheckQueueItem = {
   playerId: number;
-  sessionToken: number;
-  expectedGameStatus: number;
-  expectedMatchStage: CipherMatchStage;
-  expectedTransitionToken: number;
-  lifeGeneration: number;
+  generation: number;
+  dueTick: number;
+};
+type ForcedSafeSpawnStage = "undeploy" | "spawn";
+type ForcedSafeSpawnQueueItem = {
+  playerId: number;
+  generation: number;
+  hqObjId: number;
+  spawnerObjId: number;
+  stage: ForcedSafeSpawnStage;
+  dueTick: number;
+  waitTicks: number;
 };
 type PlayerLeaveCleanupJob = {
   playerId: number;
@@ -18875,8 +18770,29 @@ type PlayerLeaveCleanupJob = {
 const disconnectedPlayerSnapshotById: { [playerId: number]: DisconnectedPlayerSnapshot | undefined } = {};
 let pendingPlayerSessionById: { [playerId: number]: PendingPlayerSession | undefined } = {};
 let playerActivatedSessionTokenByPlayerId: { [playerId: number]: number | undefined } = {};
-let playerDeployHydrationQueue: PlayerDeployHydrationJob[] = [];
-let playerDeployHydrationQueuedByPlayerId: { [playerId: number]: boolean | undefined } = {};
+let safeSpawnCheckQueue: SafeSpawnCheckQueueItem[] = [];
+let safeSpawnForcedQueue: ForcedSafeSpawnQueueItem[] = [];
+let safeSpawnGenerationByPlayerId: { [playerId: number]: number | undefined } = {};
+let safeSpawnCheckQueuedGenerationByPlayerId: { [playerId: number]: number | undefined } = {};
+let safeSpawnForcedQueuedGenerationByPlayerId: { [playerId: number]: number | undefined } = {};
+let safeSpawnUnsafePending: { [playerId: number]: boolean | undefined } = {};
+let safeSpawnForcedUndeploy: { [playerId: number]: boolean | undefined } = {};
+let safeSpawnForcedRedeploys: { [playerId: number]: number | undefined } = {};
+let safeSpawnUnsafeHqObjIdByPlayerId: { [playerId: number]: number | undefined } = {};
+let safeSpawnUnsafeSpawnerObjIdByPlayerId: { [playerId: number]: number | undefined } = {};
+let lastLiveHqSpawnPointObjIdByPlayerId: { [playerId: number]: number | undefined } = {};
+let lastForcedSafeSpawnHqObjIdByPlayerId: { [playerId: number]: number | undefined } = {};
+const SAFE_SPAWN_CHECK_DELAY_TICKS = CIPHER_RESPAWN_POST_DEPLOY_DELAY_TICKS;
+const SAFE_SPAWN_CHECKS_PER_TICK = 2;
+const SAFE_SPAWN_FORCED_QUEUE_BUDGET_PER_TICK = 1;
+const SAFE_SPAWN_FORCED_SPAWN_DELAY_TICKS = mod.Max(1, mod.Ceiling(0.2 * TICK_RATE));
+const SAFE_SPAWN_MAX_FORCED_REDEPLOYS = 5;
+const SAFE_SPAWN_ENEMY_RADIUS_METERS = 18;
+const LIVE_SAFE_SPAWN_TEAM1_HQ_IDS: number[] = [TEAM1_INITIAL_HQ, TEAM1_LIVE_HQ];
+const LIVE_SAFE_SPAWN_TEAM2_HQ_IDS: number[] = [TEAM2_INITIAL_HQ, TEAM2_LIVE_HQ];
+const LIVE_SAFE_SPAWN_TEAM1_PLAYERSPAWNER_IDS: number[] = [11, 13];
+const LIVE_SAFE_SPAWN_TEAM2_PLAYERSPAWNER_IDS: number[] = [12, 14];
+const HQ_TO_PLAYERSPAWNER_ID: { [hqId: number]: number } = { 1: 11, 2: 12, 3: 13, 4: 14 };
 let playerLeaveCleanupQueue: PlayerLeaveCleanupJob[] = [];
 let playerLifecycleAdminRefreshPending = false;
 let playerLifecyclePrematchRefreshPending = false;
@@ -19088,8 +19004,18 @@ function clearJoinSettleStateForPlayer(playerId: number): void {
 function resetUniversalPlayerLifecycleQueues(clearReconnectSnapshots: boolean): void {
   pendingPlayerSessionById = {};
   playerActivatedSessionTokenByPlayerId = {};
-  playerDeployHydrationQueue = [];
-  playerDeployHydrationQueuedByPlayerId = {};
+  safeSpawnCheckQueue = [];
+  safeSpawnForcedQueue = [];
+  safeSpawnGenerationByPlayerId = {};
+  safeSpawnCheckQueuedGenerationByPlayerId = {};
+  safeSpawnForcedQueuedGenerationByPlayerId = {};
+  safeSpawnUnsafePending = {};
+  safeSpawnForcedUndeploy = {};
+  safeSpawnForcedRedeploys = {};
+  safeSpawnUnsafeHqObjIdByPlayerId = {};
+  safeSpawnUnsafeSpawnerObjIdByPlayerId = {};
+  lastLiveHqSpawnPointObjIdByPlayerId = {};
+  lastForcedSafeSpawnHqObjIdByPlayerId = {};
   playerLeaveCleanupQueue = [];
   playerLifecycleAdminRefreshPending = false;
   playerLifecyclePrematchRefreshPending = false;
@@ -19141,6 +19067,7 @@ function clearObjectiveCaptureAttemptStateForPlayerDataOnly(playerId: number): v
 
 function clearVolatilePlayerSessionState(playerId: number, source: string): void {
   clearJoinSettleStateForPlayer(playerId);
+  removeSafeSpawnCheckForPlayer(playerId);
   clearCipherTransitionStateForPlayer(playerId, source);
   clearLiveHudQueueForPlayer(playerId);
   clearPhasePlayerOperationsForPlayer(playerId);
@@ -19171,8 +19098,8 @@ function clearDisconnectedPlayerStateDataOnly(playerId: number, leaving?: Player
   if (leaving) resetPlayerSessionRefsForJoin(leaving, false);
 
   clearVolatilePlayerSessionState(playerId, "disconnect_immediate");
-  playerDeployHydrationQueue = playerDeployHydrationQueue.filter((job) => job.playerId !== playerId);
-  delete playerDeployHydrationQueuedByPlayerId[playerId];
+  removeSafeSpawnCheckForPlayer(playerId);
+  clearOldSafeSpawnStateForPlayer(playerId);
 
   restrictedAreaCountdownToken[playerId] = (restrictedAreaCountdownToken[playerId] ?? 0) + 1;
   cancelPendingRestrictedLethalConfirmForPlayer(playerId);
@@ -19303,18 +19230,43 @@ function settleJoinedPlayerForCurrentPhase(p: Player, source: string): void {
   runtimeBotNextReconcileAtSec = 0;
 }
 
-function queuePlayerDeployHydration(playerId: number): void {
-  if (playerDeployHydrationQueuedByPlayerId[playerId] === true) return;
-  const sessionToken = playerSessionTokenByPlayerId[playerId];
-  if (sessionToken === undefined) return;
-  playerDeployHydrationQueuedByPlayerId[playerId] = true;
-  playerDeployHydrationQueue.push({
+function removeSafeSpawnCheckForPlayer(playerId: number): void {
+  safeSpawnCheckQueue = safeSpawnCheckQueue.filter((job) => job.playerId !== playerId);
+  delete safeSpawnCheckQueuedGenerationByPlayerId[playerId];
+}
+
+function getSafeSpawnGeneration(playerId: number): number {
+  return safeSpawnGenerationByPlayerId[playerId] ?? 0;
+}
+
+function bumpSafeSpawnGeneration(playerId: number): number {
+  const next = getSafeSpawnGeneration(playerId) + 1;
+  safeSpawnGenerationByPlayerId[playerId] = next;
+  return next;
+}
+
+function clearOldSafeSpawnStateForPlayer(playerId: number): void {
+  removeSafeSpawnCheckForPlayer(playerId);
+  safeSpawnForcedQueue = safeSpawnForcedQueue.filter((job) => job.playerId !== playerId);
+  delete safeSpawnForcedQueuedGenerationByPlayerId[playerId];
+  delete safeSpawnUnsafePending[playerId];
+  delete safeSpawnForcedUndeploy[playerId];
+  delete safeSpawnForcedRedeploys[playerId];
+  delete safeSpawnUnsafeHqObjIdByPlayerId[playerId];
+  delete safeSpawnUnsafeSpawnerObjIdByPlayerId[playerId];
+  delete lastLiveHqSpawnPointObjIdByPlayerId[playerId];
+  delete lastForcedSafeSpawnHqObjIdByPlayerId[playerId];
+}
+
+function queueSafeSpawnCheckForPlayer(playerId: number): void {
+  if (safeSpawnUnsafePending[playerId] === true) return;
+  const generation = getSafeSpawnGeneration(playerId);
+  if (safeSpawnCheckQueuedGenerationByPlayerId[playerId] === generation) return;
+  safeSpawnCheckQueuedGenerationByPlayerId[playerId] = generation;
+  safeSpawnCheckQueue.push({
     playerId,
-    sessionToken,
-    expectedGameStatus: gameStatus,
-    expectedMatchStage: cipherMatchStage,
-    expectedTransitionToken: getQueuedPlayerWorkTransitionToken(),
-    lifeGeneration: getPlayerLifeGeneration(playerId),
+    generation,
+    dueTick: serverTickCount + SAFE_SPAWN_CHECK_DELAY_TICKS,
   });
 }
 
@@ -19340,7 +19292,7 @@ function activatePendingPlayerSession(pending: PendingPlayerSession): void {
   player.player = pending.player;
   player.nativeObjId = pending.nativeObjId;
   player.team = identity.team;
-  player.isDeployed = pending.deployAckSeen;
+  player.isDeployed = false;
 
   // Admit the current session before doing soldier/UI phase work. The roster reads
   // this activated table, while deployment can occur before a soldier exists.
@@ -19383,14 +19335,7 @@ function activatePendingPlayerSession(pending: PendingPlayerSession): void {
   delete disconnectedPlayerSnapshotById[player.id];
 
   if (pending.deployAckSeen) {
-    if (cipherSecondHalfTransitionStage === "deploy" && isCipherLiveTransitionActive()) {
-      const transitionToken = getCipherSecondHalfForceDeployToken();
-      cipherSecondHalfDeployRequiredByPlayerId[player.id] = true;
-      cipherTransitionDeploySeenByPlayerId[player.id] = true;
-      cipherSecondHalfDeployReadyByPlayerId[player.id] = true;
-      cipherTransitionDeployAckTokenByPlayerId[player.id] = transitionToken;
-    }
-    queuePlayerDeployHydration(player.id);
+    void Mode_OnPlayerDeployed(player.player);
   }
 
   cipherKeyActivePlayerIdsSnapshot = [];
@@ -19451,114 +19396,235 @@ function processPendingPlayerSessions(): boolean {
   return false;
 }
 
-function hydrateDeployedHumanPlayer(job: PlayerDeployHydrationJob): void {
-  if (!isQueuedPlayerWorkCurrent(
-    job.playerId,
-    job.sessionToken,
-    job.expectedGameStatus,
-    job.expectedMatchStage,
-    job.expectedTransitionToken
-  ) || job.lifeGeneration !== getPlayerLifeGeneration(job.playerId)) return;
-  const p = serverPlayers.get(job.playerId);
-  if (!p || !mod.IsPlayerValid(p.player)) return;
-  const player = p.player;
-  const playerId = p.id;
-  if (mod.GetObjId(player) !== p.nativeObjId) return;
-  p.team = mod.GetTeam(player);
-  p.isDeployed = true;
+function getLiveSafeSpawnHqIdsForTeam(team: mod.Team): number[] {
+  return mod.Equals(team, team1) ? LIVE_SAFE_SPAWN_TEAM1_HQ_IDS : LIVE_SAFE_SPAWN_TEAM2_HQ_IDS;
+}
 
-  assignCipherAdminFromJoiningPlayerIfNeeded(player);
-  p.updateScoreboard();
+function getLiveSafeSpawnPlayerSpawnerIdsForTeam(team: mod.Team): number[] {
+  return mod.Equals(team, team1)
+    ? LIVE_SAFE_SPAWN_TEAM1_PLAYERSPAWNER_IDS
+    : LIVE_SAFE_SPAWN_TEAM2_PLAYERSPAWNER_IDS;
+}
 
-  clearScoreboardDeathCountForPlayerLife(playerId);
-  delete playerInMandownByPlayerId[playerId];
-  cancelPendingRestrictedLethalConfirmForPlayer(playerId);
-  clearRestrictedAreaFeedbackSuppressionForPlayer(playerId);
-  hideDeployObjectiveTimerUiForPlayer(playerId);
-  clearTransitionSpawnStateForPlayer(playerId);
-  clearAllObjectiveAreaTriggerStateForPlayer(playerId);
-  clearCipherPresenceForPlayer(playerId);
-  cancelObjectiveCaptureAttemptsForPlayer(playerId);
-  dmgSpreadClearForPlayer(player);
+function getLiveSafeSpawnPlayerSpawnerIdForHq(hqId: number): number {
+  return HQ_TO_PLAYERSPAWNER_ID[hqId] ?? 0;
+}
 
-  if (!restrictedAreaRootWidgetByPlayerId[playerId]) buildRestrictedAreaUiForPlayer(p);
+function isValidLiveSafeSpawnHqIdForTeam(team: mod.Team, hqId: number): boolean {
+  return getLiveSafeSpawnHqIdsForTeam(team).indexOf(hqId) >= 0;
+}
 
-  if (gameStatus === 0) {
-    applyPrematch889HealthForPlayer(playerId);
-    replacePrematchReadyText(playerId, player);
-    refreshPrematchReadyStateUi();
-    queueCipherAdminInteractSpawnForPlayer(playerId, "DeployHydration_Prematch");
-    return;
-  }
-  if (gameStatus === 1) {
-    applyPrematch889HealthForPlayer(playerId);
-    stripLoadoutToMeleeOnly(player);
-    return;
-  }
-  if (gameStatus === 2) {
-    applyPrematch889HealthForPlayer(playerId);
-    requestCipherSpawnAnchorForPlayer(playerId, true);
-    requestCipherSpawnTeleportForPlayer(playerId, true);
-    return;
-  }
-  if (gameStatus === 4) {
-    applyPostmatchInputStateForPlayer(player);
-    schedulePostmatchCameraForPlayerAfterSettle(player, "DeployHydration_Postmatch");
-    return;
-  }
-  if (gameStatus !== 3) return;
+function isValidLiveSafeSpawnPlayerSpawnerIdForTeam(team: mod.Team, spawnerId: number): boolean {
+  return getLiveSafeSpawnPlayerSpawnerIdsForTeam(team).indexOf(spawnerId) >= 0;
+}
 
-  if (isCipherLiveTransitionActive()) {
-    handleCipherTransitionDeployedPlayer(playerId, player, "DeployHydration_Transition");
-    requestCipherTransitionReconcile("DeployHydration_Transition");
-    return;
-  }
+function getDefaultLiveSafeSpawnHqObjIdForTeam(team: mod.Team): number {
+  return getCipherLiveHqIdForTeam(team);
+}
 
-  if (isCipherSuddenDeathActive() && cipherSuddenDeathEliminatedByPlayerId[playerId] === true) {
-    playerInMandownByPlayerId[playerId] = true;
-    mod.SetRedeployTime(player, 9999);
-    mod.UndeployPlayer(player);
-    return;
-  }
-
-  queueLiveHudBuild(playerId, "DeployHydration_Live", "urgent", 2);
-  queueCipherAdminInteractSpawnForPlayer(playerId, "DeployHydration_Live");
-  applyPrematch889HealthForPlayer(playerId);
-  applyPhaseInputRestrictionsForPlayer(player);
-  const liveRedeploySeconds = isCipherSuddenDeathActive() ? 9999 : REDEPLOY_TIME;
-  mod.SetRedeployTime(player, liveRedeploySeconds);
-  const firstDeploy = p.isFirstDeploy();
-  if (isNativeFriendlyOrSquadSpawn(player, playerId)) {
-    invalidateCipherRespawnRouteJobForPlayer(playerId);
-    consumeCipherRouteForNativeFriendlySpawn(player, playerId);
-    return;
-  }
-
-  // A normal redeploy consumes only the route selected during the native countdown.
-  // First deploys are selected here by the scheduler-owned hydration lane.
-  if (firstDeploy && getCipherQueuedSpawnAnchorForPlayer(playerId) === undefined) {
-    requestCipherSpawnAnchorForPlayer(playerId, true);
-  }
-  const liveRespawnRoute = cipherRespawnRouteJobByPlayerId[playerId];
-  if (liveRespawnRoute && liveRespawnRoute.status === "settling") return;
-  if (getCipherQueuedSpawnAnchorForPlayer(playerId) !== undefined || firstDeploy) {
-    requestCipherSpawnTeleportForPlayer(playerId, true);
+function tryGetSpawnPointPositionSafe(spawnPointId: number): mod.Vector | undefined {
+  try {
+    return mod.GetObjectPosition(mod.GetSpawnPoint(spawnPointId) as unknown as mod.Object);
+  } catch (_err) {
+    return undefined;
   }
 }
 
-function processPlayerDeployHydrationQueue(): boolean {
-  while (playerDeployHydrationQueue.length > 0) {
-    const job = playerDeployHydrationQueue.shift();
-    if (!job) continue;
-    delete playerDeployHydrationQueuedByPlayerId[job.playerId];
-    try {
-      hydrateDeployedHumanPlayer(job);
-    } catch (err) {
-      LogRuntimeError("DeployHydration/" + String(job.playerId), err);
-    }
+function trySpawnPlayerFromSpawnPointSafe(player: mod.Player, spawnerObjId: number, context: string): boolean {
+  if (!spawnerObjId || tryGetSpawnPointPositionSafe(spawnerObjId) === undefined) return false;
+  try {
+    mod.SpawnPlayerFromSpawnPoint(player, spawnerObjId);
     return true;
+  } catch (err) {
+    LogRuntimeError("SpawnPlayerFromSpawnPoint/" + context, err);
+    return false;
   }
-  return false;
+}
+
+function getStoredOrDefaultLiveSafeSpawnHqObjId(playerId: number, team: mod.Team): number {
+  const stored = lastLiveHqSpawnPointObjIdByPlayerId[playerId];
+  return stored !== undefined && isValidLiveSafeSpawnHqIdForTeam(team, stored)
+    ? stored
+    : getDefaultLiveSafeSpawnHqObjIdForTeam(team);
+}
+
+function resolveForcedSafeSpawnHqObjId(playerId: number, team: mod.Team, attempt: number): number {
+  const ids = getLiveSafeSpawnHqIdsForTeam(team);
+  const base = getStoredOrDefaultLiveSafeSpawnHqObjId(playerId, team);
+  const previous = lastForcedSafeSpawnHqObjIdByPlayerId[playerId] ?? base;
+  const selected = attempt > 1 && ids.length > 1 ? (previous === ids[0] ? ids[1] : ids[0]) : base;
+  const sanitized = isValidLiveSafeSpawnHqIdForTeam(team, selected)
+    ? selected
+    : getDefaultLiveSafeSpawnHqObjIdForTeam(team);
+  lastForcedSafeSpawnHqObjIdByPlayerId[playerId] = sanitized;
+  return sanitized;
+}
+
+function recordLastLiveHqSpawnSourceFromDeploy(player: mod.Player, playerId: number): void {
+  if (!mod.IsPlayerValid(player) || !isPlayerAliveSafe(player)) return;
+  const team = mod.GetTeam(player);
+  const playerPos = getPlayerPosition(player);
+  const hqIds = getLiveSafeSpawnHqIdsForTeam(team);
+  let nearestHqId = 0;
+  let nearestDistance = 999999;
+  for (let i = 0; i < hqIds.length; i++) {
+    const hqId = hqIds[i];
+    const pos = tryGetSpawnPointPositionSafe(getLiveSafeSpawnPlayerSpawnerIdForHq(hqId));
+    if (!pos) continue;
+    const distance = mod.DistanceBetween(playerPos, pos);
+    if (distance < nearestDistance) {
+      nearestDistance = distance;
+      nearestHqId = hqId;
+    }
+  }
+  if (nearestHqId > 0 && nearestDistance <= 10) lastLiveHqSpawnPointObjIdByPlayerId[playerId] = nearestHqId;
+}
+
+function queueForcedSafeSpawnRetryForCurrentRoute(player: mod.Player, playerId: number): boolean {
+  if (!mod.IsPlayerValid(player)) return false;
+  const team = mod.GetTeam(player);
+  if (!mod.Equals(team, team1) && !mod.Equals(team, team2)) return false;
+  const used = safeSpawnForcedRedeploys[playerId] ?? 0;
+  if (used >= SAFE_SPAWN_MAX_FORCED_REDEPLOYS) return false;
+  const attempt = used + 1;
+  const hqObjId = resolveForcedSafeSpawnHqObjId(playerId, team, attempt);
+  const spawnerObjId = getLiveSafeSpawnPlayerSpawnerIdForHq(hqObjId);
+  if (!isValidLiveSafeSpawnPlayerSpawnerIdForTeam(team, spawnerObjId)) return false;
+  const generation = getSafeSpawnGeneration(playerId);
+  if (safeSpawnForcedQueuedGenerationByPlayerId[playerId] === generation) return true;
+  safeSpawnForcedRedeploys[playerId] = attempt;
+  safeSpawnForcedUndeploy[playerId] = true;
+  safeSpawnUnsafePending[playerId] = true;
+  safeSpawnUnsafeHqObjIdByPlayerId[playerId] = hqObjId;
+  safeSpawnUnsafeSpawnerObjIdByPlayerId[playerId] = spawnerObjId;
+  safeSpawnForcedQueuedGenerationByPlayerId[playerId] = generation;
+  safeSpawnForcedQueue.push({
+    playerId,
+    generation,
+    hqObjId,
+    spawnerObjId,
+    stage: "undeploy",
+    dueTick: serverTickCount + 1,
+    waitTicks: 0,
+  });
+  return true;
+}
+
+function finishSafeSpawnAsNativeFriendlyOrSquadSpawn(player: mod.Player, playerId: number): void {
+  safeSpawnForcedRedeploys[playerId] = 0;
+  safeSpawnForcedUndeploy[playerId] = false;
+  safeSpawnUnsafePending[playerId] = false;
+  invalidateCipherRespawnRouteJobForPlayer(playerId);
+  consumeCipherRouteForNativeFriendlySpawn(player, playerId);
+}
+
+function finalizeSafeSpawnDeploySuccess(player: mod.Player, playerId: number): void {
+  if (safeSpawnUnsafePending[playerId] === true) return;
+  if (getCipherQueuedSpawnAnchorForPlayer(playerId) === undefined) prepareCipherQueuedAnchorForPlayer(playerId);
+  const teleported = teleportCipherPlayerToRoutedAnchor(player, playerId);
+  if (!teleported) {
+    queueForcedSafeSpawnRetryForCurrentRoute(player, playerId);
+    return;
+  }
+  if (hasEnemyNearPosition(mod.GetTeam(player), getPlayerPosition(player), SAFE_SPAWN_ENEMY_RADIUS_METERS, playerId)) {
+    if (queueForcedSafeSpawnRetryForCurrentRoute(player, playerId)) return;
+  }
+  safeSpawnForcedUndeploy[playerId] = false;
+  queueCipherAdminInteractSpawnForPlayer(playerId, "safe_spawn_success");
+}
+
+function runSafeSpawnCheck(item: SafeSpawnCheckQueueItem): void {
+  if (item.generation !== getSafeSpawnGeneration(item.playerId)) return;
+  if (safeSpawnUnsafePending[item.playerId] === true) return;
+  const p = serverPlayers.get(item.playerId);
+  if (!p || !p.isDeployed || !mod.IsPlayerValid(p.player)) return;
+  if (gameStatus !== 3 || isCipherLiveTransitionActive() || isCipherSuddenDeathActive()) return;
+  if (!isPlayerAliveSafe(p.player)) return;
+  if (isNativeFriendlyOrSquadSpawn(p.player, item.playerId) || isSquadSpawnBypassActive(item.playerId)) {
+    finishSafeSpawnAsNativeFriendlyOrSquadSpawn(p.player, item.playerId);
+    return;
+  }
+  if (
+    hasEnemyNearPosition(
+      mod.GetTeam(p.player),
+      getPlayerPosition(p.player),
+      SAFE_SPAWN_ENEMY_RADIUS_METERS,
+      item.playerId
+    )
+  ) {
+    queueForcedSafeSpawnRetryForCurrentRoute(p.player, item.playerId);
+    return;
+  }
+  safeSpawnForcedRedeploys[item.playerId] = 0;
+  finalizeSafeSpawnDeploySuccess(p.player, item.playerId);
+}
+
+function processSafeSpawnCheckQueue(): boolean {
+  if (safeSpawnCheckQueue.length <= 0) return false;
+  const remaining: SafeSpawnCheckQueueItem[] = [];
+  let processed = 0;
+  for (let i = 0; i < safeSpawnCheckQueue.length; i++) {
+    const item = safeSpawnCheckQueue[i];
+    if (safeSpawnCheckQueuedGenerationByPlayerId[item.playerId] !== item.generation) continue;
+    if (item.generation !== getSafeSpawnGeneration(item.playerId)) continue;
+    if (processed >= SAFE_SPAWN_CHECKS_PER_TICK || item.dueTick > serverTickCount) {
+      remaining.push(item);
+      continue;
+    }
+    delete safeSpawnCheckQueuedGenerationByPlayerId[item.playerId];
+    processed += 1;
+    try {
+      runSafeSpawnCheck(item);
+    } catch (err) {
+      LogRuntimeError("SafeSpawnCheck/" + String(item.playerId), err);
+    }
+  }
+  safeSpawnCheckQueue = remaining;
+  return processed > 0;
+}
+
+function processForcedSafeSpawnQueue(): boolean {
+  if (safeSpawnForcedQueue.length <= 0) return false;
+  const remaining: ForcedSafeSpawnQueueItem[] = [];
+  let processed = 0;
+  for (let i = 0; i < safeSpawnForcedQueue.length; i++) {
+    const item = safeSpawnForcedQueue[i];
+    if (safeSpawnForcedQueuedGenerationByPlayerId[item.playerId] !== item.generation) continue;
+    if (item.generation !== getSafeSpawnGeneration(item.playerId)) continue;
+    if (processed >= SAFE_SPAWN_FORCED_QUEUE_BUDGET_PER_TICK || item.dueTick > serverTickCount) {
+      remaining.push(item);
+      continue;
+    }
+    const p = serverPlayers.get(item.playerId);
+    if (!p || !mod.IsPlayerValid(p.player)) {
+      delete safeSpawnForcedQueuedGenerationByPlayerId[item.playerId];
+      safeSpawnUnsafePending[item.playerId] = false;
+      continue;
+    }
+    processed += 1;
+    if (item.stage === "undeploy") {
+      p.isDeployed = false;
+      mod.SetRedeployTime(p.player, 9999);
+      mod.UndeployPlayer(p.player);
+      remaining.push({ ...item, stage: "spawn", dueTick: serverTickCount + SAFE_SPAWN_FORCED_SPAWN_DELAY_TICKS });
+      continue;
+    }
+    if (p.isDeployed && item.waitTicks < TICK_RATE) {
+      remaining.push({ ...item, dueTick: serverTickCount + 1, waitTicks: item.waitTicks + 1 });
+      continue;
+    }
+    safeSpawnUnsafePending[item.playerId] = false;
+    safeSpawnForcedUndeploy[item.playerId] = false;
+    delete safeSpawnForcedQueuedGenerationByPlayerId[item.playerId];
+    invalidateCipherRespawnRouteJobForPlayer(item.playerId);
+    lastLiveHqSpawnPointObjIdByPlayerId[item.playerId] = item.hqObjId;
+    lastForcedSafeSpawnHqObjIdByPlayerId[item.playerId] = item.hqObjId;
+    mod.SetRedeployTime(p.player, 0);
+    trySpawnPlayerFromSpawnPointSafe(p.player, item.spawnerObjId, "SafeSpawnForcedQueue");
+    mod.SetRedeployTime(p.player, isCipherSuddenDeathActive() ? 9999 : REDEPLOY_TIME);
+  }
+  safeSpawnForcedQueue = remaining;
+  return processed > 0;
 }
 
 function processPlayerLeaveCleanupQueue(): boolean {
@@ -19606,7 +19672,8 @@ function processPlayerLifecycleDeferredFanout(): void {
 function processPlayerLifecycleSupervisor(): void {
   if (processPlayerLeaveCleanupQueue()) return;
   if (processPendingPlayerSessions()) return;
-  processPlayerDeployHydrationQueue();
+  if (processForcedSafeSpawnQueue()) return;
+  processSafeSpawnCheckQueue();
 }
 
 let cipherKeyActivePlayerIdsSnapshot: number[] = [];
@@ -23942,68 +24009,132 @@ function Mode_OnPlayerLeaveGame(eventNumber: number): void {
   }
 }
 
-function recordPlayerDeployedMinimal(eventPlayer: mod.Player): void {
-  const identity = tryGetSafeEventPlayerIdentity(eventPlayer);
-  if (!identity || identity.isBot) return;
-  const playerId = identity.playerId;
-  const pending = pendingPlayerSessionById[playerId];
-  if (pending && isCurrentPlayerSession(playerId, pending.sessionToken)) {
-    if (pending.nativeObjId !== identity.nativeObjId) return;
-    pending.player = eventPlayer;
-    pending.deployAckSeen = true;
-    return;
-  }
-  const p = serverPlayers.get(playerId);
-  const sessionToken = playerSessionTokenByPlayerId[playerId];
-  if (!p || sessionToken === undefined) return;
-  if (playerActivatedSessionTokenByPlayerId[playerId] !== sessionToken) return;
-  if (p.nativeObjId !== identity.nativeObjId) return;
-  p.player = eventPlayer;
-  p.team = identity.team;
-  p.isDeployed = true;
-  // Consume the countdown route before clearing stale queue work. The route belongs
-  // to this life generation and must survive the deploy acknowledgement.
-  sealCipherRespawnRouteJobForDeploy(playerId, "OnPlayerDeployed_Minimal");
-  clearCipherSpawnJobsForPlayer(playerId);
-  if (cipherSecondHalfTransitionStage === "deploy" && isCipherLiveTransitionActive()) {
-    const transitionToken = getCipherSecondHalfForceDeployToken();
-    cipherSecondHalfDeployRequiredByPlayerId[playerId] = true;
-    cipherTransitionDeploySeenByPlayerId[playerId] = true;
-    cipherSecondHalfDeployReadyByPlayerId[playerId] = true;
-    cipherTransitionDeployAckTokenByPlayerId[playerId] = transitionToken;
-  }
-  queuePlayerDeployHydration(playerId);
-  requestCipherTransitionReconcile("OnPlayerDeployed_Minimal");
-}
-
 async function Mode_OnPlayerDeployed(eventPlayer: mod.Player): Promise<void> {
   try {
-    recordPlayerDeployedMinimal(eventPlayer);
+    if (!mod.IsPlayerValid(eventPlayer)) return;
+    const playerId = modlib.getPlayerId(eventPlayer);
+    const pending = pendingPlayerSessionById[playerId];
+    if (pending && isCurrentPlayerSession(playerId, pending.sessionToken)) {
+      pending.player = eventPlayer;
+      pending.deployAckSeen = true;
+      return;
+    }
+    const p = serverPlayers.get(playerId);
+    if (!p) return;
+    const team = mod.GetTeam(eventPlayer);
+    if (!mod.Equals(team, team1) && !mod.Equals(team, team2)) return;
+
+    p.player = eventPlayer;
+    p.nativeObjId = mod.GetObjId(eventPlayer);
+    p.team = team;
+    p.isDeployed = true;
+    clearScoreboardDeathCountForPlayerLife(playerId);
+    delete playerInMandownByPlayerId[playerId];
+    cancelPendingRestrictedLethalConfirmForPlayer(playerId);
+    clearRestrictedAreaFeedbackSuppressionForPlayer(playerId);
+    hideDeployObjectiveTimerUiForPlayer(playerId);
+    clearTransitionSpawnStateForPlayer(playerId);
+    clearAllObjectiveAreaTriggerStateForPlayer(playerId);
+    clearCipherPresenceForPlayer(playerId);
+    cancelObjectiveCaptureAttemptsForPlayer(playerId);
+    dmgSpreadClearForPlayer(eventPlayer);
+
+    if (gameStatus === 0) {
+      applyPrematch889HealthForPlayer(playerId);
+      replacePrematchReadyText(playerId, eventPlayer);
+      refreshPrematchReadyStateUi();
+      return;
+    }
+    if (gameStatus === 1) {
+      applyPrematch889HealthForPlayer(playerId);
+      stripLoadoutToMeleeOnly(eventPlayer);
+      return;
+    }
+    if (gameStatus === 2) {
+      applyPrematch889HealthForPlayer(playerId);
+      if (getCipherQueuedSpawnAnchorForPlayer(playerId) === undefined) prepareCipherQueuedAnchorForPlayer(playerId);
+      teleportCipherPlayerToRoutedAnchor(eventPlayer, playerId);
+      return;
+    }
+    if (gameStatus === 4) {
+      applyPostmatchInputStateForPlayer(eventPlayer);
+      schedulePostmatchCameraForPlayerAfterSettle(eventPlayer, "OnPlayerDeployed_Postmatch");
+      return;
+    }
+    if (gameStatus !== 3) return;
+
+    if (isCipherLiveTransitionActive()) {
+      if (cipherSecondHalfTransitionStage === "deploy") {
+        const transitionToken = getCipherSecondHalfForceDeployToken();
+        cipherSecondHalfDeployRequiredByPlayerId[playerId] = true;
+        cipherTransitionDeploySeenByPlayerId[playerId] = true;
+        cipherTransitionDeployAckTokenByPlayerId[playerId] = transitionToken;
+      }
+      handleCipherTransitionDeployedPlayer(playerId, eventPlayer, "OnPlayerDeployed_Transition");
+      requestCipherTransitionReconcile("OnPlayerDeployed_Transition");
+      return;
+    }
+    if (isCipherSuddenDeathActive() && cipherSuddenDeathEliminatedByPlayerId[playerId] === true) {
+      playerInMandownByPlayerId[playerId] = true;
+      mod.SetRedeployTime(eventPlayer, 9999);
+      mod.UndeployPlayer(eventPlayer);
+      return;
+    }
+
+    // Known-good live respawn path: repair existing refs only. Never build,
+    // delete, or recreate HUD widgets while the engine is completing deploy.
+    repairCipherKeyHudCacheForPlayer(p, false);
+    updateCipherSuddenDeathAliveHudForPlayer(p);
+    applyPrematch889HealthForPlayer(playerId);
+    recordLastLiveHqSpawnSourceFromDeploy(eventPlayer, playerId);
+    applyPhaseInputRestrictionsForPlayer(eventPlayer);
+
+    const enteringForcedSafeSpawnFlow = safeSpawnForcedUndeploy[playerId] === true;
+    if (!enteringForcedSafeSpawnFlow) {
+      bumpSafeSpawnGeneration(playerId);
+      removeSafeSpawnCheckForPlayer(playerId);
+    }
+    if (!enteringForcedSafeSpawnFlow && isNativeFriendlyOrSquadSpawn(eventPlayer, playerId)) {
+      mod.SetRedeployTime(eventPlayer, REDEPLOY_TIME);
+      p.isFirstDeploy();
+      finishSafeSpawnAsNativeFriendlyOrSquadSpawn(eventPlayer, playerId);
+      return;
+    }
+
+    mod.SetRedeployTime(eventPlayer, REDEPLOY_TIME);
+    finalizeCipherRespawnRouteJobForPlayer(playerId, "OnPlayerDeployed_Live");
+    requestCipherSpawnAnchorForPlayer(playerId, true);
+    processCipherSpawnJobs("OnPlayerDeployed_LiveAnchor");
+    p.isFirstDeploy();
+    queueSafeSpawnCheckForPlayer(playerId);
   } catch (err) {
-    LogRuntimeError("OnPlayerDeployedMinimal", err);
+    LogRuntimeError("OnPlayerDeployed", err);
   }
 }
 
 
-function recordPlayerUndeployedMinimal(eventPlayer: mod.Player): void {
-  const identity = tryGetSafeEventPlayerIdentity(eventPlayer);
-  if (!identity || identity.isBot) return;
-  const playerId = identity.playerId;
+async function Mode_OnPlayerUndeploy(eventPlayer: mod.Player): Promise<void> {
+  try {
+  if (!mod.IsPlayerValid(eventPlayer)) return;
+  const playerId = modlib.getPlayerId(eventPlayer);
   const pending = pendingPlayerSessionById[playerId];
   if (pending && isCurrentPlayerSession(playerId, pending.sessionToken)) {
-    if (pending.nativeObjId !== identity.nativeObjId) return;
     pending.player = eventPlayer;
     pending.deployAckSeen = false;
     return;
   }
   const p = serverPlayers.get(playerId);
-  const sessionToken = playerSessionTokenByPlayerId[playerId];
-  if (!p || sessionToken === undefined) return;
-  if (playerActivatedSessionTokenByPlayerId[playerId] !== sessionToken) return;
-  if (p.nativeObjId !== identity.nativeObjId) return;
+  if (!p) return;
   p.player = eventPlayer;
   const wasDeployed = p.isDeployed === true;
-  invalidateCipherRespawnRouteJobForPlayer(playerId);
+  const isForcedSafeSpawnFlow = safeSpawnForcedUndeploy[playerId] === true;
+  if (!isForcedSafeSpawnFlow) {
+    bumpSafeSpawnGeneration(playerId);
+    removeSafeSpawnCheckForPlayer(playerId);
+    safeSpawnForcedQueue = safeSpawnForcedQueue.filter((item) => item.playerId !== playerId);
+    delete safeSpawnForcedQueuedGenerationByPlayerId[playerId];
+    invalidateCipherRespawnRouteJobForPlayer(playerId);
+  }
   beginNextPlayerLife(playerId);
   const keepTransitionReady =
     cipherSecondHalfTransitionStage === "deploy" &&
@@ -24024,6 +24155,8 @@ function recordPlayerUndeployedMinimal(eventPlayer: mod.Player): void {
   clearCipherSpawnJobsForPlayer(playerId);
   delete cipherQueuedAnchorByPlayerId[playerId];
   cancelObjectiveCaptureAttemptsForPlayer(playerId);
+
+  if (isForcedSafeSpawnFlow) return;
 
   if (isCipherLiveTransitionActive()) {
     invalidateCipherRespawnRouteJobForPlayer(playerId);
@@ -24078,14 +24211,9 @@ function recordPlayerUndeployedMinimal(eventPlayer: mod.Player): void {
     // scoreboard rendering happens later from a safe deployed/global update.
     p.addDeath();
   }
-  requestCipherTransitionReconcile("OnPlayerUndeploy_Minimal");
-}
-
-async function Mode_OnPlayerUndeploy(eventPlayer: mod.Player): Promise<void> {
-  try {
-    recordPlayerUndeployedMinimal(eventPlayer);
+  requestCipherTransitionReconcile("OnPlayerUndeploy");
   } catch (err) {
-    LogRuntimeError("OnPlayerUndeployMinimal", err);
+    LogRuntimeError("OnPlayerUndeploy", err);
   }
 }
 

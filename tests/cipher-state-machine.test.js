@@ -15,6 +15,8 @@ import {
     processPureNodeReboots,
     resetPureCipherMatch,
     selectPurePostmatchSlots,
+    snapshotPureAnchorPositions,
+    takePureDueSafeSpawnChecks,
     transitionPureCipherPhase,
 } from '../src/squad-obliteration/state/cipher-state-machine.ts';
 
@@ -88,6 +90,34 @@ test('respawn routes reject stale lives, bypass squads, and teleport once', () =
     closePurePlayerLife(state, 3);
     assert.equal(consumePureRespawnRoute(state, stale, false), 'stale');
     assert.equal(createPureRespawnRoute(state, 3, []).completion, 'native-hq-fallback');
+});
+
+test('safe-spawn checks are delayed, bounded, and preserve deferred work', () => {
+    const result = takePureDueSafeSpawnChecks(
+        [
+            { playerId: 1, dueTick: 10 },
+            { playerId: 2, dueTick: 10 },
+            { playerId: 3, dueTick: 10 },
+            { playerId: 4, dueTick: 11 },
+        ],
+        10,
+        2
+    );
+    assert.deepEqual(result.ready.map((item) => item.playerId), [1, 2]);
+    assert.deepEqual(result.deferred.map((item) => item.playerId), [3, 4]);
+});
+
+test('the same anchor ids snapshot map-specific vectors without hardcoded coordinates', () => {
+    const mapA = snapshotPureAnchorPositions([
+        { objectId: 1411, position: { x: 10, y: 20, z: 30 } },
+    ]);
+    const mapB = snapshotPureAnchorPositions([
+        { objectId: 1411, position: { x: -100, y: 5, z: 250 } },
+        { objectId: 1412, position: { x: Number.NaN, y: 0, z: 0 } },
+    ]);
+    assert.deepEqual(mapA.get(1411), { x: 10, y: 20, z: 30 });
+    assert.deepEqual(mapB.get(1411), { x: -100, y: 5, z: 250 });
+    assert.equal(mapB.has(1412), false);
 });
 
 test('key pickup, two deliveries, reboot, and sudden-death join elimination', () => {

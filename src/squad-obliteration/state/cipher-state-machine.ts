@@ -26,6 +26,17 @@ export interface PureRespawnRoute {
     completion: 'evaluating' | 'selected' | 'bypassed' | 'teleported' | 'native-hq-fallback';
 }
 
+export interface PureVectorSnapshot {
+    x: number;
+    y: number;
+    z: number;
+}
+
+export interface PureSafeSpawnCheck {
+    playerId: number;
+    dueTick: number;
+}
+
 export interface PureNodeState {
     lane: 'A' | 'B' | 'C' | 'D';
     deliveredKeys: number;
@@ -182,6 +193,32 @@ export function consumePureRespawnRoute(
     if (route.completion === 'teleported' || route.completion === 'bypassed') return route.completion;
     route.completion = squadSpawned ? 'bypassed' : route.selectedAnchorId ? 'teleported' : 'native-hq-fallback';
     return route.completion;
+}
+
+export function snapshotPureAnchorPositions(
+    positions: ReadonlyArray<{ objectId: number; position: PureVectorSnapshot }>
+): Map<number, PureVectorSnapshot> {
+    const snapshots = new Map<number, PureVectorSnapshot>();
+    for (const entry of positions) {
+        const { x, y, z } = entry.position;
+        if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) continue;
+        snapshots.set(entry.objectId, { x, y, z });
+    }
+    return snapshots;
+}
+
+export function takePureDueSafeSpawnChecks(
+    queue: PureSafeSpawnCheck[],
+    currentTick: number,
+    budget: number
+): { ready: PureSafeSpawnCheck[]; deferred: PureSafeSpawnCheck[] } {
+    const ready: PureSafeSpawnCheck[] = [];
+    const deferred: PureSafeSpawnCheck[] = [];
+    for (const item of queue) {
+        if (item.dueTick <= currentTick && ready.length < Math.max(0, budget)) ready.push(item);
+        else deferred.push(item);
+    }
+    return { ready, deferred };
 }
 
 export function pickUpPureKey(state: PureCipherState, playerId: number): boolean {
