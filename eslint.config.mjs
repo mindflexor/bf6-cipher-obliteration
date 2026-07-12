@@ -15,6 +15,7 @@ export default [
             'src/squad-obliteration/zipline-runtime.ts',
             'src/squad-obliteration/zipline-module.ts',
             'src/squad-obliteration/config/zipline.ts',
+            'tools/modsim/**',
         ],
     },
     eslint.configs.recommended,
@@ -28,6 +29,9 @@ export default [
                 ecmaVersion: 2022,
                 sourceType: 'module',
                 project: './tsconfig.json',
+            },
+            globals: {
+                mod: 'readonly',
             },
         },
         rules: {
@@ -46,7 +50,7 @@ export default [
         },
     },
     {
-        files: ['**/*.js'],
+        files: ['**/*.js', '**/*.mjs'],
         languageOptions: {
             ecmaVersion: 2022,
             sourceType: 'module',

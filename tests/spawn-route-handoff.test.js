@@ -51,6 +51,25 @@ test('normal live deploy finalizes the route and queues one generation-guarded c
     assert.match(queue, /generation,/);
 });
 
+test('objective pressure uses authored A east, B west, C west, D east geometry', () => {
+    const lane = functionBody('getCipherPresenceLaneForObjective');
+    assert.match(lane, /def\.lane === "A" \|\| def\.lane === "D" \? "east" : "west"/);
+});
+
+test('respawn routing resamples pressure at finalization and consumes the route once', () => {
+    const tick = functionBody('tickCipherRespawnRouteJob');
+    const finalize = functionBody('finalizeCipherRespawnRouteJobForPlayer');
+    const teleport = functionBody('teleportCipherPlayerToRoutedAnchor');
+    assert.match(tick, /Continuously refresh the preferred quadrant/);
+    assert.match(tick, /selectCipherRespawnRouteCandidate/);
+    assert.ok(
+        finalize.indexOf('selectCipherRespawnRouteCandidate') <
+            finalize.indexOf('job.finalizedCandidate = candidate')
+    );
+    assert.match(teleport, /routeJob\.status = "consumed"/);
+    assert.match(teleport, /delete cipherRespawnRouteJobByPlayerId\[playerId\]/);
+});
+
 test('safe-spawn queue waits 0.1 seconds and is bounded', () => {
     const queue = functionBody('queueSafeSpawnCheckForPlayer');
     const process = functionBody('processSafeSpawnCheckQueue');
@@ -109,7 +128,8 @@ test('runtime snapshots all configured anchor vectors once per game-mode load', 
     const started = functionBody('Mode_OnGameModeStarted');
     const warm = functionBody('warmCipherSpawnAnchorPositionCache');
     const cached = functionBody('getCachedCipherAnchorPosition');
-    assert.match(started, /warmCipherSpawnAnchorPositionCache\(\)/);
+    assert.match(started, /startupPipelineAnchorIds = getStartupSpawnAnchorIds\(\)/);
+    assert.match(functionBody('processStartupPipelineStep'), /getCachedCipherAnchorPosition\(startupPipelineAnchorIds\[startupPipelineAnchorCursor\]\)/);
     assert.match(warm, /cipherAnchorPositionByObjectId = \{\}/);
     assert.match(warm, /getCachedCipherAnchorPosition\(ids\[anchorIndex\]\)/);
     assert.match(cached, /mod\.GetSpatialObject\(anchorId\)/);

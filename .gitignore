@@ -5,3 +5,5 @@ dist
 .DS_Store
 .env
 extension/build
+tools/modsim/.build
+tools/modsim/.run

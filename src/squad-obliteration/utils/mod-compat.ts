@@ -51,7 +51,7 @@ function addContainer(node: ParseUiNode, parent: mod.UIWidget): mod.UIWidget {
         node.bgAlpha ?? 0.5,
         node.bgFill ?? mod.UIBgFill.Solid,
     ] as const;
-    if (node.playerId) mod.AddUIContainer(...args, node.playerId);
+    if (node.playerId) mod.AddUIContainer(...args, node.playerId!);
     else mod.AddUIContainer(...args);
     return renameTemporaryWidget(node.name);
 }
@@ -74,7 +74,7 @@ function addText(node: ParseUiNode, parent: mod.UIWidget): mod.UIWidget {
         node.textAlpha ?? 1,
         node.textAnchor ?? mod.UIAnchor.CenterLeft,
     ] as const;
-    if (node.playerId) mod.AddUIText(...args, node.playerId);
+    if (node.playerId) mod.AddUIText(...args, node.playerId!);
     else mod.AddUIText(...args);
     return renameTemporaryWidget(node.name);
 }
