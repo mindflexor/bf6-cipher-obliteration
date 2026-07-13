@@ -23,6 +23,24 @@ const runBundlePath = path.join(root, 'tools/modsim/.run/bundle.js');
 fs.appendFileSync(runBundlePath, `
 export function __modsimGetLastRuntimeError(){ return cipherTransitionLastError; }
 export function __modsimEnterPostmatch(){ enterPostmatchFromLive(team1); }
+export function __modsimEnableRuntimeBots(){ cipherRuntimeBotsEnabled = true; }
+export function __modsimGetGameStatus(){ return gameStatus; }
+export function __modsimGetRuntimeBotCount(){ return countActiveRuntimeBotSlots(); }
+export function __modsimGetIssuedRuntimeBotCount(){ return getIssuedRuntimeBotDeployCount(); }
+export function __modsimGetBotRouteSummary(){
+  const routes = [];
+  for (const playerIdKey in runtimeBotPreliveRouteAcknowledgedByPlayerId) {
+    const playerId = Number(playerIdKey);
+    const sp = serverPlayers.get(playerId);
+    routes.push({
+      playerId,
+      teamId: sp ? modlib.getTeamId(mod.GetTeam(sp.player)) : -1,
+      anchorId: runtimeBotPreliveRouteAnchorByPlayerId[playerId],
+      result: runtimeBotPreliveRouteAcknowledgedByPlayerId[playerId],
+    });
+  }
+  return routes;
+}
 `);
 const sim = await import(pathToFileURL(path.join(root, 'tools/modsim/.build/index.js')).href + `?t=${Date.now()}`);
 console.log = () => {};
@@ -149,6 +167,7 @@ for (let id = 1; id <= 4200; id++) {
   }
 }
 for (let id = 11; id <= 14; id++) objects.push({ ...objectFor(id, 'PlayerSpawner'), type: 'PlayerSpawner', SpawnPoints: [] });
+for (const id of [8085, 8086]) objects.push({ ...objectFor(id, 'AI_Spawner'), type: 'AI_Spawner' });
 for (const id of [1001, 1002, 1003, 1004, 1011, 1012, 1013, 1014, 2001, 2002, 2003, 2004]) objects.push({ ...objectFor(id, 'InteractPoint'), type: 'InteractPoint' });
 for (const id of [201, 202, 203, 204, 301, 302, 303, 304]) objects.push({ ...objectFor(id, 'CapturePoint'), type: 'CapturePoint' });
 
@@ -158,14 +177,19 @@ finishFrame();
 
 beginFrame('join-burst-16p', 0);
 const players = [];
-for (let i = 0; i < 16; i++) players.push(sim.AddPlayer());
+for (let i = 0; i < 2; i++) players.push(sim.AddPlayer());
 finishFrame();
 
 beginFrame('game-start-16p', 0);
+loadedScript.__modsimEnableRuntimeBots();
 sim.StartGameMode();
 finishFrame();
 
-await sim.StepFrames(360);
+await sim.StepFrames(720);
+const functionalErrors = [];
+if (loadedScript.__modsimGetRuntimeBotCount() !== 0) {
+  functionalErrors.push(`expected no runtime bots in prematch, got ${loadedScript.__modsimGetRuntimeBotCount()}`);
+}
 beginFrame('all-ready-event-burst-16p', simulationTick);
 for (const player of players) {
   const readyId = player.team === 1 ? 2002 : 2004;
@@ -173,7 +197,22 @@ for (const player of players) {
 }
 finishFrame();
 ongoingScenario = 'ready-to-live-16p';
-await sim.StepFrames(600);
+await sim.StepFrames(900);
+if (loadedScript.__modsimGetGameStatus() !== 3) {
+  functionalErrors.push(`ready-to-live did not reach live status (status=${loadedScript.__modsimGetGameStatus()})`);
+}
+const botRoutes = loadedScript.__modsimGetBotRouteSummary();
+const issuedBots = loadedScript.__modsimGetIssuedRuntimeBotCount();
+if (issuedBots < 1) {
+  functionalErrors.push('expected at least one issued native bot spawn during prelive staging');
+}
+// ModSim deliberately does not invoke the optional AI-spawner callback. The
+// live transition must therefore be independent of route/binding callbacks.
+for (const route of botRoutes) {
+  const validAnchors = route.teamId === 1 ? [1511, 1512, 1513, 1514] : [3511, 3512, 3513, 3514];
+  if (route.result !== 'teleported') functionalErrors.push(`bound bot ${route.playerId} route resolved as ${route.result}`);
+  if (!validAnchors.includes(route.anchorId)) functionalErrors.push(`bound bot ${route.playerId} used invalid team ${route.teamId} anchor ${route.anchorId}`);
+}
 beginFrame('postmatch-entry-16p', simulationTick);
 scriptExecutionDepth += 1;
 try { loadedScript.__modsimEnterPostmatch(); }
@@ -184,7 +223,8 @@ await sim.StepFrames(600);
 if (activeFrame.total > 0) finishFrame();
 
 const uniqueFrames = frames.filter((frame, index) => index === 0 || frame !== frames[index - 1]);
-let failed = false;
+let failed = functionalErrors.length > 0;
+for (const error of functionalErrors) reportError(error);
 for (const frame of uniqueFrames) {
   if (frame.total >= 500) {
     reportError(`Portal hard limit reached: ${frame.scenario} tick ${frame.tick}: ${frame.total}`);

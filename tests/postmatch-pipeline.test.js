@@ -67,3 +67,43 @@ test('postmatch score and cards start hidden and reveal in five bounded steps', 
     assert.match(functionBody('setPostmatchCardRevealAlpha'), /PM_PlayerContainer/);
     assert.match(functionBody('processPostmatchPipeline'), /SFX_ReadyUp/);
 });
+
+test('postmatch cards pass depth before their team receiver', () => {
+    const container = functionBody('addPostMatchContainer');
+    const text = functionBody('addPostMatchText');
+    assert.match(container, /mod\.UIDepth\.AboveGameUI,[\s\S]*receiver/);
+    assert.match(text, /mod\.UIDepth\.AboveGameUI,[\s\S]*receiver/);
+});
+
+test('postmatch preparation holds score before fixed camera and pedestal activation', () => {
+    const process = functionBody('processPostmatchPipeline');
+    const jobs = functionBody('processPostmatchStateAwarePlayerJob');
+    const finalize = functionBody('processPostmatchCameraFinalize');
+    assert.match(process, /"cameraFinalize"/);
+    assert.match(process, /postmatchPreparationEndTick/);
+    assert.match(process, /activatePostmatchShowcase\(\)/);
+    assert.match(jobs, /"postmatchFrozen"/);
+    assert.doesNotMatch(jobs, /advancePostmatchPipeline\("cameraFinalize"\)/);
+    assert.match(finalize, /advancePostmatchPipeline\("teleport"\)/);
+    assert.match(finalize, /setPostmatchShowcaseCameraForPlayer\(player\.player, true\)/);
+    assert.match(functionBody('setPostmatchShowcaseCameraForPlayer'), /mod\.Cameras\.Fixed, POSTMATCH_CAMERA_ID/);
+    assert.match(functionBody('schedulePostmatchCameraForPlayerAfterSettle'), /postmatchPipelineToken/);
+    assert.match(functionBody('Mode_OnRevived'), /OnRevived_Postmatch/);
+});
+
+test('postmatch uses a five-second score hold, full showcase clock, and drift maintenance', () => {
+    assert.match(source, /POSTMATCH_TRANSITION_SECONDS = RULES\.postmatchTransitionSeconds/);
+    assert.match(functionBody('activatePostmatchShowcase'), /postmatchEndTick = serverTickCount \+ POSTMATCH_TIME \* TICK_RATE/);
+    const maintain = functionBody('maintainPostmatchShowcasePedestals');
+    assert.match(maintain, /POSTMATCH_PEDESTAL_RECHECK_TICKS/);
+    assert.match(maintain, /POSTMATCH_PEDESTAL_TOLERANCE_METERS/);
+    assert.match(maintain, /teleportPostmatchShowcaseSlotPlayer\(slot, "pedestal_reassert"\)/);
+});
+
+test('postmatch card text owns its receiver-relative colored background', () => {
+    const build = functionBody('buildPostmatchShowcaseScreenUi');
+    const text = functionBody('addPostMatchText');
+    assert.match(build, /color,[\s\S]*mod\.UIBgFill\.Blur/);
+    assert.match(text, /backgroundColor,[\s\S]*backgroundAlpha,[\s\S]*backgroundFill/);
+    assert.match(functionBody('setPostmatchCardRevealAlpha'), /PM_PlayerText[\s\S]*setPostMatchContainerAlpha/);
+});

@@ -45,6 +45,8 @@
     "PreMatchTeam2Label": "Team 2",
     "CountDownText": "5",
     "MatchStarts": "Match starts in",
+    "CipherDeployingBots": "DEPLOYING BOTS {}/{}",
+    "CipherWaitingForPlayers": "WAITING FOR PLAYERS",
     "Overtime": "SUDDEN DEATH",
     "Text_TimeRemaining": "TIME REMAINING:",
     "Text_ObjectiveDestroyTimer": "NODE REBOOTING",

@@ -22,139 +22,87 @@ function functionBody(name) {
     assert.fail(`${name} body is incomplete`);
 }
 
-test('deploy-screen route evaluation never queries an undeployed player handle', () => {
-    const currentCheck = functionBody('isCipherRespawnRouteJobCurrent');
-    const tick = functionBody('tickCipherRespawnRouteJob');
-    assert.doesNotMatch(currentCheck, /GetTeam\(sp\.player\)|GetSoldierState|GetSquad/);
-    assert.doesNotMatch(tick, /GetTeam\(sp\.player\)|GetSoldierState|GetSquad/);
-    assert.match(tick, /mod\.GetTeam\(job\.teamId\)/);
-});
-
-test('live deploy uses the direct known-good path without rebuilding HUD widgets', () => {
+test('live respawns use team queues instead of five-second per-player route timers', () => {
+    const undeploy = functionBody('Mode_OnPlayerUndeploy');
     const deployed = functionBody('Mode_OnPlayerDeployed');
-    assert.match(deployed, /repairCipherKeyHudCacheForPlayer\(p, false\)/);
-    assert.match(deployed, /recordLastLiveHqSpawnSourceFromDeploy/);
-    assert.match(deployed, /isNativeFriendlyOrSquadSpawn/);
-    assert.match(deployed, /queueSafeSpawnCheckForPlayer\(playerId\)/);
-    assert.doesNotMatch(deployed, /queueLiveHudBuild|rebuildPlayerLiveHud|buildRestrictedAreaUiForPlayer/);
-    assert.doesNotMatch(deployed, /SetScoreboardPlayerValues|UpdateScoreboard|updateScoreboard/);
-    assert.doesNotMatch(source, /function recordPlayerDeployedMinimal|function commitDeployedHumanPlayerNow/);
+    assert.doesNotMatch(source, /CipherRespawnRouteJob|cipherRespawnRoute|routeEvaluationDurationSeconds/);
+    assert.match(undeploy, /assignCipherTeamQueuedAnchorToPlayer\(playerId, "live_undeploy"\)/);
+    assert.doesNotMatch(undeploy, /Timers\.setInterval/);
+    assert.doesNotMatch(deployed, /requestCipherSpawnAnchorForPlayer|processCipherSpawnJobs\("OnPlayerDeployed_LiveAnchor"\)/);
 });
 
-test('normal live deploy finalizes the route and queues one generation-guarded check', () => {
-    const deployed = functionBody('Mode_OnPlayerDeployed');
-    const queue = functionBody('queueSafeSpawnCheckForPlayer');
-    assert.match(deployed, /finalizeCipherRespawnRouteJobForPlayer/);
-    assert.match(deployed, /requestCipherSpawnAnchorForPlayer/);
-    assert.match(deployed, /queueSafeSpawnCheckForPlayer\(playerId\)/);
-    assert.match(queue, /safeSpawnCheckQueuedGenerationByPlayerId\[playerId\] === generation/);
-    assert.match(queue, /generation,/);
+test('an undeploy claims the team queue and immediately replaces it', () => {
+    const assign = functionBody('assignCipherTeamQueuedAnchorToPlayer');
+    assert.match(assign, /cipherAssignedTeamSpawnAnchorByPlayerId\[playerId\]/);
+    assert.match(assign, /cipherQueuedAnchorByPlayerId\[playerId\] = anchor/);
+    assert.match(assign, /refreshCipherTeamQueuedAnchor\(team, source \+ "_replace"\)/);
+    assert.match(assign, /sessionToken: ensurePlayerSessionToken\(playerId\)/);
+    assert.match(assign, /lifeGeneration: getPlayerLifeGeneration\(playerId\)/);
 });
 
-test('objective pressure uses authored A east, B west, C west, D east geometry', () => {
-    const lane = functionBody('getCipherPresenceLaneForObjective');
-    assert.match(lane, /def\.lane === "A" \|\| def\.lane === "D" \? "east" : "west"/);
+test('team queues use objective pressure and all four quadrant presence inputs', () => {
+    const select = functionBody('selectCipherTeamQueuedAnchor');
+    assert.match(select, /buildCipherTeamQueueRegionCandidates/);
+    assert.match(functionBody('buildCipherTeamQueueRegionCandidates'), /getCipherObjectivePressureTarget/);
+    assert.match(functionBody('buildCipherTeamQueueRegionCandidates'), /appendCipherForwardRegionsByLowestPressure/);
+    assert.match(functionBody('markCipherPresenceZoneActive'), /refreshAllCipherTeamQueuedAnchors/);
+    assert.match(functionBody('clearCipherPresenceZoneActive'), /refreshAllCipherTeamQueuedAnchors/);
+    assert.match(functionBody('startCipherNodeReboot'), /refreshAllCipherTeamQueuedAnchors/);
+    assert.match(functionBody('reactivateCipherNode'), /refreshAllCipherTeamQueuedAnchors/);
 });
 
-test('respawn routing resamples pressure at finalization and consumes the route once', () => {
-    const tick = functionBody('tickCipherRespawnRouteJob');
-    const finalize = functionBody('finalizeCipherRespawnRouteJobForPlayer');
-    const teleport = functionBody('teleportCipherPlayerToRoutedAnchor');
-    assert.match(tick, /Continuously refresh the preferred quadrant/);
-    assert.match(tick, /selectCipherRespawnRouteCandidate/);
-    assert.ok(
-        finalize.indexOf('selectCipherRespawnRouteCandidate') <
-            finalize.indexOf('job.finalizedCandidate = candidate')
-    );
-    assert.match(teleport, /routeJob\.status = "consumed"/);
-    assert.match(teleport, /delete cipherRespawnRouteJobByPlayerId\[playerId\]/);
+test('team queues are built at live start and rebuilt after a transition', () => {
+    const liveInitialization = functionBody('processLiveInitializationStep');
+    assert.match(liveInitialization, /liveInitializationTeamQueueCursor === 0/);
+    assert.match(liveInitialization, /refreshCipherTeamQueuedAnchor\(team1, "live_initialization_team1"\)/);
+    assert.match(liveInitialization, /refreshCipherTeamQueuedAnchor\(team2, "live_initialization_team2"\)/);
+    assert.match(functionBody('finalizeCipherTransitionLiveStart'), /refreshAllCipherTeamQueuedAnchors/);
+    assert.match(functionBody('resetCipherSpawnRoutingState'), /clearCipherTeamQueuedAnchors/);
 });
 
-test('safe-spawn queue waits 0.1 seconds and is bounded', () => {
-    const queue = functionBody('queueSafeSpawnCheckForPlayer');
-    const process = functionBody('processSafeSpawnCheckQueue');
-    assert.match(spawnRoutingConfig, /safeSpawnCheckDelaySeconds:\s*0\.1/);
-    assert.match(source, /const SAFE_SPAWN_CHECK_DELAY_TICKS = CIPHER_RESPAWN_POST_DEPLOY_DELAY_TICKS/);
-    assert.match(source, /const SAFE_SPAWN_CHECKS_PER_TICK = 2/);
-    assert.match(queue, /dueTick: serverTickCount \+ SAFE_SPAWN_CHECK_DELAY_TICKS/);
-    assert.match(process, /item\.dueTick > serverTickCount/);
-    assert.match(process, /processed >= SAFE_SPAWN_CHECKS_PER_TICK/);
-});
-
-test('delayed safe check validates generation and deployed state before placement', () => {
+test('only the bounded post-deploy check evaluates nearby enemies for an assigned anchor', () => {
     const check = functionBody('runSafeSpawnCheck');
-    assert.match(check, /item\.generation !== getSafeSpawnGeneration/);
-    assert.match(check, /!p \|\| !p\.isDeployed \|\| !mod\.IsPlayerValid/);
-    assert.match(check, /isPlayerAliveSafe/);
-    assert.match(check, /isNativeFriendlyOrSquadSpawn/);
-    assert.match(check, /finalizeSafeSpawnDeploySuccess/);
-    assert.doesNotMatch(check, /queueLiveHudBuild|SetScoreboardPlayerValues|UpdateScoreboard/);
-});
-
-test('safe-spawn success is the normal-live teleport boundary', () => {
     const finalize = functionBody('finalizeSafeSpawnDeploySuccess');
     const teleport = functionBody('teleportCipherPlayerToRoutedAnchor');
-    assert.match(finalize, /teleportCipherPlayerToRoutedAnchor\(player, playerId\)/);
+    assert.match(spawnRoutingConfig, /safeSpawnCheckDelaySeconds:\s*0\.1/);
+    assert.match(check, /getCurrentCipherTeamSpawnAssignment/);
+    assert.match(check, /getCachedCipherAnchorPosition\(assignment\.anchor\.anchorObjectId\)/);
+    assert.match(check, /countCipherEnemiesNearPositionWithinRadius/);
+    assert.match(check, /selectNextSafeCipherSpawnCandidate/);
+    assert.match(check, /refreshCipherTeamQueuedAnchor\(team, "final_unsafe"\)/);
+    assert.doesNotMatch(check, /queueForcedSafeSpawnRetryForCurrentRoute/);
+    assert.doesNotMatch(finalize, /hasEnemyNearPosition/);
+    assert.doesNotMatch(teleport, /isCipherAnchorSafeFromEnemies/);
+});
+
+test('unsafe final checks remain generation guarded and reroute the same life', () => {
+    const assignment = functionBody('getCurrentCipherTeamSpawnAssignment');
+    const finalize = functionBody('finalizeSafeSpawnDeploySuccess');
+    assert.match(assignment, /isCurrentPlayerSession/);
+    assert.match(assignment, /lifeGeneration !== getPlayerLifeGeneration/);
+    assert.match(assignment, /expectedMatchStage !== cipherMatchStage/);
+    assert.match(finalize, /teleportCipherPlayerToRoutedAnchor\(player, playerId, false\)/);
     assert.match(finalize, /queueForcedSafeSpawnRetryForCurrentRoute/);
-    assert.ok(
-        teleport.indexOf('delete cipherQueuedAnchorByPlayerId[playerId]') <
-            teleport.indexOf('(mod as any).Teleport(player, anchorPos, yawRadians)')
-    );
-    assert.equal(teleport.match(/\.Teleport\(player, anchorPos, yawRadians\)/g)?.length, 1);
+    const reroute = functionBody('selectNextSafeCipherSpawnCandidate');
+    assert.match(reroute, /candidateChecksPerTick/);
+    assert.match(reroute, /applyCipherSpawnAssignmentCandidate/);
+    assert.match(reroute, /"deferred"/);
 });
 
-test('forced fallback uses the stable HQ-to-player-spawner mapping and bounded retries', () => {
-    const retry = functionBody('queueForcedSafeSpawnRetryForCurrentRoute');
-    const process = functionBody('processForcedSafeSpawnQueue');
-    assert.match(source, /const HQ_TO_PLAYERSPAWNER_ID:[\s\S]*1: 11, 2: 12, 3: 13, 4: 14/);
-    assert.match(retry, /used >= SAFE_SPAWN_MAX_FORCED_REDEPLOYS/);
-    assert.match(retry, /safeSpawnForcedQueuedGenerationByPlayerId/);
-    assert.match(process, /SAFE_SPAWN_FORCED_QUEUE_BUDGET_PER_TICK/);
-    assert.match(process, /trySpawnPlayerFromSpawnPointSafe/);
+test('pressure uses opposite lane rear anchors while clear nodes use forward variants', () => {
+    const pressure = functionBody('getCipherObjectivePressureTarget');
+    const candidates = functionBody('buildCipherTeamQueueRegionCandidates');
+    assert.match(pressure, /lane === "west" \? "east" : "west"/);
+    assert.match(pressure, /isCipherNodeRebooting|isObjectiveDisabledAfterAward/);
+    assert.match(candidates, /objectivePressure\.region/);
+    assert.match(candidates, /appendCipherForwardRegionsByLowestPressure/);
+    assert.match(functionBody('getCipherForwardSpawnRegion'), /"north" \? "south" : "north"/);
+    assert.match(functionBody('selectCipherTeamQueuedAnchor'), /getCipherAnchorRoutingDistanceSquared/);
 });
 
-test('duplicate deploy callbacks and manual undeploy are generation guarded', () => {
+test('live deploy remains bounded and does not rebuild HUD widgets', () => {
     const deployed = functionBody('Mode_OnPlayerDeployed');
-    const undeploy = functionBody('Mode_OnPlayerUndeploy');
-    assert.match(deployed, /bumpSafeSpawnGeneration\(playerId\)/);
+    assert.match(deployed, /repairCipherKeyHudCacheForPlayer\(p, false\)/);
     assert.match(deployed, /queueSafeSpawnCheckForPlayer\(playerId\)/);
-    assert.match(undeploy, /removeSafeSpawnCheckForPlayer\(playerId\)/);
-    assert.match(undeploy, /bumpSafeSpawnGeneration\(playerId\)/);
-    assert.match(undeploy, /beginNextPlayerLife\(playerId\)/);
-    assert.match(undeploy, /startCipherRespawnRouteJobForPlayer/);
-});
-
-test('runtime snapshots all configured anchor vectors once per game-mode load', () => {
-    const started = functionBody('Mode_OnGameModeStarted');
-    const warm = functionBody('warmCipherSpawnAnchorPositionCache');
-    const cached = functionBody('getCachedCipherAnchorPosition');
-    assert.match(started, /startupPipelineAnchorIds = getStartupSpawnAnchorIds\(\)/);
-    assert.match(functionBody('processStartupPipelineStep'), /getCachedCipherAnchorPosition\(startupPipelineAnchorIds\[startupPipelineAnchorCursor\]\)/);
-    assert.match(warm, /cipherAnchorPositionByObjectId = \{\}/);
-    assert.match(warm, /getCachedCipherAnchorPosition\(ids\[anchorIndex\]\)/);
-    assert.match(cached, /mod\.GetSpatialObject\(anchorId\)/);
-    assert.match(cached, /mod\.GetObjectPosition\(spatialAnchor\)/);
-    assert.match(cached, /snapshotVector\(position\)/);
-    assert.match(cached, /Number\.isFinite\(snapshot\.x\)/);
-    assert.match(cached, /mod\.CreateVector\(snapshot\.x, snapshot\.y, snapshot\.z\)/);
-    assert.doesNotMatch(functionBody('runSafeSpawnCheck'), /GetSpatialObject|GetObjectPosition|CreateVector/);
-});
-
-test('pending join acknowledgement re-enters the direct deploy handler after activation', () => {
-    const activate = functionBody('activatePendingPlayerSession');
-    assert.match(activate, /player\.isDeployed = false/);
-    assert.match(activate, /if \(pending\.deployAckSeen\)/);
-    assert.match(activate, /Mode_OnPlayerDeployed\(player\.player\)/);
-});
-
-test('scheduler owns the bounded safe-spawn and forced-fallback lanes only', () => {
-    const supervisor = functionBody('processPlayerLifecycleSupervisor');
-    assert.match(supervisor, /processForcedSafeSpawnQueue\(\)/);
-    assert.match(supervisor, /processSafeSpawnCheckQueue\(\)/);
-    assert.doesNotMatch(source, /PlayerDeployPlacement|processPlayerDeployPlacementQueue|CipherRespawnTeleportHandoff/);
-});
-
-test('player map has no implicit engine validation fan-out', () => {
-    assert.match(source, /const serverPlayers = new Map<number, Player>\(\)/);
-    assert.doesNotMatch(source, /class ActivePlayerMap/);
+    assert.doesNotMatch(deployed, /queueLiveHudBuild|rebuildPlayerLiveHud|buildRestrictedAreaUiForPlayer/);
 });

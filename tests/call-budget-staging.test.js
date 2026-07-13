@@ -40,7 +40,10 @@ test('game-mode start establishes safe prematch synchronously', () => {
 
 test('heavy phase work is cursor driven and timers cannot catch up in a burst', () => {
     assert.match(functionBody('processCipherScheduledTasks'), /processed >= 1/);
-    assert.match(functionBody('OngoingGlobal_Inner'), /if \(processCipherScheduledTasks\(nowSec\)\) return/);
+    const ongoing = functionBody('OngoingGlobal_Inner');
+    assert.match(ongoing, /const scheduledTaskRan = processCipherScheduledTasks\(nowSec\)/);
+    assert.match(ongoing, /processCriticalNextKeyUnlockTimerVisual\(nowSec\)/);
+    assert.match(ongoing, /if \(scheduledTaskRan\) return/);
     assert.match(functionBody('InitializePreLive'), /preliveInitializationStage/);
     assert.match(functionBody('processLiveInitializationStep'), /liveInitializationObjectiveCursor\+\+/);
     assert.match(functionBody('processLiveHudQueues'), /"topBuild"[\s\S]*"topBind"/);
